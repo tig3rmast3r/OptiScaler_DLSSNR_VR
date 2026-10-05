@@ -4834,6 +4834,15 @@ make_presenter_owned_frame(GeneratedFrameEndInfo&& source) {
     return time > maximum - duration ? maximum : time + duration;
 }
 
+// Djules df029629 / V417: these errors reject this frame's contents, not
+// the session. Drop it and return its error; preserve all fatal-error handling.
+[[nodiscard]] constexpr bool frame_content_refused(XrResult result) noexcept {
+    return result == XR_ERROR_LAYER_INVALID ||
+           result == XR_ERROR_LAYER_LIMIT_EXCEEDED ||
+           result == XR_ERROR_SWAPCHAIN_RECT_INVALID ||
+           result == XR_ERROR_POSE_INVALID;
+}
+
 void fail_pending_presenter_submissions_locked(
     SessionState& state,
     XrResult failure) noexcept {
@@ -5776,7 +5785,10 @@ void continuous_presenter_main(
                     state->presenter_pending_current_pair_sequence = 0;
                 }
             }
-            if (XR_FAILED(end_result)) {
+            if (frame_content_refused(end_result)) {
+                state->presenter_last_frame.reset();
+                state->presenter_pending_current_pair_sequence = 0;
+            } else if (XR_FAILED(end_result)) {
                 fail_pending_presenter_submissions_locked(*state, end_result);
             }
         }
@@ -5809,7 +5821,7 @@ void continuous_presenter_main(
                     : 0,
                 static_cast<std::uint64_t>(qpc_frequency.QuadPart));
         }
-        if (XR_FAILED(end_result)) {
+        if (XR_FAILED(end_result) && !frame_content_refused(end_result)) {
             break;
         }
     }
@@ -5978,7 +5990,11 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             }
             xrfg::bridge_flight_logger().end(token, xrfg::BridgeFlightOperation::internal_end_frame,
                 result, end.displayTime, end.layerCount, synthetic ? 1 : 0);
-            if (XR_FAILED(result)) { fail(result); break; }
+            // Selected frames are retired below; borrowed callers receive this
+            // frame's error. The director keeps its existing cadence and never
+            // repeats the refused frame. Only genuine session/runtime failure
+            // aborts all following requests.
+            if (XR_FAILED(result) && !frame_content_refused(result)) { fail(result); break; }
             if (state->fsr_two_slot_presenter && borrowed && borrowed->owned_frame) {
                 // Preserve the inline contract: B's deferred copy is submitted
                 // only after S has reached XR, before B gets its own slot.

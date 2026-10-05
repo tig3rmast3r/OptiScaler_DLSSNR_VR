@@ -12,6 +12,7 @@ std::vector<std::pair<unsigned, bool>> presented;
 std::atomic<unsigned> waits{}, begins{}, ends{};
 std::atomic<unsigned> reference_calls{}, action_calls{}, locate_calls{};
 std::atomic<bool> fail_runtime{}, blocked_end{}, entered_end{};
+std::atomic<XrResult> refuse_next_end{XR_SUCCESS};
 std::condition_variable test_condition;
 XrTime next_time = 1000000000;
 std::unordered_map<XrSwapchain, ID3D11Texture2D*> gpu_outputs;
@@ -49,6 +50,11 @@ XrResult XRAPI_CALL fake_end(XrSession, const XrFrameEndInfo* info) {
     test_condition.notify_all();
     test_condition.wait(lock, [] { return !blocked_end.load(); });
     if (fail_runtime) return XR_ERROR_RUNTIME_FAILURE;
+    // The legacy presenter legally closes an already begun frame with an
+    // empty EndFrame during stop. It has no projection to inspect/refuse.
+    if (info->layerCount == 0) return XR_SUCCESS;
+    const auto refusal = refuse_next_end.exchange(XR_SUCCESS);
+    if (XR_FAILED(refusal)) return refusal;
     const auto* layer = reinterpret_cast<const XrCompositionLayerProjection*>(info->layers[0]);
     const unsigned packed = gpu_outputs.empty()
         ? static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(layer->space))
@@ -1371,6 +1377,82 @@ void afw_producer_release_independence_test() {
     check(independent && XR_SUCCEEDED(result), "AFW producer Release waited for OFXR worker");
 }
 
+void refused_frame_recovery_test() {
+    for (bool director : {false, true}) {
+        for (XrResult error : {XR_ERROR_LAYER_INVALID, XR_ERROR_LAYER_LIMIT_EXCEEDED,
+                              XR_ERROR_SWAPCHAIN_RECT_INVALID, XR_ERROR_POSE_INVALID}) {
+            auto s = session();
+            s->three_slot_director = director;
+            s->nvidia_new_route = director;
+            try {
+                auto rejected_frame = frame(61);
+                if (!director) s->presenter_last_frame = frame(60)->frame;
+                auto rejected = enqueue_presenter_submission(s, nullptr, &rejected_frame->frame->info);
+                refuse_next_end = error;
+                s->presenter_thread = std::thread(
+                    director ? three_slot_director_main : continuous_presenter_main, s);
+                until(s, [&] { return rejected->completed; });
+                {
+                    std::scoped_lock lock(s->presenter_mutex);
+                    check(rejected->result == error && XR_SUCCEEDED(s->presenter_failure),
+                        "one refused frame poisoned the session");
+                    check(!s->presenter_last_frame && !s->presenter_inflight_frame &&
+                          !s->presenter_inflight_submission && s->outstanding_presenter_submissions == 0,
+                        "refused frame ownership/repeat retained");
+                }
+                auto next_frame = frame(62);
+                auto next = enqueue_presenter_submission(s, nullptr, &next_frame->frame->info);
+                until(s, [&] { return next->completed; });
+                {
+                    std::scoped_lock lock(s->presenter_mutex);
+                    check(XR_SUCCEEDED(next->result) && XR_SUCCEEDED(s->presenter_failure),
+                        "session did not recover after content refusal");
+                }
+                stop_continuous_presenter(s);
+            } catch (...) {
+                std::cerr << "content-refusal probe failed: director=" << director
+                          << " error=" << error << '\n';
+                stop_continuous_presenter(s);
+                refuse_next_end = XR_SUCCESS;
+                throw;
+            }
+        }
+    }
+    // Exercise an owned director slot as well as borrowed submissions. The
+    // refused A must be consumed so that B can drain; no slot/failure is stuck.
+    auto s = session();
+    try {
+        auto rejected = frame(71);
+        s->three_slots.push_real(rejected);
+        s->three_slots.shift_empty(); s->three_slots.shift_empty();
+        s->three_slots.push_real(frame(72));
+        refuse_next_end = XR_ERROR_LAYER_INVALID;
+        s->presenter_thread = std::thread(three_slot_director_main, s);
+        until(s, [&] { return s->three_slots.can_insert_synthetic(); });
+        {
+            std::scoped_lock lock(s->presenter_mutex);
+            check(s->three_slots.push_synthetic(frame(72, true)), "synthetic insertion after refusal");
+        }
+        s->presenter_condition.notify_all();
+        until(s, [&] { return s->three_slots.can_accept_real(); });
+        {
+            std::scoped_lock lock(s->presenter_mutex);
+            check(XR_SUCCEEDED(s->presenter_failure) &&
+                  s->presenter_inflight_frame != rejected->frame,
+                "owned content refusal poisoned director/retained frame");
+            s->director_draining = true;
+        }
+        s->presenter_condition.notify_all();
+        until(s, [&] { return s->three_slots.empty(); });
+        stop_continuous_presenter(s);
+    } catch (...) {
+        stop_continuous_presenter(s);
+        refuse_next_end = XR_SUCCESS;
+        throw;
+    }
+    std::cout << "Content refusal: four errors on legacy/director borrowed frames and owned-slot recovery\n";
+}
+
 int main(int argc, char** argv) {
     auto state = session();
     try {
@@ -1519,6 +1601,8 @@ int main(int argc, char** argv) {
         }
         check(presented.back() == std::pair<unsigned,bool>{25,false}, "last real drain");
         check(waits == begins && begins == ends && ends == 49, "frame cycle mismatch");
+
+        refused_frame_recovery_test();
 
         auto failing = session();
         failing->three_slots.push_real(frame(1));
