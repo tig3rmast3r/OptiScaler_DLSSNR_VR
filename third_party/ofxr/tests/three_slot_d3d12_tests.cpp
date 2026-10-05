@@ -243,7 +243,7 @@ std::shared_ptr<SwapchainState> source(unsigned id,unsigned slices,bool projecti
     return c;
 }
 void release(const std::shared_ptr<SwapchainState>& c, bool poison = true) {
-    c->acquired_indices.push_back(0);c->front_waited=true;
+    c->acquired_indices.push_back(0);c->waited_count=1;
     XrSwapchainImageReleaseInfo info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     require(XR_SUCCEEDED(layer_release_swapchain_image_impl(c->handle,&info)),"source release");
     if(!fsr_test && poison) fill(c->enumerated_d3d12_images[0].Get(),239,238); // queued director must own a private capture

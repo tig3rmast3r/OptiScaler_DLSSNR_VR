@@ -18,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -75,6 +76,9 @@ bool g_steamvr_presenter_mode = false;
 std::atomic<bool> g_application_in_end_frame{false};
 bool g_flight_simulator_mode = false;
 bool g_native_time_rewrite_mode = false;
+bool g_acquire_ahead_mode = false;
+std::atomic<bool> g_acquire_ahead_active{false};
+std::atomic<std::uint32_t> g_acquire_ahead_calls{0};
 bool g_destroy_pending_swapchain = false;
 bool g_destroy_pending_space = false;
 std::atomic<bool> g_swapchain_destroyed{false};
@@ -829,6 +833,10 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_acquire_swapchain_image(
         }
         return XR_SUCCESS;
     }
+    if (g_acquire_ahead_active.load(std::memory_order_acquire)) {
+        *index = g_acquire_ahead_calls.fetch_add(1, std::memory_order_relaxed) % 3U;
+        return XR_SUCCESS;
+    }
     *index = 2;
     return XR_SUCCESS;
 }
@@ -1178,6 +1186,7 @@ int main(int argc, char** argv) {
         (argc == 4 && std::strcmp(argv[3], "flight-simulator") == 0);
     g_native_time_rewrite_mode =
         argc == 4 && std::strcmp(argv[3], "native-time-rewrite") == 0;
+    g_acquire_ahead_mode = argc == 4 && std::strcmp(argv[3], "acquire-ahead") == 0;
     g_test_application_thread_id = GetCurrentThreadId();
     g_inverted_vertical_fov = argc == 4 &&
         (std::strcmp(argv[3], "inverted-fov") == 0 ||
@@ -1197,7 +1206,7 @@ int main(int argc, char** argv) {
         !g_d3d11_interop_mode && !g_steamvr_runtime_mode &&
         !g_flight_simulator_mode && !g_native_time_rewrite_mode &&
         !g_uevr_pipelined_display_time_mode &&
-        !g_inverted_vertical_fov) {
+        !g_inverted_vertical_fov && !g_acquire_ahead_mode) {
         std::cerr << "unknown test mode\n";
         return EXIT_FAILURE;
     }
@@ -1776,6 +1785,63 @@ int main(int argc, char** argv) {
         XR_FAILED(release_image(swapchain, &release_info)) ||
         !wait_for_queue_idle()) {
         return EXIT_FAILURE;
+    }
+
+    if (g_acquire_ahead_mode) {
+        // Ready or Not shape plus several waited images: observable history
+        // captures must follow the actual runtime-owned indices in order.
+        g_acquire_ahead_active.store(true, std::memory_order_release);
+        std::uint32_t first = 3, second = 3;
+        const bool ownership_sequence =
+            XR_SUCCEEDED(acquire_image(swapchain, &acquire_info, &first)) && first == 0 &&
+            XR_SUCCEEDED(acquire_image(swapchain, &acquire_info, &second)) && second == 1 &&
+            XR_SUCCEEDED(wait_image(swapchain, &image_wait_info)) &&
+            XR_SUCCEEDED(wait_image(swapchain, &image_wait_info)) &&
+            XR_SUCCEEDED(release_image(swapchain, &release_info)) && wait_for_queue_idle() &&
+            XR_SUCCEEDED(release_image(swapchain, &release_info)) && wait_for_queue_idle() &&
+            XR_SUCCEEDED(end_session(session)) &&
+            XR_SUCCEEDED(acquire_image(swapchain, &acquire_info, &first)) && first == 2 &&
+            XR_SUCCEEDED(begin_session(session, &session_begin_info)) &&
+            XR_SUCCEEDED(wait_image(swapchain, &image_wait_info)) &&
+            XR_SUCCEEDED(release_image(swapchain, &release_info)) && wait_for_queue_idle() &&
+            XR_SUCCEEDED(acquire_image(swapchain, &acquire_info, &first)) && first == 0 &&
+            XR_SUCCEEDED(wait_image(swapchain, &image_wait_info)) &&
+            XR_SUCCEEDED(end_session(session)) &&
+            XR_SUCCEEDED(begin_session(session, &session_begin_info)) &&
+            XR_SUCCEEDED(release_image(swapchain, &release_info)) && wait_for_queue_idle() &&
+            // An extra accepted wait must not poison later ownership tracking.
+            XR_SUCCEEDED(wait_image(swapchain, &image_wait_info)) &&
+            XR_SUCCEEDED(acquire_image(swapchain, &acquire_info, &first)) && first == 1 &&
+            XR_SUCCEEDED(wait_image(swapchain, &image_wait_info)) &&
+            XR_SUCCEEDED(release_image(swapchain, &release_info)) && wait_for_queue_idle();
+        if (!ownership_sequence || XR_FAILED(destroy_swapchain(swapchain)) ||
+            XR_FAILED(end_session(session)) || XR_FAILED(destroy_session(session)) ||
+            XR_FAILED(destroy_instance(instance))) {
+            std::cerr << "acquire-ahead ownership sequence failed\n";
+            return EXIT_FAILURE;
+        }
+        // The embedded DLL may remain pinned after FreeLibrary. Wait for the
+        // test's final record to reach its private log before process exit can
+        // terminate the recorder thread; do not add a production flush/gate.
+        const auto log_directory = std::filesystem::path(argv[1]).parent_path();
+        const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        bool drained = false;
+        do {
+            for (const auto& entry : std::filesystem::directory_iterator(log_directory)) {
+                if (!entry.path().filename().string().starts_with("ofxr-bridge-flight-")) continue;
+                std::ifstream stream(entry.path());
+                const std::string contents((std::istreambuf_iterator<char>(stream)), {});
+                drained = contents.find("phase=E op=instance_destroy") != std::string::npos;
+                if (drained) break;
+            }
+            if (!drained) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        } while (!drained && std::chrono::steady_clock::now() < drain_deadline);
+        if (!drained) {
+            std::cerr << "acquire-ahead recorder did not drain\n";
+            return EXIT_FAILURE;
+        }
+        FreeLibrary(module);
+        return EXIT_SUCCESS;
     }
 
     XrFrameWaitInfo frame_wait_info{XR_TYPE_FRAME_WAIT_INFO};

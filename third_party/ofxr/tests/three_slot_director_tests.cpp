@@ -496,7 +496,7 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
             xrfg::D3D12HistoryCaptureTicket capture{};
             if(diagnostic || luke || gap) {
                 for(const auto& c:{chain,right_chain}) {
-                    c->acquired_indices.push_back(0);c->front_waited=true;
+                    c->acquired_indices.push_back(0);c->waited_count=1;
                     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
                     check(XR_SUCCEEDED(luke ? release_swapchain_with_identity(c,&release,xrfg::LukeRenderIdentity{0x12340000,n})
                         : layer_release_swapchain_image_impl(c->handle,&release)),"projection release");
@@ -519,7 +519,7 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
             }
             if(gap && (n==4 || n==6)) {
                 auto c=n==4 ? chain : right_chain;
-                c->acquired_indices.push_back(0);c->front_waited=true;
+                c->acquired_indices.push_back(0);c->waited_count=1;
                 XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
                 check(XR_SUCCEEDED(layer_release_swapchain_image_impl(c->handle,&release)),"extra projection release");
             }
@@ -533,7 +533,7 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
                         for (unsigned eye = 0; eye != 2; ++eye)
                             state->d3d11_context->UpdateSubresource(aux->enumerated_d3d11_images[0].Get(), eye,
                                 nullptr, pixels.data(), 256*4, 0);
-                        aux->acquired_indices.push_back(0); aux->front_waited = true;
+                        aux->acquired_indices.push_back(0); aux->waited_count = 1;
                         XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
                         check(XR_SUCCEEDED(layer_release_swapchain_image_impl(aux->handle, &release)), "aux release");
                         // Poison the app texture BEFORE EndFrame. Any capture
@@ -862,7 +862,7 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
                 check(XR_SUCCEEDED(layer_begin_frame_impl(state->handle,nullptr)), "GPU duplicate Begin");
                 for (const auto& c : {chain,right_chain}) {
                     const auto serial = c->last_released_capture->serial;
-                    c->acquired_indices.push_back(0); c->front_waited=true;
+                    c->acquired_indices.push_back(0); c->waited_count=1;
                     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
                     check(XR_SUCCEEDED(release_swapchain_with_identity(c,&release,
                         xrfg::LukeRenderIdentity{0x12340000,n})),"duplicate Release");
@@ -1143,11 +1143,11 @@ void luke_admission_test() {
     commit_luke_pair(mappings,id);
     s->synthesis_busy=true; // Would block forever if duplicate entered worker gate.
     for (const auto& c:chains) {
-        c->acquired_indices.push_back(2); c->front_waited=true;
+        c->acquired_indices.push_back(2); c->waited_count=1;
         const auto start=std::chrono::steady_clock::now();
         check(XR_SUCCEEDED(release_swapchain_with_identity(c,nullptr,id)),"fast duplicate release failed");
         check(std::chrono::steady_clock::now()-start<std::chrono::milliseconds(50),"duplicate waited");
-        check(c->acquired_indices.empty() && !c->front_waited && c->last_released_index==2,
+        check(c->acquired_indices.empty() && !c->waited_count && c->last_released_index==2,
               "duplicate ownership bookkeeping");
         check(c->last_released_capture->serial==7,"private source overwritten");
     }
@@ -1157,11 +1157,11 @@ void luke_admission_test() {
     check(release_swapchain_with_identity(chains[0],nullptr,id)==XR_ERROR_RUNTIME_FAILURE,
           "duplicate hid director failure");
     s->presenter_failure=XR_SUCCESS;
-    chains[0]->acquired_indices.push_back(1);chains[0]->front_waited=true;
+    chains[0]->acquired_indices.push_back(1);chains[0]->waited_count=1;
     s->dispatch->release_swapchain_image=[](XrSwapchain,const XrSwapchainImageReleaseInfo*) { return XR_ERROR_RUNTIME_FAILURE; };
     check(release_swapchain_with_identity(chains[0],nullptr,id)==XR_ERROR_RUNTIME_FAILURE &&
-        chains[0]->acquired_indices.size()==1 && chains[0]->front_waited,"failed release lost ownership");
-    chains[0]->acquired_indices.clear();chains[0]->front_waited=false;
+        chains[0]->acquired_indices.size()==1 && chains[0]->waited_count,"failed release lost ownership");
+    chains[0]->acquired_indices.clear();chains[0]->waited_count=0;
     chains[1]->luke_released_identity=xrfg::LukeRenderIdentity{id.object,11};
     chains[1]->luke_released_duplicate=false;
     check(luke_pair_decision(mappings).action==A::drop && luke_pair_decision(mappings).reset,

@@ -683,6 +683,13 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             COMMAND xrfg_layer_call_chain
                 ${XRFG_TEST_LAYER_DLL}
                 "${CMAKE_CURRENT_BINARY_DIR}/xrfg-layer-call-chain-test.log")
+        add_test(NAME xrfg_layer_acquire_ahead
+            COMMAND "${CMAKE_COMMAND}"
+                "-DLAYER_DLL=${XRFG_TEST_LAYER_DLL}"
+                "-DCALL_CHAIN=$<TARGET_FILE:xrfg_layer_call_chain>"
+                "-DENABLED_INI=${CMAKE_CURRENT_SOURCE_DIR}/tests/ofxr_bridge_logging_enabled.ini"
+                "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/d02-acquire-ahead"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/layer_acquire_ahead.cmake")
         add_test(
             NAME xrfg_layer_presenter_swapchain_lifetime
             COMMAND xrfg_layer_call_chain

@@ -1033,7 +1033,9 @@ struct SwapchainState {
     std::mutex call_mutex;
     std::mutex mutex;
     std::deque<std::uint32_t> acquired_indices;
-    bool front_waited{};
+    // Djules 690e1ee9 / V335: waited images remain owned across session
+    // begin/end, and several acquire/wait calls may precede the first release.
+    std::size_t waited_count{};
     bool ownership_tracking_valid{true};
     std::optional<std::uint32_t> last_released_index;
     std::shared_ptr<xrfg::D3D12SwapchainHistory> d3d12_history;
@@ -3196,10 +3198,9 @@ void reset_swapchain_bookkeeping(const std::shared_ptr<SessionState>& session) n
             std::shared_ptr<FrameGenerationSwapchainState> generation;
             {
                 std::scoped_lock lock(state->mutex);
-                state->acquired_indices.clear();
-                state->front_waited = false;
-                state->ownership_tracking_valid = true;
-                state->last_released_index.reset();
+                // Neither session call releases the application's images.
+                // Keep the runtime's outstanding acquire/wait mirror; reset
+                // only history and generation state, not image ownership.
                 state->last_released_capture.reset();
                 state->last_released_motion_vectors.reset();
                 history = state->d3d12_history;
@@ -4107,7 +4108,7 @@ XrResult layer_acquire_swapchain_image_impl(
                 state->acquired_indices.push_back(*index);
             } catch (...) {
                 state->acquired_indices.clear();
-                state->front_waited = false;
+                state->waited_count = 0;
                 state->last_released_index.reset();
                 state->last_released_capture.reset();
                 state->ownership_tracking_valid = false;
@@ -4132,16 +4133,9 @@ XrResult layer_wait_swapchain_image_impl(
     });
     if (result == XR_SUCCESS || result == XR_SESSION_LOSS_PENDING) {
         std::scoped_lock lock(state->mutex);
-        if (state->ownership_tracking_valid) {
-            if (!state->front_waited && !state->acquired_indices.empty()) {
-                state->front_waited = true;
-            } else {
-                state->acquired_indices.clear();
-                state->front_waited = false;
-                state->last_released_index.reset();
-                state->last_released_capture.reset();
-                state->ownership_tracking_valid = false;
-            }
+        if (state->ownership_tracking_valid &&
+            state->waited_count < state->acquired_indices.size()) {
+            ++state->waited_count;
         }
     }
     return result;
@@ -4270,15 +4264,15 @@ XrResult release_swapchain_with_identity(
         });
         if (XR_SUCCEEDED(result)) {
             std::scoped_lock lock(state->mutex);
-            if (state->ownership_tracking_valid && state->front_waited && !state->acquired_indices.empty()) {
+            if (state->ownership_tracking_valid && state->waited_count > 0 && !state->acquired_indices.empty()) {
                 state->last_released_index = state->acquired_indices.front();
                 state->acquired_indices.pop_front();
-                state->front_waited = false;
+                --state->waited_count;
                 state->luke_released_identity = luke_identity;
                 state->luke_released_duplicate = true;
             } else {
                 state->ownership_tracking_valid = false;
-                state->acquired_indices.clear(); state->front_waited = false;
+                state->acquired_indices.clear(); state->waited_count = 0;
                 state->luke_released_identity.reset();
                 state->luke_released_duplicate = true; // never hand retained A off as new B
             }
@@ -4297,7 +4291,7 @@ XrResult release_swapchain_with_identity(
     std::shared_ptr<xrfg::D3D11D3D12SwapchainInterop> d3d11_interop;
     {
         std::scoped_lock lock(state->mutex);
-        if (state->ownership_tracking_valid && state->front_waited &&
+        if (state->ownership_tracking_valid && state->waited_count > 0 &&
             !state->acquired_indices.empty()) {
             candidate_index = state->acquired_indices.front();
             history = state->d3d12_history;
@@ -4521,11 +4515,11 @@ XrResult release_swapchain_with_identity(
         bool commit_capture = false;
         {
             std::scoped_lock lock(state->mutex);
-            if (state->ownership_tracking_valid && state->front_waited &&
+            if (state->ownership_tracking_valid && state->waited_count > 0 &&
                 !state->acquired_indices.empty()) {
                 const std::uint32_t released_index = state->acquired_indices.front();
                 state->acquired_indices.pop_front();
-                state->front_waited = false;
+                --state->waited_count;
                 state->last_released_index = released_index;
                 state->last_released_capture.reset();
                 state->last_released_motion_vectors.reset();
@@ -4535,7 +4529,7 @@ XrResult release_swapchain_with_identity(
                                  pending_capture->source_index == released_index;
             } else if (state->ownership_tracking_valid) {
                 state->acquired_indices.clear();
-                state->front_waited = false;
+                state->waited_count = 0;
                 state->last_released_index.reset();
                 state->last_released_capture.reset();
                 state->last_released_motion_vectors.reset();
