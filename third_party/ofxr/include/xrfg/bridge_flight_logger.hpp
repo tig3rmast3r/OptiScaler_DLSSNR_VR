@@ -142,6 +142,9 @@ enum class BridgeFlightOperation : std::uint32_t {
     fsr_eye_fov,
     fsr_eye_clip_vertex,
     fsr_hudless_pair,
+    fsr_context_lifecycle,
+    fsr_submit_stage,
+    fsr_recovery,
 };
 
 struct BridgeFlightToken {

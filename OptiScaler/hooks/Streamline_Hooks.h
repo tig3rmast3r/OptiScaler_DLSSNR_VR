@@ -170,6 +170,10 @@ class StreamlineHooks
     static bool isPclHooked();
     static bool isReflexHooked();
 
+    // Returns the underlying D3D/DXGI object when the game's Streamline interposer
+    // supplied a proxy. The returned interface is borrowed from the proxy.
+    static bool getNativeInterface(void* proxyInterface, void** baseInterface);
+
   private:
     inline static sl::RenderAPI renderApi = sl::RenderAPI::eCount;
     inline static std::mutex setConstantsMutex {};

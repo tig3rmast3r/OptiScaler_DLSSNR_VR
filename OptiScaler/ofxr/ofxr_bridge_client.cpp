@@ -317,7 +317,8 @@ void configure_dlss_guides(bool enabled) noexcept {
         xrfg::configure_dlss_motion_vector_tracking(enabled);
 }
 bool publish_dlss_guides(
-    const OFXR_DlssGuidePublicationV2& publication) noexcept {
+    const OFXR_DlssGuidePublicationV2& publication,
+    ID3D12Device* verifiedProducerDevice) noexcept {
     const auto api = current_dispatch();
     if (!complete(api)) {
         xrfg::DlssMotionVectorPublication embedded{};
@@ -354,6 +355,7 @@ bool publish_dlss_guides(
         embedded.camera_far = publication.camera_far;
         embedded.depth_inverted = publication.depth_inverted != 0;
         embedded.depth_infinite = publication.depth_infinite != 0;
+        embedded.verified_producer_device = verifiedProducerDevice;
         xrfg::publish_dlss_motion_vectors(embedded);
         return true;
     }

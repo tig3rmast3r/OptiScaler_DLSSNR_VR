@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.24)
 
 project(XRFrameGenerationBridge VERSION 0.223.0 LANGUAGES CXX)
 
+if(MSVC)
+    # This static layer is linked into OptiScaler and injected into hosts that
+    # can preload an older game-local MSVCP140.dll. Initialize mutex/CV storage
+    # through that loaded runtime instead of relying on the newer toolset's
+    # constexpr representation.
+    add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+endif()
+
 # V23043 embeds the unchanged layer implementation in the OptiScaler module.
 set(XRFG_TEST_LAYER_DLL "" CACHE FILEPATH "Combined DLL tested by the layer harnesses")
 set(XRFG_LAYER_KIND STATIC)
@@ -674,6 +682,13 @@ if(WIN32 AND XRFG_BUILD_LAYER)
                 ${XRFG_TEST_LAYER_DLL}
                 "${CMAKE_CURRENT_BINARY_DIR}/xrfg-layer-pipelined-presenter-test.log"
                 flight-simulator)
+
+        add_test(
+            NAME xrfg_layer_native_time_rewrite
+            COMMAND xrfg_layer_call_chain
+                ${XRFG_TEST_LAYER_DLL}
+                "${CMAKE_CURRENT_BINARY_DIR}/xrfg-layer-native-time-rewrite-test.log"
+                native-time-rewrite)
 
         add_test(
             NAME xrfg_layer_flight_logging

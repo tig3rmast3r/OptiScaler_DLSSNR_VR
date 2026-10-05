@@ -45,6 +45,10 @@ struct DlssMotionVectorPublication {
     float camera_far{1000.0F};
     bool depth_inverted{};
     bool depth_infinite{};
+    // An in-process producer may supply the native D3D12 device after it has
+    // unwrapped and identity-checked every object in the publication. This is
+    // intentionally absent from the external provider ABI.
+    ID3D12Device* verified_producer_device{};
 };
 
 struct DlssMotionVectorFrame {

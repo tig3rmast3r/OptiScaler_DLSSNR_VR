@@ -542,7 +542,7 @@ void luke_cycle_clock_test() {
         XrFrameState prediction{XR_TYPE_FRAME_STATE};
         check(XR_SUCCEEDED(layer_wait_frame_impl(s->handle, nullptr, &prediction)), "Luke clock Wait");
         check(XR_SUCCEEDED(layer_begin_frame_impl(s->handle, nullptr)), "Luke clock Begin");
-        consume_application_frame(s, prediction.predictedDisplayTime, false);
+        consume_application_frame(s, prediction.predictedDisplayTime, false, true);
         s->application_frame_in_progress = false;
         return prediction;
     };
@@ -603,9 +603,32 @@ void luke_cycle_clock_test() {
     { std::scoped_lock lock(g_state_mutex); g_sessions.erase(s->handle); }
 }
 
+void native_stereo_time_match_test() {
+    auto state = session();
+    state->pending_frames.push_back({100, 11});
+    check(latest_pending_application_period(state, 100, false, true) == 11,
+          "exact Native frame time failed");
+    check(latest_pending_application_period(state, 105, false, true) == 11,
+          "Native Stereo Fix time rewrite rejected");
+    consume_application_frame(state, 105, false, true);
+    check(state->pending_frames.empty(), "rewritten Native frame was not consumed");
+
+    state->pending_frames.push_back({100, 11});
+    state->pending_frames.push_back({200, 12});
+    check(latest_pending_application_period(state, 205, false, true) == 12,
+          "Native Stereo Fix selected a stale pending frame");
+    check(!latest_pending_application_period(state, 205, false, false),
+          "ambiguous frame time was accepted without begin ownership");
+    check(latest_pending_application_period(state, 205, true, false) == 11,
+          "overlapping wait lost submission order");
+    consume_application_frame(state, 205, false, true);
+    check(state->pending_frames.empty(), "stale pending Native frames survived");
+}
+
 int main(int argc, char** argv) {
     auto state = session();
     try {
+        native_stereo_time_match_test();
         check(three_slot_generation_session(state), "Nvidia (new) must select director");
         state->nvidia_new_route = false;
         check(!three_slot_generation_session(state), "Nvidia legacy must exclude director");

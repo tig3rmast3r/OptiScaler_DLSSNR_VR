@@ -558,6 +558,16 @@ sl::Result StreamlineHooks::hkslGetNativeInterface(void* proxyInterface, void** 
     return result;
 }
 
+bool StreamlineHooks::getNativeInterface(void* proxyInterface, void** baseInterface)
+{
+    if (proxyInterface == nullptr || baseInterface == nullptr || o_slGetNativeInterface == nullptr)
+        return false;
+
+    *baseInterface = nullptr;
+    return o_slGetNativeInterface(proxyInterface, baseInterface) == sl::Result::eOk &&
+           *baseInterface != nullptr;
+}
+
 sl::Result StreamlineHooks::hkslSetD3DDevice(void* d3dDevice)
 {
     LOG_FUNC();

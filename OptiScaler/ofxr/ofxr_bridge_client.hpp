@@ -22,7 +22,8 @@ namespace ofxr_bridge {
 
 void configure_dlss_guides(bool enabled) noexcept;
 [[nodiscard]] bool publish_dlss_guides(
-    const OFXR_DlssGuidePublicationV2& publication) noexcept;
+    const OFXR_DlssGuidePublicationV2& publication,
+    ID3D12Device* verifiedProducerDevice = nullptr) noexcept;
 void retire_dlss_guide_stream(std::uint64_t stream) noexcept;
 [[nodiscard]] OFXR_DlssGuideStatisticsV2
 dlss_guide_statistics() noexcept;

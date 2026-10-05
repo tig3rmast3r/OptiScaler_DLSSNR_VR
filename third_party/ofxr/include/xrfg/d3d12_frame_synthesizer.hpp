@@ -16,6 +16,12 @@
 
 namespace xrfg {
 
+// AFW can submit an additional application frame before DLSS publishes a new
+// guide. This recoverable result tells the OpenXR layer to pass that frame
+// through without retiring the last real FSR anchor.
+inline constexpr HRESULT kD3D12FrameSynthesisStaleGuides =
+    HRESULT_FROM_WIN32(ERROR_NO_DATA);
+
 struct D3D12FieldOfView {
     float angle_left{};
     float angle_right{};

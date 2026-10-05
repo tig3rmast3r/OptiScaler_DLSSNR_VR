@@ -1,5 +1,6 @@
 #include "d3d12_fsr_frame_generator.hpp"
 
+#include "xrfg/bridge_flight_logger.hpp"
 #include "xrfg/fsr_frame_generation.hpp"
 
 #include <windows.h>
@@ -26,6 +27,21 @@ constexpr D3D12_RESOURCE_STATES kComputeRead =
 constexpr D3D12_RESOURCE_STATES kShaderRead =
     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+// Native Stereo stores both eye viewports in one physical XR texture slice.
+// Their FSR temporal contexts remain separate even though the copy targets
+// share that slice. Array stereo instead owns one context per physical slice.
+[[nodiscard]] bool shared_stereo_slice(
+    std::span<const D3D12FsrEyeInput> inputs) noexcept {
+    if (inputs.size() != 2 ||
+        inputs[0].output_slice != inputs[1].output_slice) return false;
+    const auto& left = inputs[0].color_rect;
+    const auto& right = inputs[1].color_rect;
+    return static_cast<std::uint64_t>(left.offset_x) + left.width <= right.offset_x ||
+           static_cast<std::uint64_t>(right.offset_x) + right.width <= left.offset_x ||
+           static_cast<std::uint64_t>(left.offset_y) + left.height <= right.offset_y ||
+           static_cast<std::uint64_t>(right.offset_y) + right.height <= left.offset_y;
+}
 
 DXGI_FORMAT linear_color_format(DXGI_FORMAT format) noexcept {
     switch (format) {
@@ -255,14 +271,11 @@ struct D3D12FsrFrameGenerator::Impl {
                               generated_array_state, &generated_array);
     }
 
-    HRESULT ensure_eye(Eye& eye, const D3D12FsrEyeInput& input) noexcept {
-        const UINT display_width = input.color_rect.width;
-        const UINT display_height = input.color_rect.height;
-        const UINT render_width = input.depth_rect.width;
-        const UINT render_height = input.depth_rect.height;
+    [[nodiscard]] static UINT context_flags(
+        const D3D12FsrEyeInput& input) noexcept {
         UINT flags = 0;
-        if (input.motion_rect.width == display_width &&
-            input.motion_rect.height == display_height)
+        if (input.motion_rect.width == input.color_rect.width &&
+            input.motion_rect.height == input.color_rect.height)
             flags |= FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS;
         if (input.motion_vectors_jittered)
             flags |= FFX_FRAMEGENERATION_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
@@ -270,11 +283,34 @@ struct D3D12FsrFrameGenerator::Impl {
             flags |= FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED;
         if (input.depth_infinite)
             flags |= FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE;
+        return flags;
+    }
 
-        const bool recreate = !eye.context || eye.display_width != display_width ||
-            eye.display_height != display_height || eye.render_width != render_width ||
-            eye.render_height != render_height || eye.context_flags != flags;
-        if (!recreate) return S_OK;
+    [[nodiscard]] static bool needs_recreate(
+        const Eye& eye, const D3D12FsrEyeInput& input) noexcept {
+        return !eye.context || eye.display_width != input.color_rect.width ||
+            eye.display_height != input.color_rect.height ||
+            eye.render_width != input.depth_rect.width ||
+            eye.render_height != input.depth_rect.height ||
+            eye.context_flags != context_flags(input);
+    }
+
+    HRESULT ensure_eye(
+        Eye& eye,
+        const D3D12FsrEyeInput& input,
+        std::size_t eye_index) noexcept {
+        const UINT display_width = input.color_rect.width;
+        const UINT display_height = input.color_rect.height;
+        const UINT render_width = input.depth_rect.width;
+        const UINT render_height = input.depth_rect.height;
+        const UINT flags = context_flags(input);
+        if (!needs_recreate(eye, input)) return S_OK;
+        bridge_flight_logger().event(
+            BridgeFlightOperation::fsr_context_lifecycle,
+            static_cast<std::int64_t>(eye_index),
+            (static_cast<std::uint64_t>(display_width) << 32U) | display_height,
+            (static_cast<std::uint64_t>(render_width) << 32U) | render_height,
+            (static_cast<std::uint64_t>(eye.context_flags) << 32U) | flags);
         destroy_eye(eye);
 
         HRESULT result = create_texture(device.Get(),
@@ -396,8 +432,9 @@ struct D3D12FsrFrameGenerator::Impl {
 
     HRESULT generate_eye(ID3D12GraphicsCommandList* commands,
                          Eye& eye,
-                         const D3D12FsrEyeInput& input) noexcept {
-        HRESULT result = ensure_eye(eye, input);
+                         const D3D12FsrEyeInput& input,
+                         std::size_t eye_index) noexcept {
+        HRESULT result = ensure_eye(eye, input, eye_index);
         if (FAILED(result)) return result;
         result = copy_inputs(commands, eye, input);
         if (FAILED(result)) return result;
@@ -522,7 +559,7 @@ HRESULT D3D12FsrFrameGenerator::dispatch(
         commands->ResourceBarrier(1, &barrier);
         impl_->generated_array_state = D3D12_RESOURCE_STATE_COPY_DEST;
     }
-    std::uint32_t used_output_slices = 0;
+    const bool shared_slice = shared_stereo_slice(inputs);
     for (std::size_t eye_index = 0; eye_index < inputs.size(); ++eye_index) {
         const auto& input = inputs[eye_index];
         if (!input.color || !input.depth || !input.motion_vectors ||
@@ -546,21 +583,18 @@ HRESULT D3D12FsrFrameGenerator::dispatch(
             report_fsr_frame_generation_attempt(false);
             return E_INVALIDARG;
         }
-        const std::uint32_t output_slice_bit = 1U << input.output_slice;
-        if ((used_output_slices & output_slice_bit) != 0U) {
+        if (eye_index != 0 &&
+            inputs[eye_index - 1].output_slice == input.output_slice &&
+            !shared_slice) {
             report_fsr_frame_generation_status(
                 FsrFrameGenerationStatus::waiting_for_guides);
             report_fsr_frame_generation_attempt(false);
             return E_INVALIDARG;
         }
-        used_output_slices |= output_slice_bit;
 
-        // Temporal history belongs to the physical XR array slice, not to the
-        // transient position of that view in the submitted span. Keeping the
-        // context indexed by eye_index can feed the other eye's history when
-        // view order and array-slice order diverge across a route transition.
-        auto& eye = impl_->eyes[input.output_slice];
-        result = impl_->generate_eye(commands, eye, input);
+        const auto context_index = shared_slice ? eye_index : input.output_slice;
+        auto& eye = impl_->eyes[context_index];
+        result = impl_->generate_eye(commands, eye, input, context_index);
         if (FAILED(result)) {
             report_fsr_frame_generation_status(
                 FsrFrameGenerationStatus::dispatch_failed);
@@ -587,6 +621,20 @@ HRESULT D3D12FsrFrameGenerator::dispatch(
     *generated_array = impl_->generated_array.Get();
     report_fsr_frame_generation_attempt(true);
     return S_OK;
+}
+
+bool D3D12FsrFrameGenerator::requires_idle_reconfigure(
+    std::span<const D3D12FsrEyeInput> inputs) const noexcept {
+    if (!impl_ || inputs.empty() || inputs.size() > kMaximumEyes) return false;
+    const bool shared_slice = shared_stereo_slice(inputs);
+    for (std::size_t eye_index = 0; eye_index < inputs.size(); ++eye_index) {
+        const auto context_index = shared_slice
+            ? eye_index : inputs[eye_index].output_slice;
+        if (context_index >= kMaximumEyes) return false;
+        if (Impl::needs_recreate(impl_->eyes[context_index], inputs[eye_index]))
+            return true;
+    }
+    return false;
 }
 
 void D3D12FsrFrameGenerator::reset() noexcept {

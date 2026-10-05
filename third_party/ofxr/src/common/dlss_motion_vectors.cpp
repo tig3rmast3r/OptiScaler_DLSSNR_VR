@@ -30,6 +30,7 @@ struct StreamState {
     std::uint64_t first_publication{};
     float jitter_x{};
     float jitter_y{};
+    std::shared_ptr<const DlssMotionVectorFrame> previous;
     std::shared_ptr<const DlssMotionVectorFrame> latest;
     // Output colour is consumed on the same direct queue after both eye
     // publications. One private surface per stream is therefore sufficient:
@@ -139,6 +140,7 @@ HRESULT snapshot_resource(
     D3D12_RESOURCE_STATES source_state,
     ID3D12GraphicsCommandList* producer_command_list,
     ID3D12CommandQueue* producer_queue,
+    ID3D12Device* verified_producer_device,
     ComPtr<ID3D12Resource>* snapshot,
     D3D12_RESOURCE_STATES snapshot_state = kSnapshotReadState) noexcept {
     if (source == nullptr || producer_command_list == nullptr ||
@@ -157,9 +159,19 @@ HRESULT snapshot_resource(
     result = producer_queue->GetDevice(
         IID_PPV_ARGS(queue_device.GetAddressOf()));
     if (FAILED(result)) return result;
-    if (!same_identity(source_device.Get(), command_device.Get()) ||
-        !same_identity(source_device.Get(), queue_device.Get())) {
-        return E_INVALIDARG;
+    ComPtr<ID3D12Device> allocation_device;
+    if (verified_producer_device != nullptr) {
+        // The in-process producer has already unwrapped and identity-checked
+        // the devices returned by every resource/list/queue. Comparing the
+        // reported wrapper identities here would recreate the Streamline false
+        // mismatch this field exists to avoid.
+        allocation_device = verified_producer_device;
+    } else {
+        if (!same_identity(source_device.Get(), command_device.Get()) ||
+            !same_identity(source_device.Get(), queue_device.Get())) {
+            return E_INVALIDARG;
+        }
+        allocation_device = source_device;
     }
 
     const D3D12_RESOURCE_DESC description = source->GetDesc();
@@ -170,7 +182,7 @@ HRESULT snapshot_resource(
         properties.CreationNodeMask = 1;
         properties.VisibleNodeMask = 1;
         ComPtr<ID3D12Resource> resource;
-        result = source_device->CreateCommittedResource(
+        result = allocation_device->CreateCommittedResource(
             &properties,
             D3D12_HEAP_FLAG_NONE,
             &description,
@@ -220,6 +232,7 @@ HRESULT snapshot_resource(
 struct Candidate {
     std::uint64_t first_publication{};
     std::shared_ptr<const DlssMotionVectorFrame> frame;
+    std::shared_ptr<const DlssMotionVectorFrame> previous;
 };
 
 }  // namespace
@@ -240,6 +253,7 @@ void publish_dlss_motion_vectors(
         if (publication.reset) {
             ++stream.epoch;
             stream.serial = 0;
+            stream.previous.reset();
             stream.latest.reset();
         }
 
@@ -247,6 +261,7 @@ void publish_dlss_motion_vectors(
         if (FAILED(snapshot_resource(stream.snapshots, stream.next_snapshot,
                 publication.motion_vectors, publication.resource_state,
                 publication.producer_command_list, publication.producer_queue,
+                publication.verified_producer_device,
                 &motion_snapshot))) {
             ++state.statistics.snapshot_failures;
             state.statistics.status = DlssMotionVectorStatus::invalid_input;
@@ -260,7 +275,8 @@ void publish_dlss_motion_vectors(
                     stream.next_depth_snapshot, publication.depth,
                     publication.depth_resource_state,
                     publication.producer_command_list,
-                    publication.producer_queue, &depth_snapshot))) {
+                    publication.producer_queue,
+                    publication.verified_producer_device, &depth_snapshot))) {
                 ++state.statistics.snapshot_failures;
                 state.statistics.status = DlssMotionVectorStatus::invalid_input;
                 return;
@@ -315,6 +331,7 @@ void publish_dlss_motion_vectors(
         if (stream.first_publication == 0) {
             stream.first_publication = frame->publication;
         }
+        stream.previous = std::move(stream.latest);
         stream.latest = std::move(frame);
         if (state.statistics.used == 0) {
             state.statistics.status = DlssMotionVectorStatus::output_not_direct;
@@ -348,6 +365,7 @@ void configure_dlss_motion_vector_tracking(bool enabled) noexcept {
             stream.first_publication = 0;
             stream.jitter_x = 0.0F;
             stream.jitter_y = 0.0F;
+            stream.previous.reset();
             stream.latest.reset();
         }
         state.statistics = {};
@@ -400,7 +418,7 @@ std::shared_ptr<const DlssMotionVectorSet> resolve_dlss_motion_vectors(
             state.statistics.status = DlssMotionVectorStatus::invalid_input;
             return {};
         }
-        const std::uint32_t eye_count = std::min<std::uint32_t>(
+        std::uint32_t eye_count = std::min<std::uint32_t>(
             std::max<std::uint32_t>(description.DepthOrArraySize, 1U),
             kDlssMotionVectorEyeCount);
 
@@ -412,7 +430,87 @@ std::shared_ptr<const DlssMotionVectorSet> resolve_dlss_motion_vectors(
             if (!stream.latest) continue;
             ++streams_with_frames;
             if (same_identity(stream.latest->producer_queue.Get(), consumer_queue)) {
-                candidates.push_back({stream.first_publication, stream.latest});
+                candidates.push_back(
+                    {stream.first_publication, stream.latest, stream.previous});
+            }
+        }
+
+        // Native Stereo can place two eye viewports side by side in one
+        // array-size-one XR image while DLSS keeps one persistent stream per
+        // eye. Restrict the candidate set to streams whose published output is
+        // exactly one horizontal half of the XR image. This excludes desktop
+        // DLSS streams and leaves ordinary mono/Sync Sequential resources on
+        // the existing array-size-one path.
+        if (eye_count == 1) {
+            std::vector<Candidate> horizontal_eye_candidates;
+            horizontal_eye_candidates.reserve(candidates.size());
+            for (const auto& candidate : candidates) {
+                if (candidate.frame->output_width != 0 &&
+                    candidate.frame->output_height != 0 &&
+                    description.Width ==
+                        static_cast<std::uint64_t>(
+                            candidate.frame->output_width) * 2U &&
+                    description.Height == candidate.frame->output_height) {
+                    horizontal_eye_candidates.push_back(candidate);
+                }
+            }
+            if (horizontal_eye_candidates.size() >=
+                    kDlssMotionVectorEyeCount) {
+                candidates = std::move(horizontal_eye_candidates);
+                eye_count = kDlssMotionVectorEyeCount;
+            }
+        }
+
+        // Alternating-eye renderers such as Ghost of Tsushima's AER path reuse
+        // one DLSS handle for both eyes. A complete stereo guide set therefore
+        // consists of two consecutive publications from that single stream.
+        // Even local serials close the stable eye-0/eye-1 pair; odd serials are
+        // deliberately left pending until the second eye arrives.
+        if (eye_count == 2 && candidates.size() == 1) {
+            const auto& current = candidates.front().frame;
+            const auto& previous = candidates.front().previous;
+            if (previous && current->stream == previous->stream &&
+                current->epoch == previous->epoch &&
+                current->serial == previous->serial + 1 &&
+                (current->serial & 1U) == 0 &&
+                current->publication > previous->publication &&
+                current->publication - previous->publication <=
+                    kMaximumStereoPublicationGap &&
+                same_identity(previous->producer_queue.Get(), consumer_queue)) {
+                auto left = std::make_shared<DlssMotionVectorFrame>(*previous);
+                auto right = std::make_shared<DlssMotionVectorFrame>(*current);
+                left->previous_serial = left->serial > 2 ? left->serial - 2 : 0;
+                right->previous_serial = right->serial > 2 ? right->serial - 2 : 0;
+                auto result = std::make_shared<DlssMotionVectorSet>();
+                result->eye_count = 2;
+                result->eyes[0] = std::move(left);
+                result->eyes[1] = std::move(right);
+                ++state.statistics.matched;
+                return result;
+            }
+        }
+
+        // Native Stereo can put two viewports in one double-wide XR image
+        // while DLSS publishes a separate eye-sized stream for each viewport.
+        // Only streams on the consumer queue with this exact output extent
+        // participate. Ordinary mono and Sync Sequential keep one guide.
+        if (eye_count == 1) {
+            std::vector<Candidate> horizontal_eye_candidates;
+            horizontal_eye_candidates.reserve(candidates.size());
+            for (const auto& candidate : candidates) {
+                if (candidate.frame->output_width != 0 &&
+                    candidate.frame->output_height != 0 &&
+                    description.Width ==
+                        static_cast<std::uint64_t>(
+                            candidate.frame->output_width) * 2U &&
+                    description.Height == candidate.frame->output_height) {
+                    horizontal_eye_candidates.push_back(candidate);
+                }
+            }
+            if (horizontal_eye_candidates.size() >=
+                    kDlssMotionVectorEyeCount) {
+                candidates = std::move(horizontal_eye_candidates);
+                eye_count = kDlssMotionVectorEyeCount;
             }
         }
 

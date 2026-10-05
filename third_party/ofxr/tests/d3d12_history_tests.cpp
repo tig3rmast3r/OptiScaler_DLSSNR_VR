@@ -2574,14 +2574,19 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
         return texture;
     };
     const auto shared_output = create_texture(width, height, 1);
+    const auto left_output = create_texture(width, height, 1);
+    const auto right_output = create_texture(width, height, 1);
     const auto motion = create_texture(width / 2, height / 2, 1);
     const auto xr_output = create_texture(width, height, 2);
+    const auto xr_double_wide = create_texture(width * 2, height, 1);
 
     fixture.execute_and_wait([&](ID3D12GraphicsCommandList* command_list) {
-        xrfg::publish_dlss_motion_vectors({
+        xrfg::DlssMotionVectorPublication verified_publication{
             101, shared_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
             0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
-            D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
+            D3D12_RESOURCE_STATE_COMMON, false, false, command_list};
+        verified_publication.verified_producer_device = fixture.device();
+        xrfg::publish_dlss_motion_vectors(verified_publication);
         xrfg::publish_dlss_motion_vectors({
             202, shared_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
             0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
@@ -2602,6 +2607,17 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
             resolved->eyes[0]->output_slice == 0 &&
             resolved->eyes[1]->output_slice == 0,
         "two DLSS streams were not associated with the XR stereo image");
+    const auto double_wide = xrfg::resolve_dlss_motion_vectors(
+        xr_double_wide.Get(), fixture.queue());
+    require(double_wide && double_wide->eye_count == 2 &&
+            double_wide->eyes[0] && double_wide->eyes[1] &&
+            double_wide->eyes[0]->stream == 101 &&
+            double_wide->eyes[1]->stream == 202,
+        "two eye-sized DLSS streams were not associated with double-wide XR");
+    const auto mono = xrfg::resolve_dlss_motion_vectors(
+        left_output.Get(), fixture.queue());
+    require(mono && mono->eye_count == 1 && mono->eyes[0],
+        "ordinary mono output was changed by double-wide stream detection");
 
     // Publish in the opposite order. Eye assignment must remain tied to the
     // stable first-seen stream order, not to this frame's evaluation order.
@@ -2628,7 +2644,7 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
 
     const auto tracked = xrfg::dlss_motion_vector_statistics();
     require(tracked.published == 4 && tracked.snapshot_copies == 4 &&
-            tracked.snapshot_failures == 0 && tracked.matched == 2 &&
+            tracked.snapshot_failures == 0 && tracked.matched == 4 &&
             tracked.resolve_missing_streams == 0 &&
             tracked.resolve_stale_pairs == 0,
         "DLSS stream diagnostics did not account for the stereo pair");
@@ -2646,16 +2662,84 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
     require(xrfg::dlss_motion_vector_statistics().status ==
                 xrfg::DlssMotionVectorStatus::used,
         "a new DLSS publication falsely demoted a recently used vector route");
+
+    // UEVR Native Stereo publishes one eye-sized DLSS output per stream for
+    // a single double-wide XR resource. The Witcher array-stereo assertions
+    // above still cover the shared-output topology.
+    const auto native_left = create_texture(width, height, 1);
+    const auto native_right = create_texture(width, height, 1);
+    const auto native_xr = create_texture(width * 2, height, 1);
+    fixture.execute_and_wait([&](ID3D12GraphicsCommandList* command_list) {
+        xrfg::publish_dlss_motion_vectors({
+            303, native_left.Get(), motion.Get(), fixture.queue(),
+            0, 0, width, height, 0, 0, width / 2, height / 2,
+            1.0F, 1.0F, 0.0F, 0.0F,
+            D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
+        xrfg::publish_dlss_motion_vectors({
+            404, native_right.Get(), motion.Get(), fixture.queue(),
+            0, 0, width, height, 0, 0, width / 2, height / 2,
+            1.0F, 1.0F, 0.0F, 0.0F,
+            D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
+    });
+    const auto native_guides = xrfg::resolve_dlss_motion_vectors(
+        native_xr.Get(), fixture.queue());
+    require(native_guides && native_guides->eye_count == 2 &&
+            native_guides->eyes[0] && native_guides->eyes[1] &&
+            native_guides->eyes[0]->stream == 303 &&
+            native_guides->eyes[1]->stream == 404,
+        "Native Stereo did not select its two eye-sized DLSS streams");
+    const auto native_mono = xrfg::resolve_dlss_motion_vectors(
+        native_left.Get(), fixture.queue());
+    require(native_mono && native_mono->eye_count == 1,
+        "ordinary mono resolution changed with Native Stereo guides");
+
     xrfg::configure_dlss_motion_vector_tracking(false);
     require(!xrfg::resolve_dlss_motion_vectors(xr_output.Get(), fixture.queue()),
         "disabled DLSS vector tracking still resolved a pair");
     xrfg::configure_dlss_motion_vector_tracking(true);
     require(!xrfg::resolve_dlss_motion_vectors(xr_output.Get(), fixture.queue()),
         "re-enabled DLSS vector tracking exposed a stale pair");
+
+    const auto publish_alternating_eye = [&](ID3D12Resource* eye_output) {
+        fixture.execute_and_wait([&](ID3D12GraphicsCommandList* command_list) {
+            xrfg::publish_dlss_motion_vectors({
+                303, eye_output, motion.Get(), fixture.queue(), 0, 0, width, height,
+                0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
+                D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
+        });
+    };
+    publish_alternating_eye(left_output.Get());
+    require(!xrfg::resolve_dlss_motion_vectors(xr_output.Get(), fixture.queue()),
+        "single DLSS stream resolved before the second eye arrived");
+    publish_alternating_eye(right_output.Get());
+    const auto alternating_ab = xrfg::resolve_dlss_motion_vectors(
+        xr_output.Get(), fixture.queue());
+    require(alternating_ab && alternating_ab->eyes[0] && alternating_ab->eyes[1] &&
+            alternating_ab->eyes[0]->stream == 303 &&
+            alternating_ab->eyes[1]->stream == 303 &&
+            alternating_ab->eyes[0]->serial == 1 &&
+            alternating_ab->eyes[1]->serial == 2 &&
+            alternating_ab->eyes[0]->previous_serial == 0 &&
+            alternating_ab->eyes[1]->previous_serial == 0,
+        "single alternating DLSS stream did not form its first stereo pair");
+    publish_alternating_eye(left_output.Get());
+    require(!xrfg::resolve_dlss_motion_vectors(xr_output.Get(), fixture.queue()),
+        "single alternating DLSS stream exposed a half-updated stereo pair");
+    publish_alternating_eye(right_output.Get());
+    const auto alternating_cd = xrfg::resolve_dlss_motion_vectors(
+        xr_output.Get(), fixture.queue());
+    require(alternating_cd && alternating_cd->eyes[0] && alternating_cd->eyes[1] &&
+            alternating_cd->eyes[0]->serial == 3 &&
+            alternating_cd->eyes[1]->serial == 4 &&
+            alternating_cd->eyes[0]->previous_serial == 1 &&
+            alternating_cd->eyes[1]->previous_serial == 2,
+        "single alternating DLSS stream lost per-eye temporal continuity");
     xrfg::configure_dlss_motion_vector_tracking(false);
     xrfg::retire_disabled_dlss_motion_vector_resources();
     xrfg::retire_dlss_motion_vector_stream(101);
     xrfg::retire_dlss_motion_vector_stream(202);
+    xrfg::retire_dlss_motion_vector_stream(303);
+    xrfg::retire_dlss_motion_vector_stream(404);
 }
 
 void test_dlss_motion_vector_gpu_ingress(

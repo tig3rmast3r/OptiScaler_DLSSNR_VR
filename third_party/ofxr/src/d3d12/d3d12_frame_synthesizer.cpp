@@ -1,4 +1,4 @@
-#include "xrfg/d3d12_frame_synthesizer.hpp"
+﻿#include "xrfg/d3d12_frame_synthesizer.hpp"
 #include "xrfg/fsr_frame_generation.hpp"
 #include "d3d12_fsr_frame_generator.hpp"
 #include "xrfg/d3d12_ram_timing.hpp"
@@ -504,6 +504,25 @@ static_assert(kSynthesisConstantCount + 2U <= 64U);
         : std::numeric_limits<UINT>::max();
 }
 
+[[nodiscard]] UINT resolved_fsr_guide_eye(
+    const D3D12ReprojectionView& view,
+    std::size_t view_index,
+    std::size_t view_count,
+    UINT array_size,
+    UINT guide_eye_count) noexcept {
+    // Native double-wide stereo uses one physical resource slice and a DLSS
+    // guide stream for each viewport. Array stereo still uses slice indices.
+    if (array_size == 1 && guide_eye_count == view_count &&
+        view_index < guide_eye_count) {
+        return static_cast<UINT>(view_index);
+    }
+    const UINT slice = resolved_array_slice(
+        view, view_index, view_count, array_size);
+    return slice < guide_eye_count
+        ? slice
+        : std::numeric_limits<UINT>::max();
+}
+
 [[nodiscard]] bool rectangles_overlap(
     const D3D12ImageRect& left,
     const D3D12ImageRect& right) noexcept {
@@ -945,6 +964,8 @@ struct D3D12FrameSynthesizer::Impl {
     std::unique_ptr<D3D12FsrFrameGenerator> fsr_frame_generator;
     bool synthesis_enabled{};
     bool completion_unknown{};
+    bool fsr_context_reset_pending{};
+    bool fsr_stale_guide_gap{};
     bool ffx_context_created{};
     bool flow_output_consumed{};
     bool nvidia_gpu_timing_enabled{};
@@ -1270,6 +1291,25 @@ struct D3D12FrameSynthesizer::Impl {
             IID_PPV_ARGS(cinema_flatten_pipeline.GetAddressOf()));
         if (FAILED(result)) return result;
         graphics_description.RTVFormats[0] = view_format;
+        graphics_description.pRootSignature = root_signature.Get();
+        graphics_description.VS = {
+            g_xrfg_fullscreen_vertex_shader,
+            sizeof(g_xrfg_fullscreen_vertex_shader),
+        };
+
+        graphics_description.pRootSignature = fsr_cinema_root_signature.Get();
+        graphics_description.VS = {
+            g_xrfg_fsr_cinema_vertex_shader,
+            sizeof(g_xrfg_fsr_cinema_vertex_shader),
+        };
+        graphics_description.PS = {
+            g_xrfg_fsr_cinema_pixel_shader,
+            sizeof(g_xrfg_fsr_cinema_pixel_shader),
+        };
+        result = device->CreateGraphicsPipelineState(
+            &graphics_description,
+            IID_PPV_ARGS(fsr_cinema_panel_pipeline.GetAddressOf()));
+        if (FAILED(result)) return result;
         graphics_description.pRootSignature = root_signature.Get();
         graphics_description.VS = {
             g_xrfg_fullscreen_vertex_shader,
@@ -2823,12 +2863,13 @@ struct D3D12FrameSynthesizer::Impl {
 
     [[nodiscard]] bool valid_game_motion_pair(
         const RollingSource& previous_source,
-        const RollingSource& current_source) const noexcept {
+        const RollingSource& current_source,
+        UINT expected_eye_count) const noexcept {
         const auto& previous_vectors = previous_source.motion_vectors;
         const auto& current = current_source.motion_vectors;
         if (!previous_vectors || !current || previous_vectors->eye_count == 0 ||
             previous_vectors->eye_count != current->eye_count ||
-            current->eye_count != image_description.DepthOrArraySize ||
+            current->eye_count != expected_eye_count ||
             current->eye_count > kDlssMotionVectorEyeCount) {
             return false;
         }
@@ -2864,14 +2905,25 @@ struct D3D12FrameSynthesizer::Impl {
         return true;
     }
 
+
+    void synthetic_target_state(ID3D12GraphicsCommandList* list,
+                                std::uint32_t index, bool rendering) {
+        if (release_state == D3D12_RESOURCE_STATE_RENDER_TARGET) return;
+        const auto barrier = transition_barrier(synthetic_destinations[index].resource.Get(),
+            rendering ? release_state : D3D12_RESOURCE_STATE_RENDER_TARGET,
+            rendering ? D3D12_RESOURCE_STATE_RENDER_TARGET : release_state);
+        list->ResourceBarrier(1, &barrier);
+    }
+
     [[nodiscard]] bool unchanged_game_motion_pair(
         const RollingSource& previous_source,
-        const RollingSource& current_source) const noexcept {
+        const RollingSource& current_source,
+        UINT expected_eye_count) const noexcept {
         const auto& previous_vectors = previous_source.motion_vectors;
         const auto& current = current_source.motion_vectors;
         if (!previous_vectors || !current || previous_vectors->eye_count == 0 ||
             previous_vectors->eye_count != current->eye_count ||
-            current->eye_count != image_description.DepthOrArraySize ||
+            current->eye_count != expected_eye_count ||
             current->eye_count > kDlssMotionVectorEyeCount) {
             return false;
         }
@@ -2888,15 +2940,6 @@ struct D3D12FrameSynthesizer::Impl {
         return true;
     }
 
-    void synthetic_target_state(ID3D12GraphicsCommandList* list,
-                                std::uint32_t index, bool rendering) {
-        if (release_state == D3D12_RESOURCE_STATE_RENDER_TARGET) return;
-        const auto barrier = transition_barrier(synthetic_destinations[index].resource.Get(),
-            rendering ? release_state : D3D12_RESOURCE_STATE_RENDER_TARGET,
-            rendering ? D3D12_RESOURCE_STATE_RENDER_TARGET : release_state);
-        list->ResourceBarrier(1, &barrier);
-    }
-
     [[nodiscard]] HRESULT record_game_motion_pair(
         WorkSlot& slot,
         const RollingSource& previous_source,
@@ -2906,7 +2949,9 @@ struct D3D12FrameSynthesizer::Impl {
         std::uint32_t current_destination_index,
         const std::optional<OverlayPlacement>& debug_marker) noexcept {
         const auto& guides = current_source.motion_vectors;
-        if (!guides || !valid_game_motion_pair(previous_source, current_source)) {
+        if (!guides || !valid_game_motion_pair(
+                previous_source, current_source,
+                image_description.DepthOrArraySize)) {
             return E_INVALIDARG;
         }
         dred_marker(slot.command_list.Get(), "OFXR DLSS-vector begin");
@@ -3187,7 +3232,29 @@ struct D3D12FrameSynthesizer::Impl {
             target_views.size() != previous_source.view_count) {
             return E_INVALIDARG;
         }
-        if (!guides || !valid_game_motion_pair(previous_source, current_source)) {
+        if (!guides) {
+            report_fsr_frame_generation_status(
+                FsrFrameGenerationStatus::waiting_for_guides);
+            return DXGI_ERROR_WAS_STILL_DRAWING;
+        }
+        const UINT expected_guide_eyes = std::min<UINT>(
+            std::max<UINT>(image_description.DepthOrArraySize,
+                           current_source.view_count),
+            kDlssMotionVectorEyeCount);
+        if (unchanged_game_motion_pair(
+                previous_source, current_source, expected_guide_eyes)) {
+            report_fsr_frame_generation_status(
+                FsrFrameGenerationStatus::waiting_for_guides);
+            bridge_flight_logger().event(
+                BridgeFlightOperation::fsr_recovery,
+                kD3D12FrameSynthesisStaleGuides,
+                4,
+                guides->eyes[0]->serial,
+                current_source.ticket.serial);
+            return kD3D12FrameSynthesisStaleGuides;
+        }
+        if (!valid_game_motion_pair(
+                previous_source, current_source, expected_guide_eyes)) {
             report_fsr_frame_generation_status(
                 FsrFrameGenerationStatus::waiting_for_guides);
             return DXGI_ERROR_WAS_STILL_DRAWING;
@@ -3238,7 +3305,9 @@ struct D3D12FrameSynthesizer::Impl {
         }
 
         std::array<D3D12FsrEyeInput, kMaxReprojectionViews> inputs{};
-        if (cinema_projection) {
+        const bool witcher_cinema = cinema_projection &&
+            witcher_hudless_color_export() != nullptr;
+        if (witcher_cinema) {
             const HRESULT flatten_result = record_cinema_color(slot, current_source, target_views);
             if (FAILED(flatten_result)) return flatten_result;
         }
@@ -3247,15 +3316,19 @@ struct D3D12FrameSynthesizer::Impl {
             bridge_flight_logger().enabled() &&
             ((fsr_eye_diagnostic_pair++ % 120U) == 0U);
         for (UINT view_index = 0; view_index < target_views.size(); ++view_index) {
-            const UINT slice = resolved_array_slice(
+            const UINT resource_slice = resolved_array_slice(
                 target_views[view_index], view_index, target_views.size(),
                 image_description.DepthOrArraySize);
-            if (slice >= guides->eye_count || !guides->eyes[slice]) {
+            const UINT guide_eye = resolved_fsr_guide_eye(
+                target_views[view_index], view_index, target_views.size(),
+                image_description.DepthOrArraySize, guides->eye_count);
+            if (resource_slice >= image_description.DepthOrArraySize ||
+                guide_eye >= guides->eye_count || !guides->eyes[guide_eye]) {
                 report_fsr_frame_generation_status(
                     FsrFrameGenerationStatus::waiting_for_guides);
                 return DXGI_ERROR_WAS_STILL_DRAWING;
             }
-            const auto& guide = *guides->eyes[slice];
+            const auto& guide = *guides->eyes[guide_eye];
             if (!guide.depth || !guide.motion_vectors ||
                 !same_device(device.Get(), guide.depth.Get()) ||
                 !same_device(device.Get(), guide.motion_vectors.Get())) {
@@ -3268,22 +3341,41 @@ struct D3D12FrameSynthesizer::Impl {
             // compositor, after FSR has finished its synthesis.
             ID3D12Resource* color_resource = hudless_pair_ready
                 ? slot.hudless_source.Get() : current_source.resource.Get();
-            UINT color_slice = slice;
+            UINT color_slice = resource_slice;
             D3D12ImageRect color_rect = resolved_rect(
                 current_source.views[view_index].image_rect,
                 static_cast<UINT>(image_description.Width),
                 image_description.Height);
-            if (cinema_projection) {
+            if (witcher_cinema) {
                 color_resource = cinema_flat_color.Get();
-                color_slice = slice;
+                color_slice = resource_slice;
                 color_rect = {
                     guide.output_x, guide.output_y,
                     guide.output_width, guide.output_height};
+            } else if (cinema_projection) {
+                if (!guide.output ||
+                    !same_device(device.Get(), guide.output.Get()) ||
+                    guide.output_width == 0 || guide.output_height == 0) {
+                    report_fsr_frame_generation_status(
+                        FsrFrameGenerationStatus::waiting_for_guides);
+                    return DXGI_ERROR_WAS_STILL_DRAWING;
+                }
+                const auto output_description = guide.output->GetDesc();
+                if (output_description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                    guide.output_slice >= output_description.DepthOrArraySize ||
+                    guide.output_x + guide.output_width > output_description.Width ||
+                    guide.output_y + guide.output_height > output_description.Height) {
+                    return E_INVALIDARG;
+                }
+                color_resource = guide.output.Get();
+                color_slice = guide.output_slice;
+                color_rect = {guide.output_x, guide.output_y,
+                              guide.output_width, guide.output_height};
             }
             inputs[view_index] = {
                 color_resource,
                 color_slice,
-                slice,
+                resource_slice,
                 color_rect,
                 guide.depth.Get(),
                 {guide.depth_x, guide.depth_y,
@@ -3328,7 +3420,7 @@ struct D3D12FrameSynthesizer::Impl {
                 const auto depth_description = guide.depth->GetDesc();
                 const auto motion_description = guide.motion_vectors->GetDesc();
                 const std::uint64_t slices_and_arrays =
-                    (static_cast<std::uint64_t>(slice) & 0xffULL) |
+                    (static_cast<std::uint64_t>(resource_slice) & 0xffULL) |
                     ((static_cast<std::uint64_t>(color_slice) & 0xffULL) << 8U) |
                     ((static_cast<std::uint64_t>(inputs[view_index].output_slice) & 0xffULL) << 16U) |
                     ((static_cast<std::uint64_t>(guide.motion_slice) & 0xffULL) << 24U) |
@@ -3424,6 +3516,42 @@ struct D3D12FrameSynthesizer::Impl {
                           slot.hudless_source->GetDesc().Format)
                     : 0,
                 static_cast<std::uint64_t>(image_description.Format));
+        }
+
+        // FidelityFX contexts own GPU resources shared by every OFXR work
+        // slot. Recreating one while a different slot still references the
+        // old context is unsafe even when the current slot itself is free.
+        // Defer the whole transaction until the bridge's own fence proves all
+        // earlier FSR work has retired. The caller treats this as an ordinary
+        // guide/continuity miss and primes again without burning the route.
+        if (fsr_frame_generator->requires_idle_reconfigure(
+                std::span<const D3D12FsrEyeInput>(
+                    inputs.data(), target_views.size()))) {
+            // Do not let a transient Cinema/non-Cinema guide revert erase the
+            // need to reset FSR temporal state. Once a domain discontinuity is
+            // observed, keep it latched until every older bridge submission
+            // has retired and the shared contexts can be safely discarded.
+            fsr_context_reset_pending = true;
+        }
+        if (fsr_context_reset_pending) {
+            const std::uint64_t completed = fence->GetCompletedValue();
+            if (completed < last_submitted_fence_value) {
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_recovery,
+                    DXGI_ERROR_WAS_STILL_DRAWING,
+                    1,
+                    completed,
+                    last_submitted_fence_value);
+                return DXGI_ERROR_WAS_STILL_DRAWING;
+            }
+            fsr_frame_generator->reset();
+            fsr_context_reset_pending = false;
+            bridge_flight_logger().event(
+                BridgeFlightOperation::fsr_recovery,
+                S_OK,
+                2,
+                completed,
+                last_submitted_fence_value);
         }
 
         if (backend == D3D12OpticalFlowBackend::nvidia) {
@@ -3527,6 +3655,7 @@ struct D3D12FrameSynthesizer::Impl {
                     static_cast<UINT>(generated_description.Width);
                 cinema_parameters.source_height = generated_description.Height;
                 cinema_parameters.source_slice = inputs[view_index].output_slice;
+                cinema_parameters.padding = witcher_cinema ? 1U : 0U;
                 slot.command_list->SetGraphicsRoot32BitConstants(
                     1, kFsrCinemaPanelConstantCount,
                     &cinema_parameters, 0);
@@ -4238,7 +4367,9 @@ struct D3D12FrameSynthesizer::Impl {
             if (SUCCEEDED(result)) *used_game_motion = true;
             return result;
         }
-        if (valid_game_motion_pair(previous_source, current_source)) {
+        if (valid_game_motion_pair(
+                previous_source, current_source,
+                image_description.DepthOrArraySize)) {
             const HRESULT result = record_game_motion_pair(slot, previous_source,
                 current_source, target_views, synthetic_destination_index,
                 current_destination_index, debug_marker);
@@ -4680,6 +4811,42 @@ struct D3D12FrameSynthesizer::Impl {
 
         HRESULT result = slot.command_list->Close();
         if (FAILED(result)) {
+            if (generation_mode == D3D12FrameGenerationMode::fsr3) {
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_submit_stage,
+                    result, 40, last_submitted_fence_value,
+                    next_fence_value);
+                // The failed list was never submitted and its allocator had
+                // already passed the per-slot retirement gate. Replace the
+                // poisoned recording object, latch a full FSR context reset,
+                // and surface recoverable backpressure so continuity primes
+                // again instead of permanently disabling frame generation.
+                const HRESULT rejected_close = result;
+                fsr_context_reset_pending = true;
+                slot.command_list.Reset();
+                result = slot.allocator->Reset();
+                if (SUCCEEDED(result)) {
+                    result = device->CreateCommandList(
+                        queue->GetDesc().NodeMask,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        slot.allocator.Get(),
+                        nullptr,
+                        IID_PPV_ARGS(slot.command_list.GetAddressOf()));
+                }
+                if (SUCCEEDED(result)) {
+                    result = slot.command_list->Close();
+                }
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_recovery,
+                    result,
+                    3,
+                    static_cast<std::uint64_t>(
+                        static_cast<std::uint32_t>(rejected_close)),
+                    last_submitted_fence_value);
+                if (SUCCEEDED(result)) {
+                    return DXGI_ERROR_WAS_STILL_DRAWING;
+                }
+            }
             synthesis_enabled = false;
             return result;
         }
@@ -5049,6 +5216,7 @@ struct D3D12FrameSynthesizer::Impl {
         }
         next.last_use_fence_value = fence_value;
         previous = std::move(next);
+        fsr_stale_guide_gap = false;
         current_destinations[current_destination_index].fence_value = fence_value;
         next_work_slot = (work_slot_index + 1U) %
             static_cast<std::uint32_t>(work_slots.size());
@@ -5096,10 +5264,17 @@ struct D3D12FrameSynthesizer::Impl {
             previous.ticket.serial != std::numeric_limits<std::uint64_t>::max() &&
             current.serial == previous.ticket.serial + 1U &&
             current.slot != previous.ticket.slot;
+        const bool stale_guide_gapped_capture =
+            generation_mode == D3D12FrameGenerationMode::fsr3 &&
+            fsr_stale_guide_gap && previous.active() &&
+            previous.ticket.serial != std::numeric_limits<std::uint64_t>::max() &&
+            current.serial > previous.ticket.serial &&
+            current.slot != previous.ticket.slot;
         if (!synthesis_enabled || !previous.active() || untracked_source.active() ||
             current.serial == 0 || current.fence_value == 0 ||
             previous.ticket.serial == std::numeric_limits<std::uint64_t>::max() ||
-            (!repeated_capture && !advanced_capture) ||
+            (!repeated_capture && !advanced_capture &&
+             !stale_guide_gapped_capture) ||
             previous.view_count !=
                 static_cast<UINT>(current_source_views.size()) ||
             synthetic_target_views.size() != current_source_views.size() ||
@@ -5289,6 +5464,13 @@ struct D3D12FrameSynthesizer::Impl {
             debug_marker,
             &used_game_motion);
         if (FAILED(result)) {
+            if (generation_mode == D3D12FrameGenerationMode::fsr3 &&
+                result != DXGI_ERROR_WAS_STILL_DRAWING &&
+                result != kD3D12FrameSynthesisStaleGuides) {
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_submit_stage,
+                    result, 1, work_slot_index, current.serial);
+            }
             // A DLSS guide pair can be incomplete during startup, reset, or a
             // transient eye mismatch. The layer will discard this transaction,
             // clear continuity and prime again on the next application frame.
@@ -5296,7 +5478,8 @@ struct D3D12FrameSynthesizer::Impl {
             // permanently burn the FSR route.
             const bool fsr_guides_not_ready =
                 generation_mode == D3D12FrameGenerationMode::fsr3 &&
-                result == DXGI_ERROR_WAS_STILL_DRAWING;
+                (result == DXGI_ERROR_WAS_STILL_DRAWING ||
+                 result == kD3D12FrameSynthesisStaleGuides);
             if (fsr_guides_not_ready) {
                 // record_fsr_pair reports this only before recording GPU work.
                 // Close the freshly reset lists so the same work slot can be
@@ -5318,17 +5501,33 @@ struct D3D12FrameSynthesizer::Impl {
                 synthesis_enabled = false;
             }
             cancel_next();
+            if (result == kD3D12FrameSynthesisStaleGuides) {
+                // This capture was intentionally passed through. Permit the
+                // retained source to pair with the next capture even though
+                // their history serials will no longer be consecutive.
+                fsr_stale_guide_gap = true;
+            }
             return result;
         }
         result = queue->Wait(
             previous.producer_fence.Get(),
             previous.ticket.fence_value);
         if (FAILED(result)) {
+            if (generation_mode == D3D12FrameGenerationMode::fsr3) {
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_submit_stage,
+                    result, 2, previous.ticket.fence_value, current.serial);
+            }
             cancel_next();
             return result;
         }
         result = queue->Wait(next.producer_fence.Get(), current.fence_value);
         if (FAILED(result)) {
+            if (generation_mode == D3D12FrameGenerationMode::fsr3) {
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_submit_stage,
+                    result, 3, current.fence_value, current.serial);
+            }
             cancel_next();
             return result;
         }
@@ -5342,6 +5541,11 @@ struct D3D12FrameSynthesizer::Impl {
                            slot, work_slot_index, &next, &fence_value,
                            defer_current_copy);
         if (FAILED(result)) {
+            if (generation_mode == D3D12FrameGenerationMode::fsr3) {
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_submit_stage,
+                    result, 4, work_slot_index, current.serial);
+            }
             if (next.active()) {
                 cancel_next();
             }
@@ -5355,6 +5559,11 @@ struct D3D12FrameSynthesizer::Impl {
             fence.Get(),
             fence_value);
         if (FAILED(result)) {
+            if (generation_mode == D3D12FrameGenerationMode::fsr3) {
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_submit_stage,
+                    result, 5, fence_value, current.serial);
+            }
             synthesis_enabled = false;
             untracked_source = std::move(next);
             return result;
@@ -5362,6 +5571,7 @@ struct D3D12FrameSynthesizer::Impl {
 
         const std::uint64_t previous_serial = previous.ticket.serial;
         previous = std::move(next);
+        fsr_stale_guide_gap = false;
         current_destinations[current_destination_index].fence_value = fence_value;
         synthetic_destinations[synthetic_destination_index].fence_value = fence_value;
         next_work_slot = (work_slot_index + 1U) %
@@ -5382,12 +5592,13 @@ struct D3D12FrameSynthesizer::Impl {
             synthesis_enabled = false;
             return HRESULT_FROM_WIN32(ERROR_IO_INCOMPLETE);
         }
-        if (!previous.active()) return S_OK;
+        if (!previous.active()) { fsr_stale_guide_gap = false; return S_OK; }
         if (previous.last_use_fence_value == 0) {
             // A tracked real source was never read by synthesis. It has no
             // consumer GPU fence to retire against.
             history->cancel_consumer(previous.lease);
             previous.clear();
+            fsr_stale_guide_gap = false;
             return S_OK;
         }
         if (fence == nullptr) {
@@ -5403,6 +5614,7 @@ struct D3D12FrameSynthesizer::Impl {
             return result;
         }
         previous.clear();
+        fsr_stale_guide_gap = false;
         return S_OK;
     }
 
@@ -5551,7 +5763,12 @@ bool D3D12FrameSynthesizer::can_pair_fsr(std::shared_ptr<const DlssMotionVectorS
     if (!impl_ || !impl_->previous.active()) return false;
     Impl::RollingSource next{};
     next.motion_vectors = std::move(current);
-    if (!impl_->valid_game_motion_pair(impl_->previous, next)) return false;
+    const UINT expected_guide_eyes = std::min<UINT>(
+        std::max<UINT>(impl_->image_description.DepthOrArraySize,
+                       impl_->previous.view_count),
+        kDlssMotionVectorEyeCount);
+    if (!impl_->valid_game_motion_pair(
+            impl_->previous, next, expected_guide_eyes)) return false;
     for (UINT eye = 0; eye < next.motion_vectors->eye_count; ++eye) {
         const auto& guide = next.motion_vectors->eyes[eye];
         if (!guide->depth || !same_device(impl_->device.Get(), guide->depth.Get()) ||

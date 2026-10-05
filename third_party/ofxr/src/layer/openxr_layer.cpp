@@ -6194,10 +6194,14 @@ enum class GenerationPrepareReason : std::int64_t {
     structural_quarantine_active = 18,
     synthesis_busy = 19,
     presenter_route_changed = 23,
+    synthesis_stale_guides = 24,
 };
 
 [[nodiscard]] constexpr GenerationPrepareReason classify_synthesis_failure(
     HRESULT result) noexcept {
+    if (result == xrfg::kD3D12FrameSynthesisStaleGuides) {
+        return GenerationPrepareReason::synthesis_stale_guides;
+    }
     return result == HRESULT_FROM_WIN32(ERROR_BUSY) ||
             result == DXGI_ERROR_WAS_STILL_DRAWING
         ? GenerationPrepareReason::synthesis_busy
@@ -6206,6 +6210,25 @@ enum class GenerationPrepareReason : std::int64_t {
 
 static_assert(classify_synthesis_failure(DXGI_ERROR_WAS_STILL_DRAWING) ==
     GenerationPrepareReason::synthesis_busy);
+static_assert(classify_synthesis_failure(
+                  xrfg::kD3D12FrameSynthesisStaleGuides) ==
+    GenerationPrepareReason::synthesis_stale_guides);
+
+[[nodiscard]] constexpr bool should_preserve_generation_anchor(
+    HRESULT result,
+    bool current_released,
+    bool synthetic_released) noexcept {
+    return result == xrfg::kD3D12FrameSynthesisStaleGuides &&
+        current_released && synthetic_released;
+}
+
+static_assert(should_preserve_generation_anchor(
+    xrfg::kD3D12FrameSynthesisStaleGuides, true, true));
+static_assert(!should_preserve_generation_anchor(
+    DXGI_ERROR_WAS_STILL_DRAWING, true, true));
+static_assert(!should_preserve_generation_anchor(
+    xrfg::kD3D12FrameSynthesisStaleGuides, false, true));
+
 struct PreparedGeneration {
     PreparedGenerationKind kind{PreparedGenerationKind::none};
     GenerationPrepareReason reason{GenerationPrepareReason::exception};
@@ -6220,6 +6243,7 @@ struct PreparedGeneration {
     std::uint32_t synthetic_destination{};
     std::size_t current_slot{};
     std::size_t synthetic_slot{};
+    bool preserve_previous{};
 };
 
 struct PreparedProjectionResource {
@@ -6233,6 +6257,7 @@ struct PreparedProjectionFrame {
     XrSwapchain failed_swapchain{XR_NULL_HANDLE};
     std::vector<PreparedProjectionResource> resources;
     bool anchor_is_current{};
+    bool preserve_previous{};
 };
 
 [[nodiscard]] PreparedGeneration prepare_frame_generation(
@@ -6494,8 +6519,18 @@ struct PreparedProjectionFrame {
             current_image);
 
         if (FAILED(submit_result)) {
-            output.reason = classify_synthesis_failure(submit_result);
-            if (request_pair) {
+            // A busy bridge slot or an FSR context waiting for its previous GPU
+            // users is ordinary backpressure. A repeated AFW guide is different:
+            // pass this application frame through while retaining the last real
+            // anchor, so the next advanced guide can still form an FSR pair.
+            const bool stale_guides = request_pair &&
+                should_preserve_generation_anchor(
+                    submit_result, current_released, synthetic_released);
+            output.reason = stale_guides
+                ? GenerationPrepareReason::synthesis_stale_guides
+                : classify_synthesis_failure(submit_result);
+            output.preserve_previous = stale_guides;
+            if (request_pair && !stale_guides) {
                 std::scoped_lock gpu_lock(state->session->gpu_mutex);
                 static_cast<void>(generation->synthesizer->retire_previous());
             }
@@ -6577,6 +6612,7 @@ struct PreparedProjectionFrame {
             : PreparedGenerationKind::prime;
         bool all_expected_kind = true;
         bool all_anchor_current = true;
+        bool all_preserve_previous = request_pair;
         output.resources.reserve(mappings.size());
         for (const ProjectionResourceMapping& mapping : mappings) {
             const auto reprojection_views =
@@ -6597,6 +6633,8 @@ struct PreparedProjectionFrame {
                 all_expected_kind && generation.kind == expected_kind;
             all_anchor_current =
                 all_anchor_current && generation.anchor_is_current;
+            all_preserve_previous =
+                all_preserve_previous && generation.preserve_previous;
             if (generation.reason != GenerationPrepareReason::ready &&
                 output.failed_swapchain == XR_NULL_HANDLE) {
                 output.reason = generation.reason;
@@ -6611,6 +6649,7 @@ struct PreparedProjectionFrame {
             ? expected_kind
             : PreparedGenerationKind::none;
         output.anchor_is_current = all_anchor_current;
+        output.preserve_previous = all_preserve_previous;
         if (all_expected_kind) {
             output.reason = GenerationPrepareReason::ready;
         } else if (output.failed_swapchain == XR_NULL_HANDLE) {
@@ -7032,7 +7071,8 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
 [[nodiscard]] std::optional<XrDuration> latest_pending_application_period(
     const std::shared_ptr<SessionState>& state,
     XrTime display_time,
-    bool consume_in_submission_order) noexcept {
+    bool consume_in_submission_order,
+    bool match_latest_by_submission) noexcept {
     try {
         std::scoped_lock lock(state->mutex);
         if (consume_in_submission_order) {
@@ -7041,26 +7081,22 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
                 : std::optional<XrDuration>{
                       state->pending_frames.front().display_period};
         }
-        // xrEndFrame::displayTime is an application-selected presentation
-        // time, not an identity token for the preceding xrWaitFrame. UEVR's
-        // Native Stereo Fix deliberately submits an older pipelined render
-        // state while keeping a strictly sequential wait/begin/end call chain.
-        // When exactly one wait is outstanding, call order identifies the
-        // frame unambiguously even if those two times differ.
-        if (state->pending_frames.size() == 1) {
-            return state->pending_frames.front().display_period;
-        }
         const auto frame = std::find_if(
             state->pending_frames.begin(),
             state->pending_frames.end(),
             [display_time](const PendingApplicationFrame& candidate) {
                 return candidate.display_time == display_time;
             });
-        if (frame == state->pending_frames.end() ||
-            std::next(frame) != state->pending_frames.end()) {
-            return std::nullopt;
+        if (frame != state->pending_frames.end() &&
+            std::next(frame) == state->pending_frames.end()) {
+            return frame->display_period;
         }
-        return frame->display_period;
+        // Native Stereo Fix may rewrite displayTime. A begun frame with no
+        // overlapping wait identifies the newest pending record by call order.
+        return match_latest_by_submission && !state->pending_frames.empty()
+            ? std::optional<XrDuration>{
+                  state->pending_frames.back().display_period}
+            : std::nullopt;
     } catch (...) {
         return std::nullopt;
     }
@@ -7412,7 +7448,8 @@ struct InternalCycleResult {
 void consume_application_frame(
     const std::shared_ptr<SessionState>& state,
     XrTime display_time,
-    bool consume_in_submission_order) {
+    bool consume_in_submission_order,
+    bool match_latest_by_submission) {
     std::scoped_lock lock(state->mutex);
     if (consume_in_submission_order) {
         if (!state->pending_frames.empty()) {
@@ -7420,8 +7457,8 @@ void consume_application_frame(
         }
         return;
     }
-    if (state->pending_frames.size() == 1) {
-        state->pending_frames.pop_front();
+    if (match_latest_by_submission) {
+        state->pending_frames.clear();
         return;
     }
     const auto frame = std::find_if(
@@ -7663,6 +7700,8 @@ XrResult layer_end_frame_impl(
     const auto application_end_now = std::chrono::steady_clock::now();
     const bool frame_had_overlapping_wait =
         state->application_frame_has_overlapping_wait;
+    const bool application_frame_in_progress =
+        state->application_frame_in_progress;
     const bool pipelined_presenter_mode = state->pipelined_presenter_mode;
     // Both promotions hand the presenter its first frame at the top of an
     // xrEndFrame, before the inline second cycle runs, so the handoff never
@@ -7672,6 +7711,8 @@ XrResult layer_end_frame_impl(
         state->presenter_start_requested;
     const bool consume_in_submission_order =
         pipelined_presenter_mode || frame_had_overlapping_wait;
+    const bool match_latest_by_submission =
+        application_frame_in_progress && !consume_in_submission_order;
     state->application_frame_in_progress = false;
     state->application_frame_has_overlapping_wait = false;
     if (!frame_had_overlapping_wait && !pipelined_presenter_mode) {
@@ -7800,7 +7841,8 @@ XrResult layer_end_frame_impl(
                 consume_application_frame(
                     state,
                     end_info->displayTime,
-                    consume_in_submission_order);
+                    consume_in_submission_order,
+                    match_latest_by_submission);
             }
             if (XR_SUCCEEDED(end_result) && !use_continuous_presenter) {
                 const XrResult start_result =
@@ -7939,7 +7981,8 @@ XrResult layer_end_frame_impl(
         latest_pending_application_period(
             state,
             current_snapshot.display_time,
-            consume_in_submission_order);
+            consume_in_submission_order,
+            match_latest_by_submission);
     const bool latest_application_frame = application_display_period.has_value();
     std::optional<ProjectionSnapshot> previous_snapshot;
     {
@@ -7984,7 +8027,9 @@ XrResult layer_end_frame_impl(
               if (state->presenter_stop_requested) return XR_ERROR_SESSION_NOT_RUNNING; }
             // This is a virtual app cycle; the director alone owns runtime
             // Wait/Begin/End. No borrowed repeat and no new synthesis job.
-            consume_application_frame(state, current_snapshot.display_time, consume_in_submission_order);
+            consume_application_frame(state, current_snapshot.display_time,
+                                      consume_in_submission_order,
+                                      match_latest_by_submission);
             xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::luke_filter,
                 luke.reset ? 2 : 1, luke.identity ? luke.identity->render : ~0ULL,
                 luke.identity ? luke.identity->object : 0, current_snapshot.display_time);
@@ -8002,7 +8047,8 @@ XrResult layer_end_frame_impl(
                     luke.reset ? 3 : 0, luke.identity->render, luke.identity->object,
                     current_snapshot.display_time);
             consume_application_frame(state, current_snapshot.display_time,
-                                      consume_in_submission_order);
+                                      consume_in_submission_order,
+                                      match_latest_by_submission);
             std::scoped_lock lock(state->mutex);
             state->previous_projection = current_snapshot;
             state->generation_failure_streak = 0;
@@ -8121,7 +8167,7 @@ XrResult layer_end_frame_impl(
                 GenerationQuarantineReason::generated_end_info_failed);
             prepared = {};
         }
-    } else if (!prepared.anchor_is_current) {
+    } else if (!prepared.anchor_is_current && !prepared.preserve_previous) {
         clear_generation_continuity(state);
     }
 
@@ -8317,7 +8363,8 @@ XrResult layer_end_frame_impl(
     consume_application_frame(
         state,
         current_snapshot.display_time,
-        consume_in_submission_order);
+        consume_in_submission_order,
+        match_latest_by_submission);
     if (!use_continuous_presenter && pair_ready && application_display_period &&
         !pipelined_presenter_mode &&
         xrfg::should_enter_generation_cooldown(
@@ -8336,7 +8383,7 @@ XrResult layer_end_frame_impl(
     if (prepared.anchor_is_current) {
         std::scoped_lock lock(state->mutex);
         state->previous_projection = current_snapshot;
-    } else {
+    } else if (!prepared.preserve_previous) {
         std::scoped_lock lock(state->mutex);
         state->previous_projection.reset();
     }

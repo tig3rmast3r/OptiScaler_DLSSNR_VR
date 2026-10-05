@@ -51,6 +51,8 @@ public:
         ID3D12GraphicsCommandList* command_list,
         std::span<const D3D12FsrEyeInput> eyes,
         ID3D12Resource** generated_array) noexcept;
+    [[nodiscard]] bool requires_idle_reconfigure(
+        std::span<const D3D12FsrEyeInput> eyes) const noexcept;
     void reset() noexcept;
 
 private:

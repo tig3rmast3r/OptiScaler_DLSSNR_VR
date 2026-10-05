@@ -74,6 +74,7 @@ bool g_steamvr_presenter_mode = false;
 // the two waits apart by what is happening rather than by counting calls.
 std::atomic<bool> g_application_in_end_frame{false};
 bool g_flight_simulator_mode = false;
+bool g_native_time_rewrite_mode = false;
 bool g_destroy_pending_swapchain = false;
 bool g_destroy_pending_space = false;
 std::atomic<bool> g_swapchain_destroyed{false};
@@ -384,7 +385,7 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_end_frame(
     {
         std::scoped_lock lock(g_frame_loop_mutex);
         if (!g_begun_display_time || end_info == nullptr ||
-            (!g_flight_simulator_mode &&
+            (!g_flight_simulator_mode && !g_native_time_rewrite_mode &&
              !g_uevr_pipelined_display_time_mode &&
              end_info->displayTime != *g_begun_display_time)) {
             return XR_ERROR_CALL_ORDER_INVALID;
@@ -1120,7 +1121,7 @@ int main(int argc, char** argv) {
             "usage: xrfg_layer_call_chain <layer-dll> <log-path> "
             "[split-eye|cropped-split-eye|double-wide|d3d11-interop|"
             "d3d11-double-wide|steamvr-inline|steamvr-presenter|"
-            "flight-simulator|uevr-pipelined-time|inverted-fov|"
+            "flight-simulator|native-time-rewrite|uevr-pipelined-time|inverted-fov|"
             "d3d11-inverted-fov]\n";
         return EXIT_FAILURE;
     }
@@ -1138,6 +1139,8 @@ int main(int argc, char** argv) {
         argc == 4 && std::strcmp(argv[3], "flight-destroy-swapchain") == 0;
     g_flight_simulator_mode = g_destroy_pending_swapchain ||
         (argc == 4 && std::strcmp(argv[3], "flight-simulator") == 0);
+    g_native_time_rewrite_mode =
+        argc == 4 && std::strcmp(argv[3], "native-time-rewrite") == 0;
     g_test_application_thread_id = GetCurrentThreadId();
     g_inverted_vertical_fov = argc == 4 &&
         (std::strcmp(argv[3], "inverted-fov") == 0 ||
@@ -1155,7 +1158,8 @@ int main(int argc, char** argv) {
         (std::strcmp(argv[3], "split-eye") == 0 || g_cropped_subimage_mode);
     if (argc == 4 && !g_split_eye_mode && !g_double_wide_mode &&
         !g_d3d11_interop_mode && !g_steamvr_runtime_mode &&
-        !g_flight_simulator_mode && !g_uevr_pipelined_display_time_mode &&
+        !g_flight_simulator_mode && !g_native_time_rewrite_mode &&
+        !g_uevr_pipelined_display_time_mode &&
         !g_inverted_vertical_fov) {
         std::cerr << "unknown test mode\n";
         return EXIT_FAILURE;
@@ -1869,6 +1873,68 @@ int main(int argc, char** argv) {
         }
         std::cout <<
             "OpenXR UEVR pipelined display-time call-chain test passed\n";
+        return EXIT_SUCCESS;
+    }
+
+    if (g_native_time_rewrite_mode) {
+        XrFrameState first{XR_TYPE_FRAME_STATE};
+        XrFrameState second{XR_TYPE_FRAME_STATE};
+        XrFrameState third{XR_TYPE_FRAME_STATE};
+        constexpr XrTime kNativeFixOffset = 5'000;
+        const bool sequence_succeeded =
+            XR_SUCCEEDED(wait_frame(session, &frame_wait_info, &first)) &&
+            first.predictedDisplayTime == 100 &&
+            XR_SUCCEEDED(begin_frame(session, &frame_begin_info)) &&
+            capture_fresh_application_image() &&
+            submit_frame(first.predictedDisplayTime + kNativeFixOffset) &&
+            wait_for_queue_idle() &&
+            XR_SUCCEEDED(wait_frame(session, &frame_wait_info, &second)) &&
+            second.predictedDisplayTime == 200 &&
+            XR_SUCCEEDED(begin_frame(session, &frame_begin_info)) &&
+            capture_fresh_application_image() &&
+            submit_frame(second.predictedDisplayTime + kNativeFixOffset) &&
+            wait_for_queue_idle() &&
+            XR_SUCCEEDED(wait_frame(session, &frame_wait_info, &third)) &&
+            third.predictedDisplayTime == 300 &&
+            XR_SUCCEEDED(begin_frame(session, &frame_begin_info)) &&
+            capture_fresh_application_image() &&
+            submit_frame(third.predictedDisplayTime + kNativeFixOffset) &&
+            wait_for_queue_idle();
+        const bool teardown_succeeded =
+            XR_SUCCEEDED(end_session(session)) &&
+            XR_SUCCEEDED(destroy_swapchain(swapchain)) &&
+            XR_SUCCEEDED(destroy_session(session)) &&
+            XR_SUCCEEDED(destroy_instance(instance));
+        FreeLibrary(module);
+        std::vector<EndFrameRecord> end_records;
+        {
+            std::scoped_lock lock(g_end_records_mutex);
+            end_records = g_end_records;
+        }
+        std::size_t current_frames = 0;
+        std::size_t synthetic_frames = 0;
+        for (const EndFrameRecord& record : end_records) {
+            current_frames += record.target == SubmittedTarget::current ? 1U : 0U;
+            synthetic_frames +=
+                record.target == SubmittedTarget::synthetic ? 1U : 0U;
+        }
+        const bool valid = sequence_succeeded && teardown_succeeded &&
+            current_frames == 2 && synthetic_frames == 1 &&
+            g_wait_frame_calls.load(std::memory_order_relaxed) == 4 &&
+            g_begin_frame_calls.load(std::memory_order_relaxed) == 5 &&
+            g_end_frame_calls.load(std::memory_order_relaxed) == 4 &&
+            g_waited_display_times.empty() && !g_begun_display_time;
+        if (!valid) {
+            std::cerr << "Native-time rewrite validation failed: sequence="
+                      << sequence_succeeded << " teardown=" << teardown_succeeded
+                      << " current=" << current_frames
+                      << " synthetic=" << synthetic_frames << " waits="
+                      << g_wait_frame_calls.load() << " begins="
+                      << g_begin_frame_calls.load() << " ends="
+                      << g_end_frame_calls.load() << '\n';
+            return EXIT_FAILURE;
+        }
+        std::cout << "OpenXR Native Stereo Fix time-rewrite test passed\n";
         return EXIT_SUCCESS;
     }
 

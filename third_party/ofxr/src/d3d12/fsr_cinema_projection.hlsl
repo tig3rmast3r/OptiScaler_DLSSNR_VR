@@ -7,7 +7,7 @@ cbuffer CinemaPanelParameters : register(b0) {
     uint source_width;
     uint source_height;
     uint source_slice;
-    uint padding;
+    uint decode_generated_srgb;
 };
 
 Texture2DArray<float4> generated_texture : register(t0);
@@ -42,11 +42,12 @@ float4 CinemaPanelPS(VertexOutput input) : SV_Target0 {
     const float2 uv = pixel / dimensions;
     float4 color = generated_texture.SampleLevel(
         linear_sampler, float3(uv, source_slice), 0.0);
-    // FSR receives display-encoded final colour flattened from the XR panel.
-    // Decode once before the sRGB XR target encodes the generated panel.
-    const float3 low = color.rgb / 12.92;
-    const float3 high = pow(max((color.rgb + 0.055) / 1.055, 0.0), 2.4);
-    color.rgb = lerp(high, low, step(color.rgb, 0.04045));
+    if (decode_generated_srgb != 0) {
+        // Witcher supplies display-encoded flattened colour to FSR.
+        const float3 low = color.rgb / 12.92;
+        const float3 high = pow(max((color.rgb + 0.055) / 1.055, 0.0), 2.4);
+        color.rgb = lerp(high, low, step(color.rgb, 0.04045));
+    }
     color.a = 1.0;
     return color;
 }

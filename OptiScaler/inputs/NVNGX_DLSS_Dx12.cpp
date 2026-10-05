@@ -19,6 +19,7 @@
 #include <imgui/ImGuiNotify.hpp>
 
 #include <hooks/D3D12_Hooks.h>
+#include <hooks/Streamline_Hooks.h>
 #include <diagnostics/DredMarkers.h>
 
 #include <dxgi1_4.h>
@@ -38,6 +39,59 @@ static int evalCounter = 0;
 static bool shutdown = false;
 static bool _skipInit = false;
 static wchar_t const** paths;
+
+template <typename Interface>
+static Interface* ResolveStreamlineNativeInterface(Interface* object)
+{
+    void* native = nullptr;
+    if (object != nullptr && StreamlineHooks::getNativeInterface(object, &native))
+        return static_cast<Interface*>(native);
+    return object;
+}
+
+static Microsoft::WRL::ComPtr<IUnknown> CanonicalIdentity(IUnknown* object)
+{
+    Microsoft::WRL::ComPtr<IUnknown> identity;
+    if (object != nullptr)
+        object->QueryInterface(IID_PPV_ARGS(identity.GetAddressOf()));
+    return identity;
+}
+
+template <typename DeviceChild>
+static Microsoft::WRL::ComPtr<ID3D12Device> ResolveStreamlineNativeDevice(
+    DeviceChild* object)
+{
+    Microsoft::WRL::ComPtr<ID3D12Device> reportedDevice;
+    if (object == nullptr || FAILED(object->GetDevice(
+            IID_PPV_ARGS(reportedDevice.GetAddressOf()))))
+        return {};
+
+    ID3D12Device* nativeDevice = ResolveStreamlineNativeInterface(
+        reportedDevice.Get());
+    Microsoft::WRL::ComPtr<ID3D12Device> retainedDevice;
+    if (nativeDevice == nullptr || FAILED(nativeDevice->QueryInterface(
+            IID_PPV_ARGS(retainedDevice.GetAddressOf()))))
+        return {};
+    return retainedDevice;
+}
+
+static bool SameCanonicalIdentity(IUnknown* left, IUnknown* right)
+{
+    const auto leftIdentity = CanonicalIdentity(left);
+    const auto rightIdentity = CanonicalIdentity(right);
+    return leftIdentity && rightIdentity &&
+        leftIdentity.Get() == rightIdentity.Get();
+}
+
+static bool SameAdapter(ID3D12Device* left, ID3D12Device* right)
+{
+    if (left == nullptr || right == nullptr)
+        return false;
+    const LUID leftLuid = left->GetAdapterLuid();
+    const LUID rightLuid = right->GetAdapterLuid();
+    return leftLuid.HighPart == rightLuid.HighPart &&
+        leftLuid.LowPart == rightLuid.LowPart;
+}
 
 static const char* OfxrGuideStatusName(std::uint32_t status)
 {
@@ -139,8 +193,37 @@ static void PublishOfxrDlssGuides(
             NVSDK_NGX_Result_Success ||
         parameters->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) !=
             NVSDK_NGX_Result_Success ||
-        output == nullptr || motion == nullptr || queue == nullptr)
+        output == nullptr || motion == nullptr || queue == nullptr ||
+        commandList == nullptr)
         return;
+
+    parameters->Get(NVSDK_NGX_Parameter_Depth, &depth);
+
+    output = ResolveStreamlineNativeInterface(output);
+    motion = ResolveStreamlineNativeInterface(motion);
+    queue = ResolveStreamlineNativeInterface(queue);
+    commandList = ResolveStreamlineNativeInterface(commandList);
+    depth = ResolveStreamlineNativeInterface(depth);
+
+    const auto outputDevice = ResolveStreamlineNativeDevice(output);
+    const auto motionDevice = ResolveStreamlineNativeDevice(motion);
+    const auto depthDevice = ResolveStreamlineNativeDevice(depth);
+    const auto commandDevice = ResolveStreamlineNativeDevice(commandList);
+    const auto queueDevice = ResolveStreamlineNativeDevice(queue);
+    const bool devicesMatch = outputDevice && motionDevice && commandDevice &&
+        queueDevice && SameAdapter(outputDevice.Get(), commandDevice.Get()) &&
+        SameAdapter(motionDevice.Get(), commandDevice.Get()) &&
+        SameCanonicalIdentity(queueDevice.Get(), commandDevice.Get()) &&
+        (depth == nullptr || (depthDevice &&
+            SameAdapter(depthDevice.Get(), commandDevice.Get())));
+    if (!devicesMatch)
+    {
+        static std::atomic_bool mismatchLogged { false };
+        if (ofxr_bridge::logging_setting() &&
+            !mismatchLogged.exchange(true, std::memory_order_relaxed))
+            LOG_WARN("V23090 OFXR guide resources do not match the command adapter or queue/list identity");
+        return;
+    }
 
     const auto outputDesc = output->GetDesc();
     const auto motionDesc = motion->GetDesc();
@@ -181,8 +264,6 @@ static void PublishOfxrDlssGuides(
     parameters->Get(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, &frameTimeDelta);
     parameters->Get(NVSDK_NGX_Parameter_Reset, &reset);
     parameters->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags);
-    parameters->Get(NVSDK_NGX_Parameter_Depth, &depth);
-
     const unsigned int availableOutputWidth = static_cast<unsigned int>(
         outputDesc.Width - std::min<UINT64>(outputX, outputDesc.Width));
     const unsigned int availableOutputHeight = outputDesc.Height -
@@ -267,7 +348,8 @@ static void PublishOfxrDlssGuides(
     publication.camera_far = cameraFar;
     publication.depth_inverted = depthInverted ? 1 : 0;
     publication.depth_infinite = depthInfinite ? 1 : 0;
-    (void)ofxr_bridge::publish_dlss_guides(publication);
+    publication.verified_native_device = commandDevice.Get();
+    (void)ofxr_bridge::publish_dlss_guides(publication, commandDevice.Get());
     MaybeLogOfxrGuideStatistics();
 }
 

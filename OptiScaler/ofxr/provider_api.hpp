@@ -176,6 +176,10 @@ struct OFXR_DlssGuidePublicationV2 {
     float camera_far{1000.0F};
     std::int32_t depth_inverted{};
     std::int32_t depth_infinite{};
+    // Optional native device already identity-checked by an in-process
+    // producer. Appended so older V2 producers and consumers remain ABI-safe
+    // through struct_size negotiation.
+    ID3D12Device* verified_native_device{};
 };
 
 struct OFXR_DlssGuideStatisticsV2 {

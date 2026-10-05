@@ -92,7 +92,7 @@ void test_cinema_color_contract(D3D12WarpFixture& fixture) {
             const float left = (eye == 0 ? -0.75F : -0.25F), right = left + 1.0F;
             struct Constants { float clip[16]; float rect[4]; UINT width, height, slice, pad; } data{
                 {left, .5F, .5F, 1, right, .5F, .5F, 1, left, -.5F, .5F, 1, right, -.5F, .5F, 1},
-                {0, 0, float(width), float(height)}, width, height, eye, 0};
+                {0, 0, float(width), float(height)}, width, height, eye, 1};
             static_assert(sizeof(data) == 24 * sizeof(UINT));
             commands->SetGraphicsRoot32BitConstants(1, 24, &data, 0);
             commands->DrawInstanced(6, 1, 0, 0);
