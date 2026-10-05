@@ -2501,6 +2501,81 @@ XRAPI_ATTR XrResult XRAPI_CALL layer_locate_space(XrSpace space, XrSpace base,
     });
 }
 
+// Djules 3096ddcf (V334), adapted to the embedded DLL: only loader discovery
+// is needed here; do not bring in standalone's OptiScaler delegation/tray.
+[[nodiscard]] FARPROC loader_export(HMODULE module, const char* name) noexcept {
+    __try {
+        return GetProcAddress(module, name);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+[[nodiscard]] bool enumerate_loader_modules(
+    HMODULE* modules, DWORD capacity, DWORD* bytes) noexcept {
+    __try {
+        return EnumProcessModules(GetCurrentProcess(), modules, capacity, bytes) != FALSE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+[[nodiscard]] PFN_xrGetInstanceProcAddr find_loader_get_instance_proc_addr() {
+    const auto loader_entry = [](HMODULE module) noexcept -> PFN_xrGetInstanceProcAddr {
+        if (module == nullptr ||
+            loader_export(module, "xrNegotiateLoaderApiLayerInterface") != nullptr ||
+            loader_export(module, "xrNegotiateLoaderRuntimeInterface") != nullptr ||
+            loader_export(module, "xrEnumerateApiLayerProperties") == nullptr) {
+            return nullptr;
+        }
+        return reinterpret_cast<PFN_xrGetInstanceProcAddr>(
+            loader_export(module, "xrGetInstanceProcAddr"));
+    };
+    if (const auto entry = loader_entry(GetModuleHandleW(L"openxr_loader.dll"))) {
+        return entry;
+    }
+    std::vector<HMODULE> modules(256);
+    DWORD bytes = 0;
+    if (!enumerate_loader_modules(
+            modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &bytes)) {
+        return nullptr;
+    }
+    if (bytes > modules.size() * sizeof(HMODULE)) {
+        modules.resize(bytes / sizeof(HMODULE));
+        if (!enumerate_loader_modules(
+                modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &bytes)) {
+            return nullptr;
+        }
+    }
+    const std::size_t count = std::min(modules.size(), static_cast<std::size_t>(bytes / sizeof(HMODULE)));
+    for (std::size_t index = 0; index < count; ++index) {
+        if (const auto entry = loader_entry(modules[index])) {
+            return entry;
+        }
+    }
+    return nullptr;
+}
+
+// Before an instance exists there is no next-layer dispatch. Upper layers
+// (e.g. Cheeky Foveated DLSS) still need the loader's global extension query.
+// Never expose instance functions or mistake this embedded DLL for a loader.
+XrResult resolve_global_function(const char* name, PFN_xrVoidFunction* function) {
+    if (std::strcmp(name, "xrEnumerateInstanceExtensionProperties") != 0 &&
+        std::strcmp(name, "xrEnumerateApiLayerProperties") != 0) {
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+    const PFN_xrGetInstanceProcAddr loader = find_loader_get_instance_proc_addr();
+    if (loader == nullptr) {
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+    const XrResult result = loader(XR_NULL_HANDLE, name, function);
+    if (XR_FAILED(result) || *function == nullptr) {
+        *function = nullptr;
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+    return XR_SUCCESS;
+}
+
 XrResult layer_get_instance_proc_addr_impl(
     XrInstance instance,
     const char* name,
@@ -2515,9 +2590,12 @@ XrResult layer_get_instance_proc_addr_impl(
         return XR_SUCCESS;
     }
 
+    if (instance == XR_NULL_HANDLE) {
+        return resolve_global_function(name, function);
+    }
     const auto dispatch = find_dispatch(instance);
     if (!dispatch) {
-        return instance == XR_NULL_HANDLE ? XR_ERROR_FUNCTION_UNSUPPORTED : XR_ERROR_HANDLE_INVALID;
+        return XR_ERROR_HANDLE_INVALID;
     }
 
     if (std::strcmp(

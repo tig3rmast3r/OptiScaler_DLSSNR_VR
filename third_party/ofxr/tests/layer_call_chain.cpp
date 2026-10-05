@@ -876,6 +876,41 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_release_swapchain_image(
 XRAPI_ATTR XrResult XRAPI_CALL fake_get_instance_proc_addr(
     XrInstance,
     const char* name,
+    PFN_xrVoidFunction* function);
+
+XRAPI_ATTR XrResult XRAPI_CALL fake_enumerate_instance_extension_properties(
+    const char*, std::uint32_t capacity, std::uint32_t* count,
+    XrExtensionProperties* properties) {
+    constexpr const char* names[] = {XR_KHR_D3D12_ENABLE_EXTENSION_NAME,
+                                   XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME};
+    *count = 2;
+    if (capacity == 0 || properties == nullptr) return XR_SUCCESS;
+    if (capacity < *count) return XR_ERROR_SIZE_INSUFFICIENT;
+    for (std::uint32_t index = 0; index < *count; ++index) {
+        strcpy_s(properties[index].extensionName, names[index]);
+        properties[index].extensionVersion = 1;
+    }
+    return XR_SUCCESS;
+}
+
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL fake_loader_enumerate_api_layer_properties(
+    std::uint32_t, std::uint32_t* count, XrApiLayerProperties*) {
+    *count = 0;
+    return XR_SUCCESS;
+}
+
+// Stand in for a loader with a nonstandard module name, without negotiating
+// as a layer/runtime. The production resolver must find its global exports.
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL fake_loader_get_instance_proc_addr(
+    XrInstance instance, const char* name, PFN_xrVoidFunction* function) {
+    return fake_get_instance_proc_addr(instance, name, function);
+}
+#pragma comment(linker, "/export:xrGetInstanceProcAddr=fake_loader_get_instance_proc_addr")
+#pragma comment(linker, "/export:xrEnumerateApiLayerProperties=fake_loader_enumerate_api_layer_properties")
+
+XRAPI_ATTR XrResult XRAPI_CALL fake_get_instance_proc_addr(
+    XrInstance,
+    const char* name,
     PFN_xrVoidFunction* function) {
     *function = nullptr;
 #define XRFG_FAKE_FUNCTION(openxr_name, implementation)                         \
@@ -883,6 +918,8 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_get_instance_proc_addr(
         *function = reinterpret_cast<PFN_xrVoidFunction>(implementation);       \
         return XR_SUCCESS;                                                       \
     }
+    XRFG_FAKE_FUNCTION("xrEnumerateInstanceExtensionProperties", fake_enumerate_instance_extension_properties)
+    XRFG_FAKE_FUNCTION("xrEnumerateApiLayerProperties", fake_loader_enumerate_api_layer_properties)
     XRFG_FAKE_FUNCTION("xrDestroyInstance", fake_destroy_instance)
     XRFG_FAKE_FUNCTION("xrGetInstanceProperties", fake_get_instance_properties)
     XRFG_FAKE_FUNCTION("xrCreateSession", fake_create_session)
@@ -1247,6 +1284,39 @@ int main(int argc, char** argv) {
     strcpy_s(instance_info.applicationInfo.applicationName, "XRFG fake runtime test");
     strcpy_s(instance_info.applicationInfo.engineName, "XRFG tests");
     instance_info.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
+
+    // Probe before instance creation exactly as an upper eye-tracking layer
+    // does. Verify content, both global functions, and refusal of instance APIs.
+    {
+        PFN_xrVoidFunction probe = nullptr;
+        if (XR_FAILED(request.getInstanceProcAddr(
+                XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties", &probe)) || !probe) {
+            std::cerr << "null-instance extension query not resolved\n";
+            return EXIT_FAILURE;
+        }
+        const auto enumerate = reinterpret_cast<PFN_xrEnumerateInstanceExtensionProperties>(probe);
+        std::uint32_t count = 0;
+        std::array<XrExtensionProperties, 2> extensions{};
+        for (auto& extension : extensions) extension.type = XR_TYPE_EXTENSION_PROPERTIES;
+        if (XR_FAILED(enumerate(nullptr, 0, &count, nullptr)) || count != extensions.size() ||
+            XR_FAILED(enumerate(nullptr, static_cast<std::uint32_t>(extensions.size()), &count, extensions.data())) ||
+            std::strcmp(extensions[1].extensionName, XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME) != 0) {
+            std::cerr << "null-instance extension query lost eye tracking\n";
+            return EXIT_FAILURE;
+        }
+        if (XR_FAILED(request.getInstanceProcAddr(
+                XR_NULL_HANDLE, "xrEnumerateApiLayerProperties", &probe)) || !probe ||
+            XR_FAILED(reinterpret_cast<PFN_xrEnumerateApiLayerProperties>(probe)(0, &count, nullptr)) || count != 0) {
+            std::cerr << "null-instance layer query did not reach loader\n";
+            return EXIT_FAILURE;
+        }
+        probe = reinterpret_cast<PFN_xrVoidFunction>(fake_get_instance_proc_addr);
+        if (request.getInstanceProcAddr(XR_NULL_HANDLE, "xrCreateSession", &probe) !=
+                XR_ERROR_FUNCTION_UNSUPPORTED || probe != nullptr) {
+            std::cerr << "null-instance must not expose instance functions\n";
+            return EXIT_FAILURE;
+        }
+    }
 
     XrInstance instance = XR_NULL_HANDLE;
     if (XR_FAILED(request.createApiLayerInstance(&instance_info, &layer_info, &instance)) ||
