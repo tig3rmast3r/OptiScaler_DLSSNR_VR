@@ -1,4 +1,5 @@
 #pragma once
+#include "xrfg/flow_input_encoding.hpp"
 
 #include "xrfg/d3d12_history.hpp"
 #include "xrfg/dlss_motion_vectors.hpp"
@@ -130,6 +131,8 @@ struct D3D12NvidiaOpticalFlowOptions {
     D3D12OpticalFlowInputScale input_scale{
         D3D12OpticalFlowInputScale::half};
     bool bidirectional{};
+    D3D12OpticalFlowInputEncoding input_encoding{
+        D3D12OpticalFlowInputEncoding::reference_linear};
 };
 
 // Owns a rolling exclusive history lease. Each resource supports at most two

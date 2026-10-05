@@ -422,7 +422,8 @@ struct SynthesisParameters {
     std::array<float, 2> game_motion_jitter_delta{};
     std::array<CameraMapping, kMaxReprojectionViews> previous_mappings{};
     UINT slice{};
-    // Bit 0 is the repeated-capture flag; bits 8-23 carry the synthetic's
+    // Bit 0 is the repeated-capture flag; bit 1 encodes sRGB flow input.
+    // Bits 8-23 carry the synthetic's
     // position between the two captures in 1/65535ths. They share a slot
     // because the root signature is full - see the assert below.
     UINT synthesis_flags{};
@@ -4010,7 +4011,8 @@ struct D3D12FrameSynthesizer::Impl {
         slot.command_list->SetPipelineState(pack_pipeline.Get());
 
         SynthesisParameters parameters{};
-        parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction);
+        parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction) |
+            flow_input_flags(view_format, nvidia_options.input_encoding);
         parameters.width = static_cast<UINT>(image_description.Width);
         parameters.height = image_description.Height;
         parameters.array_size = image_description.DepthOrArraySize;
@@ -4172,7 +4174,8 @@ struct D3D12FrameSynthesizer::Impl {
         slot.command_list->SetPipelineState(nvidia_pack_pipeline.Get());
 
         SynthesisParameters parameters{};
-        parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction);
+        parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction) |
+            flow_input_flags(view_format, nvidia_options.input_encoding);
         parameters.width = static_cast<UINT>(image_description.Width);
         parameters.height = image_description.Height;
         parameters.array_size = image_description.DepthOrArraySize;
@@ -4600,7 +4603,8 @@ struct D3D12FrameSynthesizer::Impl {
         slot.command_list->SetPipelineState(pack_pipeline.Get());
 
         SynthesisParameters parameters{};
-        parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction);
+        parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction) |
+            flow_input_flags(view_format, nvidia_options.input_encoding);
         parameters.width = static_cast<UINT>(image_description.Width);
         parameters.height = image_description.Height;
         parameters.array_size = image_description.DepthOrArraySize;

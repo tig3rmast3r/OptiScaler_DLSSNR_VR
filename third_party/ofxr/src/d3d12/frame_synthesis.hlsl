@@ -36,7 +36,8 @@ cbuffer SynthesisParameters : register(b0) {
     float2 GameMotionJitterDelta;
     CameraMapping PreviousMappings[2];
     uint Slice;
-    // Bit 0 is the repeated-capture flag. Bits 8-23 carry the synthetic's
+    // Bit 0 is the repeated-capture flag; bit 1 encodes sRGB flow input.
+    // Bits 8-23 carry the synthetic's
     // position between the two captures in 1/65535ths - 0 at the previous
     // capture, 1 at the current. They share a slot because the root signature
     // is full: 62 constants plus two descriptor tables is the whole 64-DWORD
@@ -46,6 +47,18 @@ cbuffer SynthesisParameters : register(b0) {
 
 uint repeated_capture_flag() {
     return SynthesisFlags & 1u;
+}
+
+// Djules 08bcfc40 / V416: sRGB source views return linear light. Preserve
+// linear filtering and composition; encode only the optical-flow pack output.
+float4 pack_flow_input_color(float4 color) {
+    float4 packed = saturate(color);
+    if ((SynthesisFlags & 2u) != 0u) {
+        float3 low = packed.rgb * 12.92;
+        float3 high = 1.055 * pow(max(packed.rgb, 0.0), 1.0 / 2.4) - 0.055;
+        packed.rgb = packed.rgb <= 0.0031308 ? low : high;
+    }
+    return packed;
 }
 
 // An unset field decodes to 0.5, which is the fixed midpoint this shader
@@ -337,7 +350,7 @@ void PackFlowInput(uint3 thread_id : SV_DispatchThreadID) {
     // sees a filtered image instead of every fourth pixel.
     float2 input_scale = flow_input_scale();
     if (slice >= ArraySize) {
-        PackedColor[thread_id.xy] = saturate(current_color);
+        PackedColor[thread_id.xy] = pack_flow_input_color(current_color);
         return;
     }
     if (PackedWidth < Width) {
@@ -352,7 +365,7 @@ void PackFlowInput(uint3 thread_id : SV_DispatchThreadID) {
         current_color = CurrentFrame.Load(
             int4(int2(thread_id.x, local_y), int(slice), 0));
     }
-    PackedColor[thread_id.xy] = saturate(current_color);
+    PackedColor[thread_id.xy] = pack_flow_input_color(current_color);
 }
 
 [numthreads(8, 8, 1)]
@@ -377,8 +390,8 @@ void PackNvidiaFlowInput(uint3 thread_id : SV_DispatchThreadID) {
         current_color = CurrentFrame.Load(
             int4(int2(thread_id.xy), int(slice), 0));
     }
-    NvidiaPreviousColor[thread_id.xy] = saturate(previous_color);
-    NvidiaCurrentColor[thread_id.xy] = saturate(current_color);
+    NvidiaPreviousColor[thread_id.xy] = pack_flow_input_color(previous_color);
+    NvidiaCurrentColor[thread_id.xy] = pack_flow_input_color(current_color);
 }
 
 float2 load_backward_flow_clamped(
