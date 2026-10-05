@@ -145,12 +145,12 @@ int main(int argc, char** argv) {
             "bounded ring did not expose truncation or retain newest event");
         logger.shutdown();
         require(!xrfg::pause_ram_timing(GetCurrentProcessId(),true),"mapping leaked after shutdown");
-        // Retain mature cadence/AFW records and compact read telemetry only.
+        // Retain mature cadence/AFW records, compact read and bounded ingress receipts.
         { std::ofstream ini(root/L"ofxr_bridge.ini");
           ini<<"[diagnostics]\nlogging_enabled=0\ntiming_capture=1\npose_cadence_capture=1\n"; }
         logger.initialize(root);
         require(logger.ram_enabled() && !logger.enabled(),"pose profile enabled normal logging");
-        constexpr std::array<std::uint64_t,9> selected{28,71,89,90,101,102,103,104,122};
+        constexpr std::array<std::uint64_t,16> selected{28,71,89,90,101,102,103,104,122,123,124,125,126,127,128,129};
         constexpr std::array<std::uint64_t,5> unselected{105,121,200,354,999};
         for(const auto stage:selected) logger.event(O::luke_afw_stage,-731,stage,812,913);
         for(const auto stage:unselected) logger.event(O::luke_afw_stage,-732,stage,812,913);

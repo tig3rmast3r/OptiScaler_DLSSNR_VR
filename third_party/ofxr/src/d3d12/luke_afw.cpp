@@ -1,5 +1,6 @@
 #include "xrfg/luke_afw.hpp"
 #include "xrfg/luke_depth_format.hpp"
+#include "xrfg/luke_motion_format.hpp"
 #include "xrfg/luke_recording_scope.hpp"
 #include "xrfg/luke_guide_window.hpp"
 #include "xrfg/luke_physical_projection.hpp"
@@ -642,14 +643,14 @@ struct LukeAfwSynthesizer::Impl {
             roi_width == 0 || roi_height == 0 ||
             roi_width > description.Width || roi_height > description.Height ||
             description.DepthOrArraySize != 1 || description.SampleDesc.Count != 1 ||
-            description.Format != DXGI_FORMAT_R16G16_FLOAT ||
+            luke_motion_srv_format(description.Format) == DXGI_FORMAT_UNKNOWN ||
             (description.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) {
             return E_INVALIDARG;
         }
         if (motion_resource != nullptr &&
             motion_description.Width == roi_width &&
             motion_description.Height == roi_height &&
-            motion_description.Format == description.Format &&
+            motion_description.Format == kLukeAfwMotionFormat &&
             motion_description.Flags == description.Flags) {
             report_stage(AfwStage::motion_resource_created, S_FALSE,
                 reinterpret_cast<std::uint64_t>(motion_resource.Get()), publication);
@@ -664,14 +665,13 @@ struct LukeAfwSynthesizer::Impl {
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         heap.CreationNodeMask = 1;
         heap.VisibleNodeMask = 1;
-        // Preserve the producer's format and flags, which PureDark requires,
-        // but expose only the populated NGX motion subrect. Horizon stores a
-        // 1672x1672 motion image in the top-left of a 3344x3344 resource;
-        // registering the full resource makes AFW sample undefined pixels and
-        // map depth/motion to different normalized coordinates.
+        // Composition reads the producer's typed float2 SRV and writes the
+        // standard AFW RG16F texture. Preserve compatible producer flags, not
+        // its precision; expose only the populated/cropped motion window.
         D3D12_RESOURCE_DESC clean = description;
         clean.Width = roi_width;
         clean.Height = roi_height;
+        clean.Format = kLukeAfwMotionFormat;
         Microsoft::WRL::ComPtr<ID3D12Resource> resource;
         const HRESULT result = device->CreateCommittedResource(
             &heap, D3D12_HEAP_FLAG_NONE, &clean,
@@ -709,7 +709,7 @@ struct LukeAfwSynthesizer::Impl {
             composed_motion_height == height) return S_OK;
 
         D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
-        support.Format = DXGI_FORMAT_R16G16_FLOAT;
+        support.Format = kLukeAfwMotionFormat;
         if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
                 &support, sizeof(support))) ||
             (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) == 0)
@@ -724,7 +724,7 @@ struct LukeAfwSynthesizer::Impl {
         texture.Height = height;
         texture.DepthOrArraySize = 1;
         texture.MipLevels = 1;
-        texture.Format = DXGI_FORMAT_R16G16_FLOAT;
+        texture.Format = kLukeAfwMotionFormat;
         texture.SampleDesc.Count = 1;
         texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
         texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -796,7 +796,7 @@ struct LukeAfwSynthesizer::Impl {
             descriptors->GetCPUDescriptorHandleForHeapStart();
         cpu.ptr += 2ULL * descriptor_size;
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-        uav.Format = DXGI_FORMAT_R16G16_FLOAT;
+        uav.Format = kLukeAfwMotionFormat;
         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         device->CreateUnorderedAccessView(staging.Get(), nullptr, &uav, cpu);
         result = device->GetDeviceRemovedReason();
@@ -827,7 +827,8 @@ struct LukeAfwSynthesizer::Impl {
             return E_INVALIDARG;
 
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+        srv.Format = luke_motion_srv_format(guide.motion_vectors->GetDesc().Format);
+        if (srv.Format == DXGI_FORMAT_UNKNOWN) return DXGI_ERROR_UNSUPPORTED;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Shader4ComponentMapping =
             D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -1064,7 +1065,7 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
             return reject_input(3);
         if (color_desc.Width > guide.output_width || color_desc.Height > guide.output_height)
             return reject_input(4);
-        if (motion_desc.Format != DXGI_FORMAT_R16G16_FLOAT) return reject_input(5);
+        if (luke_motion_srv_format(motion_desc.Format) == DXGI_FORMAT_UNKNOWN) return reject_input(5);
         if (depth_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
             motion_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return reject_input(6);
         if (depth_desc.DepthOrArraySize != 1 || motion_desc.DepthOrArraySize != 1) return reject_input(7);

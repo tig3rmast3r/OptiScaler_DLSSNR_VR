@@ -18,9 +18,12 @@ namespace {
 using Microsoft::WRL::ComPtr;
 
 constexpr std::uint64_t kMaximumStereoPublicationGap = 4;
-constexpr std::size_t kSnapshotSlotCount = 8;
+constexpr std::size_t kSnapshotSlotCount = 16;
 // Leave two protected slots free for producer/consumer overlap. Stored frames
 // have no previous-guide chains: those pins are attached only to a resolved join.
+// Keep exact delayed colors AND their N-1 guides: OFXR can make the color
+// arrive 5-6 publications behind production. Retention is not a pacing delay;
+// snapshots remain immutable and CPU/GPU readers still prevent slot reuse.
 constexpr std::size_t kLukeOriginHistoryCount = kSnapshotSlotCount - 2;
 constexpr D3D12_RESOURCE_STATES kSnapshotReadState =
     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |

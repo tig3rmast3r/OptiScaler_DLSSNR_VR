@@ -20,9 +20,12 @@
 
 #include <hooks/D3D12_Hooks.h>
 #include <hooks/Streamline_Hooks.h>
+#include <hooks/D3D_NativeInterface.h>
+#include <hooks/D3D_DeviceOwner.h>
 #include <diagnostics/DredMarkers.h>
 
 #include <dxgi1_4.h>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <ankerl/unordered_dense.h>
@@ -30,6 +33,7 @@
 #include "../ofxr/ofxr_bridge_client.hpp"
 #include "../../third_party/ofxr/include/xrfg/dlss_motion_vectors.hpp"
 #include "../../third_party/ofxr/include/xrfg/luke_color_origin.hpp"
+#include "../../third_party/ofxr/include/xrfg/luke_ingress_devices.hpp"
 #include "../../third_party/ofxr/include/xrfg/bridge_flight_logger.hpp"
 
 static ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx12>> Dx12Contexts;
@@ -64,12 +68,13 @@ HMODULE FindRealVrModule()
 }
 
 template <typename Interface>
-static Interface* ResolveStreamlineNativeInterface(Interface* object)
+static Interface* ResolveD3DNativeInterface(Interface* object, HRESULT* receipt = nullptr)
 {
-    void* native = nullptr;
-    if (object != nullptr && StreamlineHooks::getBorrowedNativeInterface(object, &native))
+    IUnknown* native = nullptr;
+    if (receipt) *receipt = E_POINTER;
+    if (d3d_native::get_borrowed(object, &native, receipt))
         return static_cast<Interface*>(native);
-    return object;
+    return nullptr;
 }
 
 static Microsoft::WRL::ComPtr<IUnknown> CanonicalIdentity(IUnknown* object)
@@ -80,21 +85,39 @@ static Microsoft::WRL::ComPtr<IUnknown> CanonicalIdentity(IUnknown* object)
     return identity;
 }
 
+struct DlssNativeDeviceReceipt
+{
+    HRESULT get_device = E_POINTER;
+    HRESULT native_query = E_POINTER;
+    HRESULT retain = E_POINTER;
+    std::uintptr_t reported = 0;
+};
+
 template <typename DeviceChild>
-static Microsoft::WRL::ComPtr<ID3D12Device> ResolveStreamlineNativeDevice(
-    DeviceChild* object)
+static Microsoft::WRL::ComPtr<ID3D12Device> ResolveD3DNativeDevice(
+    DeviceChild* object, DlssNativeDeviceReceipt* receipt = nullptr)
 {
     Microsoft::WRL::ComPtr<ID3D12Device> reportedDevice;
-    if (object == nullptr || FAILED(object->GetDevice(
-            IID_PPV_ARGS(reportedDevice.GetAddressOf()))))
+    if (receipt) *receipt = {};
+    if (object == nullptr)
         return {};
+    const HRESULT getResult = object->GetDevice(IID_PPV_ARGS(reportedDevice.GetAddressOf()));
+    if (receipt) {
+        receipt->get_device = getResult;
+        receipt->reported = reinterpret_cast<std::uintptr_t>(reportedDevice.Get());
+    }
+    if (FAILED(getResult)) return {};
 
-    ID3D12Device* nativeDevice = ResolveStreamlineNativeInterface(
-        reportedDevice.Get());
+    HRESULT nativeResult = E_POINTER;
+    ID3D12Device* nativeDevice = ResolveD3DNativeInterface(
+        reportedDevice.Get(), &nativeResult);
+    if (receipt) receipt->native_query = nativeResult;
     Microsoft::WRL::ComPtr<ID3D12Device> retainedDevice;
-    if (nativeDevice == nullptr || FAILED(nativeDevice->QueryInterface(
-            IID_PPV_ARGS(retainedDevice.GetAddressOf()))))
+    if (nativeDevice == nullptr)
         return {};
+    const HRESULT retainResult = nativeDevice->QueryInterface(IID_PPV_ARGS(retainedDevice.GetAddressOf()));
+    if (receipt) receipt->retain = retainResult;
+    if (FAILED(retainResult)) return {};
     return retainedDevice;
 }
 
@@ -229,35 +252,105 @@ static void PublishOfxrDlssGuides(
     parameters->Get(NVSDK_NGX_Parameter_Depth, &depth);
     parameters->Get(NVSDK_NGX_Parameter_Color, &inputColor);
 
-    output = ResolveStreamlineNativeInterface(output);
-    motion = ResolveStreamlineNativeInterface(motion);
-    queue = ResolveStreamlineNativeInterface(queue);
-    commandList = ResolveStreamlineNativeInterface(commandList);
-    depth = ResolveStreamlineNativeInterface(depth);
-    inputColor = ResolveStreamlineNativeInterface(inputColor);
-
-    const auto outputDevice = ResolveStreamlineNativeDevice(output);
-    const auto motionDevice = ResolveStreamlineNativeDevice(motion);
-    const auto depthDevice = ResolveStreamlineNativeDevice(depth);
-    const auto inputColorDevice = ResolveStreamlineNativeDevice(inputColor);
-    const auto commandDevice = ResolveStreamlineNativeDevice(commandList);
-    const auto queueDevice = ResolveStreamlineNativeDevice(queue);
-    const bool devicesMatch = outputDevice && motionDevice && commandDevice &&
-        queueDevice && SameAdapter(outputDevice.Get(), commandDevice.Get()) &&
-        SameAdapter(motionDevice.Get(), commandDevice.Get()) &&
-        SameCanonicalIdentity(queueDevice.Get(), commandDevice.Get()) &&
-        (depth == nullptr || (depthDevice &&
-            SameAdapter(depthDevice.Get(), commandDevice.Get())));
-    if (!devicesMatch)
+    // Normalize interfaces, then prove one authoritative queue-device owner.
+    const std::array<IUnknown*, 6> originalObjects{output, motion, depth, inputColor, commandList, queue};
+    std::array<HRESULT, 6> objectQueries{};
+    output = ResolveD3DNativeInterface(output, &objectQueries[0]);
+    motion = ResolveD3DNativeInterface(motion, &objectQueries[1]);
+    depth = ResolveD3DNativeInterface(depth, &objectQueries[2]);
+    inputColor = ResolveD3DNativeInterface(inputColor, &objectQueries[3]);
+    commandList = ResolveD3DNativeInterface(commandList, &objectQueries[4]);
+    queue = ResolveD3DNativeInterface(queue, &objectQueries[5]);
+    const std::array<IUnknown*, 6> nativeObjects{output, motion, depth, inputColor, commandList, queue};
+    std::array<DlssNativeDeviceReceipt, 6> receipts{};
+    const auto outputDevice = ResolveD3DNativeDevice(output, &receipts[0]);
+    const auto motionDevice = ResolveD3DNativeDevice(motion, &receipts[1]);
+    const auto depthDevice = ResolveD3DNativeDevice(depth, &receipts[2]);
+    const auto inputColorDevice = ResolveD3DNativeDevice(inputColor, &receipts[3]);
+    const auto commandDevice = ResolveD3DNativeDevice(commandList, &receipts[4]);
+    const auto queueDevice = ResolveD3DNativeDevice(queue, &receipts[5]);
+    d3d_owner::Receipt ownerReceipt;
+    const bool queueListOwner = d3d_owner::same(queueDevice.Get(), commandDevice.Get(), &ownerReceipt);
+    if (ownerReceipt.fresh) {
+        auto& logger = xrfg::bridge_flight_logger();
+        logger.event(xrfg::BridgeFlightOperation::luke_afw_stage,
+            ownerReceipt.verified ? S_OK : E_INVALIDARG, 128,
+            reinterpret_cast<std::uintptr_t>(queueDevice.Get()),
+            reinterpret_cast<std::uintptr_t>(commandDevice.Get()));
+        const auto pack = [](HRESULT lo, HRESULT hi) {
+            return std::uint64_t(static_cast<std::uint32_t>(lo)) |
+                (std::uint64_t(static_cast<std::uint32_t>(hi)) << 32);
+        };
+        for (unsigned i = 0; i < ownerReceipt.steps.size(); i += 2)
+            logger.event(xrfg::BridgeFlightOperation::luke_afw_stage, i / 2, 129,
+                ownerReceipt.mask, pack(ownerReceipt.steps[i], ownerReceipt.steps[i + 1]));
+        if (ofxr_bridge::logging_setting())
+            LOG_WARN("V30063 device backing proof verified={} mask=0x{:X} queue={:p} list={:p} pre=0x{:X}/0x{:X} forward=0x{:X}/0x{:X} reverse=0x{:X}/0x{:X} clear=0x{:X}/0x{:X} empty=0x{:X}/0x{:X}",
+                ownerReceipt.verified, ownerReceipt.mask, static_cast<void*>(queueDevice.Get()),
+                static_cast<void*>(commandDevice.Get()), static_cast<unsigned>(ownerReceipt.steps[0]),
+                static_cast<unsigned>(ownerReceipt.steps[1]), static_cast<unsigned>(ownerReceipt.steps[2]),
+                static_cast<unsigned>(ownerReceipt.steps[3]), static_cast<unsigned>(ownerReceipt.steps[4]),
+                static_cast<unsigned>(ownerReceipt.steps[5]), static_cast<unsigned>(ownerReceipt.steps[6]),
+                static_cast<unsigned>(ownerReceipt.steps[7]), static_cast<unsigned>(ownerReceipt.steps[8]),
+                static_cast<unsigned>(ownerReceipt.steps[9]));
+    }
+    // bits 0..4: missing output/MV/list/queue/depth device;
+    // bits 5..7: output/MV/depth adapter mismatch; bit 8: queue/list identity.
+    const auto deviceFailures = xrfg::luke_ingress_device_failures({
+        bool(outputDevice), bool(motionDevice), bool(commandDevice), bool(queueDevice),
+        depth != nullptr, bool(depthDevice),
+        SameAdapter(outputDevice.Get(), commandDevice.Get()),
+        SameAdapter(motionDevice.Get(), commandDevice.Get()),
+        !depth || SameAdapter(depthDevice.Get(), commandDevice.Get()),
+        queueListOwner});
+    if (deviceFailures)
     {
-        static std::atomic_bool mismatchLogged { false };
-        if (ofxr_bridge::logging_setting() &&
-            !mismatchLogged.exchange(true, std::memory_order_relaxed))
-            LOG_WARN("V23090 OFXR guide resources do not match the command adapter or queue/list identity");
+        const std::array<ID3D12Device*, 6> devices{outputDevice.Get(), motionDevice.Get(),
+            depthDevice.Get(), inputColorDevice.Get(), commandDevice.Get(), queueDevice.Get()};
+        std::uint64_t fingerprint = deviceFailures;
+        for (auto* device : devices)
+            fingerprint = (fingerprint * 1099511628211ULL) ^ reinterpret_cast<std::uintptr_t>(device);
+        static std::atomic<std::uint64_t> lastFingerprint{0};
+        static std::atomic<unsigned> packets{0};
+        // At most eight changed-signature packets per process, independent of
+        // frame rate. No GPU query/readback, hook, retry or continuous file I/O.
+        if (lastFingerprint.exchange(fingerprint, std::memory_order_relaxed) != fingerprint &&
+            packets.fetch_add(1, std::memory_order_relaxed) < 8) {
+            auto& logger = xrfg::bridge_flight_logger();
+            logger.event(xrfg::BridgeFlightOperation::luke_afw_stage, deviceFailures, 123, handleId, fingerprint);
+            if (ofxr_bridge::logging_setting())
+                LOG_WARN("V30061 OFXR ingress device rejection mask=0x{:X} handle={} fingerprint={}",
+                    deviceFailures, handleId, fingerprint);
+            const auto pack = [](HRESULT lo, HRESULT hi) {
+                return std::uint64_t(static_cast<std::uint32_t>(lo)) |
+                    (std::uint64_t(static_cast<std::uint32_t>(hi)) << 32);
+            };
+            static constexpr const char* roles[]{"output", "motion", "depth", "inputColor", "list", "queue"};
+            for (std::size_t i = 0; i < devices.size(); ++i) {
+                const auto identity = CanonicalIdentity(devices[i]);
+                const auto luid = devices[i] ? devices[i]->GetAdapterLuid() : LUID{};
+                logger.event(xrfg::BridgeFlightOperation::luke_afw_stage, i, 124,
+                    reinterpret_cast<std::uintptr_t>(originalObjects[i]), reinterpret_cast<std::uintptr_t>(nativeObjects[i]));
+                logger.event(xrfg::BridgeFlightOperation::luke_afw_stage, i, 125,
+                    receipts[i].reported, reinterpret_cast<std::uintptr_t>(devices[i]));
+                logger.event(xrfg::BridgeFlightOperation::luke_afw_stage, i, 126,
+                    reinterpret_cast<std::uintptr_t>(identity.Get()),
+                    std::uint64_t(luid.LowPart) | (std::uint64_t(static_cast<std::uint32_t>(luid.HighPart)) << 32));
+                logger.event(xrfg::BridgeFlightOperation::luke_afw_stage, i, 127,
+                    pack(objectQueries[i], receipts[i].get_device), pack(receipts[i].native_query, receipts[i].retain));
+                if (ofxr_bridge::logging_setting())
+                    LOG_WARN("V30061 OFXR ingress {} object={:p}->{:p} objectQI=0x{:X} getDevice=0x{:X} device={:p}->{:p} deviceQI=0x{:X} retain=0x{:X} canonical={:p} luid={}:{}",
+                        roles[i], static_cast<void*>(originalObjects[i]), static_cast<void*>(nativeObjects[i]),
+                        static_cast<std::uint32_t>(objectQueries[i]), static_cast<std::uint32_t>(receipts[i].get_device),
+                        reinterpret_cast<void*>(receipts[i].reported), static_cast<void*>(devices[i]),
+                        static_cast<std::uint32_t>(receipts[i].native_query), static_cast<std::uint32_t>(receipts[i].retain),
+                        static_cast<void*>(identity.Get()), luid.HighPart, luid.LowPart);
+            }
+        }
         return;
     }
 
-    ofxr_bridge::ensure_d3d12_submission_hook(commandDevice.Get());
+    ofxr_bridge::ensure_d3d12_submission_hook(queueDevice.Get());
 
     const auto outputDesc = output->GetDesc();
     const auto motionDesc = motion->GetDesc();
@@ -414,7 +507,7 @@ static void PublishOfxrDlssGuides(
                 static_cast<std::uint32_t>(inputColorState);
         }
     }
-    publication.verified_native_device = commandDevice.Get();
+    publication.verified_native_device = queueDevice.Get();
     const bool exactCamera =
         ofxr_bridge::apply_streamline_camera(publication);
     static std::atomic_bool exactCameraLogged { false };
@@ -422,7 +515,7 @@ static void PublishOfxrDlssGuides(
         !exactCameraLogged.exchange(true, std::memory_order_relaxed))
         LOG_INFO("V23173 OFXR guides are using the exact Streamline camera contract");
     const bool published = ofxr_bridge::publish_dlss_guides(
-        publication, commandDevice.Get());
+        publication, queueDevice.Get());
     (void)published;
     MaybeLogOfxrGuideStatistics();
 }
@@ -1658,13 +1751,13 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         xrfg::LukeColorOriginRect rect{};
         D3D12_RESOURCE_DESC final_desc{};
         ID3D12Resource* final_output = nullptr;
-        auto* native_list = ResolveStreamlineNativeInterface(InCmdList);
+        auto* native_list = ResolveD3DNativeInterface(InCmdList);
         if (InParameters && InParameters->Get(NVSDK_NGX_Parameter_Output, &final_output) == NVSDK_NGX_Result_Success && final_output) {
-            final_output = ResolveStreamlineNativeInterface(final_output);
+            final_output = ResolveD3DNativeInterface(final_output);
         }
         if (!final_output) marker_failures |= kOriginMissingOutput;
-        const auto final_device = ResolveStreamlineNativeDevice(final_output);
-        const auto list_device = ResolveStreamlineNativeDevice(native_list);
+        const auto final_device = ResolveD3DNativeDevice(final_output);
+        const auto list_device = ResolveD3DNativeDevice(native_list);
         const bool owned_sr = InFeatureHandle && InFeatureHandle->Id >= DLSS_MOD_ID_OFFSET;
         if (SameCanonicalIdentity(final_output, color_origin->output.Get())) {
             rect = {color_origin->output_x, color_origin->output_y,
@@ -1687,10 +1780,10 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
             marker_failures |= kOriginDimensions;
         // Match the validated V23090 ingress contract: resources may expose
         // distinct device interfaces on the same adapter; list/queue ownership
-        // is still strict native canonical identity, and allocation stays native.
+        // uses the same proven backing owner and authoritative allocation device.
         if (!SameAdapter(final_device.Get(), color_origin->verified_producer_device.Get()))
             marker_failures |= kOriginResourceAdapter;
-        if (!SameCanonicalIdentity(list_device.Get(), color_origin->verified_producer_device.Get()))
+        if (!d3d_owner::same(list_device.Get(), color_origin->verified_producer_device.Get()))
             marker_failures |= kOriginListIdentity;
         if (final_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || final_desc.SampleDesc.Count != 1 ||
             final_desc.DepthOrArraySize != 1 || !xrfg::luke_origin_pixel_bytes(final_desc.Format))

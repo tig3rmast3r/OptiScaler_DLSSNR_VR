@@ -4,6 +4,7 @@
 
 #include "../State.h"
 #include "../hooks/Streamline_Hooks.h"
+#include "../hooks/D3D_NativeInterface.h"
 #include "../inputs/NVNGX_DLSS.h"
 
 #include "../../third_party/ofxr/include/xrfg/dlss_motion_vectors.hpp"
@@ -275,11 +276,9 @@ extern "C" __declspec(dllexport) int OFXR_GetLukeRossD3D12ContextV1(
         if (!LukeRossDlssIngress::Detected()) return 0;
         ID3D12CommandQueue* producer_queue_raw =
             State::Instance().currentCommandQueue;
-        void* native_queue = nullptr;
-        if (StreamlineHooks::getBorrowedNativeInterface(
-                producer_queue_raw, &native_queue)) {
-            producer_queue_raw = static_cast<ID3D12CommandQueue*>(native_queue);
-        }
+        IUnknown* native_queue = nullptr;
+        if (!d3d_native::get_borrowed(producer_queue_raw, &native_queue)) return 0;
+        producer_queue_raw = static_cast<ID3D12CommandQueue*>(native_queue);
         Microsoft::WRL::ComPtr<ID3D12CommandQueue> producer_queue =
             producer_queue_raw;
         if (!producer_queue ||
@@ -291,10 +290,11 @@ extern "C" __declspec(dllexport) int OFXR_GetLukeRossD3D12ContextV1(
                 IID_PPV_ARGS(producer_device.GetAddressOf())))) {
             return 0;
         }
-        // A native queue can still report a Streamline device proxy. Match the
+        // A native queue can still report a device proxy. Match the
         // guide ingress's native-device resolution, not merely its adapter.
-        void* native_device = nullptr;
-        if (StreamlineHooks::getBorrowedNativeInterface(producer_device.Get(), &native_device)) {
+        IUnknown* native_device = nullptr;
+        if (!d3d_native::get_borrowed(producer_device.Get(), &native_device)) return 0;
+        {
             Microsoft::WRL::ComPtr<ID3D12Device> canonical_device;
             if (FAILED(static_cast<ID3D12Device*>(native_device)->QueryInterface(
                     IID_PPV_ARGS(canonical_device.GetAddressOf())))) return 0;

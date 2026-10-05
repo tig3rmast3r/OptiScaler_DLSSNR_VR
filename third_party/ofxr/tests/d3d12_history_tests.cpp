@@ -1705,7 +1705,8 @@ void test_protected_guide_snapshots(D3D12WarpFixture& fixture) {
         require(resolved && resolved->eye_count == 1 && resolved->eyes[0], "protected guide resolution");
         return resolved->eyes[0];
     };
-    for (unsigned n = 1; n <= 8; ++n) {
+    constexpr unsigned snapshot_capacity = 16;
+    for (unsigned n = 1; n <= snapshot_capacity; ++n) {
         auto frame = publish(n);
         require(published && published->publication == frame->publication &&
             published->color_origin_token != 0 &&
@@ -1736,11 +1737,39 @@ void test_protected_guide_snapshots(D3D12WarpFixture& fixture) {
         require_readback_matches(fixture, selected->depth.Get(), make_pattern(68),
             "exact older origin depth", selected->depth_resource_state);
         require(!xrfg::resolve_luke_guide_token(0, fixture.queue(), fixture.device()) &&
-            !xrfg::resolve_luke_guide_token(held[7]->color_origin_token + 1, fixture.queue(), fixture.device()) &&
+            !xrfg::resolve_luke_guide_token(held.back()->color_origin_token + 1, fixture.queue(), fixture.device()) &&
             !xrfg::resolve_luke_guide_token(held[0]->color_origin_token, fixture.queue(), fixture.device()) &&
             !xrfg::resolve_luke_guide_token(held[1]->color_origin_token, fixture.queue(), fixture.device()) &&
             !xrfg::resolve_luke_guide_token(held[2]->color_origin_token, fixture.queue(), fixture.device()),
             "unknown, evicted, or missing N-1 origin fell back to the stream head");
+
+        // Ghost F11: exact colors at age 5/6 were rejected by the old six-entry
+        // history despite a valid barcode. Check both current and N-1 GPU data,
+        // not merely successful lookup or substitution with the latest guide.
+        for (unsigned age : {5U, 6U}) {
+            const auto index = snapshot_capacity - 1 - age;
+            const auto delayed = xrfg::resolve_luke_guide_token(
+                held[index]->color_origin_token, fixture.queue(), fixture.device());
+            require(delayed && delayed->publication == held[index]->publication &&
+                delayed->color_origin_token == held[index]->color_origin_token &&
+                delayed->previous_opposite_guide &&
+                delayed->previous_opposite_guide->publication == held[index - 1]->publication &&
+                delayed->camera_frame_token == (index + 1) * 7 &&
+                delayed->previous_opposite_guide->camera_frame_token == index * 7,
+                "age 5/6 exact origin lost its own N-1 guide/camera");
+            require_readback_matches(fixture, delayed->motion_vectors.Get(),
+                make_pattern(static_cast<std::uint8_t>((index + 1) * 13)),
+                "delayed exact MV", delayed->resource_state);
+            require_readback_matches(fixture, delayed->depth.Get(),
+                make_pattern(static_cast<std::uint8_t>((index + 1) * 17)),
+                "delayed exact depth", delayed->depth_resource_state);
+            require_readback_matches(fixture, delayed->previous_opposite_guide->motion_vectors.Get(),
+                make_pattern(static_cast<std::uint8_t>(index * 13)),
+                "delayed N-1 MV", delayed->previous_opposite_guide->resource_state);
+            require_readback_matches(fixture, delayed->previous_opposite_guide->depth.Get(),
+                make_pattern(static_cast<std::uint8_t>(index * 17)),
+                "delayed N-1 depth", delayed->previous_opposite_guide->depth_resource_state);
+        }
 
         D3D12_COMMAND_QUEUE_DESC queue_description{};
         queue_description.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -1762,8 +1791,8 @@ void test_protected_guide_snapshots(D3D12WarpFixture& fixture) {
             "submission did not stamp older retained guides immutably");
     }
     const auto snapshot_state = held[0]->resource_state;
-    require_readback_matches(fixture, held[0]->motion_vectors.Get(), make_pattern(13), "old MV after eight publications", snapshot_state);
-    require_readback_matches(fixture, held[0]->depth.Get(), make_pattern(17), "old depth after eight publications", snapshot_state);
+    require_readback_matches(fixture, held[0]->motion_vectors.Get(), make_pattern(13), "old MV after sixteen publications", snapshot_state);
+    require_readback_matches(fixture, held[0]->depth.Get(), make_pattern(17), "old depth after sixteen publications", snapshot_state);
     Microsoft::WRL::ComPtr<ID3D12Fence> reader_fence;
     require_hresult(fixture.device()->CreateFence(0, D3D12_FENCE_FLAG_NONE,
         IID_PPV_ARGS(&reader_fence)), "protected snapshot reader fence");
@@ -1775,18 +1804,18 @@ void test_protected_guide_snapshots(D3D12WarpFixture& fixture) {
     const auto first_depth = held[0]->depth;
     held[0].reset(); // no CPU frame owner; unfinished GPU read MUST still pin it
     const auto failures = xrfg::dlss_motion_vector_statistics().snapshot_failures;
-    require(publish(9)->publication == first_publication + 7 && !published &&
+    require(publish(17)->publication == first_publication + 15 && !published &&
         xrfg::dlss_motion_vector_statistics().snapshot_failures == failures + 1,
         "full pool reused a GPU-in-flight snapshot");
     require_readback_matches(fixture, first_motion.Get(), make_pattern(13), "busy MV remains unchanged", snapshot_state);
     require_readback_matches(fixture, first_depth.Get(), make_pattern(17), "busy depth remains unchanged", snapshot_state);
     require_hresult(reader_fence->Signal(1), "complete protected snapshot read");
-    const auto recycled = publish(9);
-    require(published && recycled->publication == first_publication + 8 &&
+    const auto recycled = publish(17);
+    require(published && recycled->publication == first_publication + 16 &&
         recycled->color_origin_token > last_origin_token + 1 &&
         recycled->motion_vectors.Get() == first_motion.Get() &&
         recycled->depth.Get() == first_depth.Get(), "completed unowned snapshot not recycled");
-    require_readback_matches(fixture, recycled->motion_vectors.Get(), make_pattern(117), "recycled MV", snapshot_state);
+    require_readback_matches(fixture, recycled->motion_vectors.Get(), make_pattern(221), "recycled MV", snapshot_state);
     held.clear();
     const auto reset = publish(10, true);
     require(reset->publication == recycled->publication + 1 && reset->serial == 1 &&

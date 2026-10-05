@@ -7,6 +7,7 @@
 #include "xrfg/luke_pose_camera.hpp"
 #include "xrfg/luke_world_scale.hpp"
 #include "xrfg/luke_camera_units.hpp"
+#include "xrfg/luke_ingress_devices.hpp"
 
 #include <array>
 #include <chrono>
@@ -40,6 +41,20 @@ void expect(bool condition, std::string_view description) {
 }  // namespace
 
 int main() {
+    // Every combination of missing devices, optional depth, adapter and strict
+    // queue/list identity must preserve the old guard's acceptance exactly.
+    for (unsigned bits = 0; bits < 1024; ++bits) {
+        const auto b = [&](unsigned i) { return (bits & (1u << i)) != 0; };
+        const xrfg::LukeIngressDeviceFacts f{b(0),b(1),b(2),b(3),b(4),b(5),b(6),b(7),b(8),b(9)};
+        const bool old_admitted = f.output_device && f.motion_device &&
+            f.command_device && f.queue_device && f.output_adapter &&
+            f.motion_adapter && f.queue_list_identity &&
+            (!f.depth_present || (f.depth_device && f.depth_adapter));
+        expect((xrfg::luke_ingress_device_failures(f) == 0) == old_admitted,
+            "diagnostic device facts must not change admission");
+    }
+    expect(xrfg::luke_ingress_device_failures({true,true,true,true,true,true,true,true,true,false}) == 256,
+        "queue/list identity is independently reported and still rejects");
     const std::array<float, 16> luke_projection{
         0.70020777F, 0.0F, 0.0F, 0.0F,
         0.0F, 0.70020777F, 0.0F, 0.0F,

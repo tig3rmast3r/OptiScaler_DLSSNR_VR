@@ -32,8 +32,8 @@ assert(completion.includes('SameAdapter(final_device.Get(), color_origin->verifi
     'final resource must use the validated same-adapter ingress contract');
 assert(!completion.includes('SameCanonicalIdentity(final_device.Get(),'),
     'resource-device aliases must not be rejected by a stricter canonical-device guard');
-assert(completion.includes('SameCanonicalIdentity(list_device.Get(), color_origin->verified_producer_device.Get())'),
-    'native command-list device identity must remain strict');
+assert(completion.includes('d3d_owner::same(list_device.Get(), color_origin->verified_producer_device.Get())'),
+    'completion must reuse the exact device-backing proof, never adapter-only ownership');
 assert(completion.includes('Dx12Contexts.find(InFeatureHandle->Id)') &&
     completion.includes('context->second.feature->DisplayWidth()') &&
     completion.includes('context->second.feature->DisplayHeight()'),
@@ -109,7 +109,46 @@ assert(layer.includes('origin_token, session->d3d12_queue.Get(), session->d3d12_
 const contextSource = read('OptiScaler/ofxr/ofxr_bridge_client.cpp');
 const contextStart = contextSource.indexOf('int OFXR_GetLukeRossD3D12ContextV1(');
 const context = contextSource.slice(contextStart, contextSource.indexOf('namespace ofxr_bridge', contextStart));
-assert(context.includes('StreamlineHooks::getBorrowedNativeInterface(producer_device.Get(), &native_device)') &&
+const nativeResolver = read('OptiScaler/hooks/D3D_NativeInterface.h');
+assert(nativeResolver.includes('streamline_native::native_interface_guid') &&
+    nativeResolver.includes('reshade_unwrapped_guid') && nativeResolver.includes('next->Release()') &&
+    nativeResolver.includes('visited[8]') && nativeResolver.includes('FAILED(result) || !next'),
+    'Luke wrapper resolution must balance both native QI contracts and reject malformed or cyclic chains');
+assert(source.includes('d3d_native::get_borrowed(object, &native, receipt)') &&
+    !source.includes('ResolveStreamlineNative'),
+    'all Luke ingress/completion native resolution must use the replacement resolver');
+assert(context.includes('d3d_native::get_borrowed(producer_device.Get(), &native_device)') &&
     context.indexOf('producer_device = std::move(canonical_device)') < context.indexOf('producer_device.CopyTo(device)'),
     'Luke native queue context must canonicalize its reported device before exporting ownership');
+const ingressStart = source.indexOf('static void PublishOfxrDlssGuides(');
+const ingress = source.slice(ingressStart, source.indexOf('void LukeRossDlssIngress::PublishD3D12Guide', ingressStart));
+assert(ingress.includes('xrfg::luke_ingress_device_failures({') &&
+    ingress.includes('d3d_owner::same(queueDevice.Get(), commandDevice.Get(), &ownerReceipt)') &&
+    ingress.includes('queueListOwner});'),
+    'ingress must require canonical identity or a complete bidirectional backing proof');
+assert(ingress.includes('publication.verified_native_device = queueDevice.Get()') &&
+    ingress.includes('publication, queueDevice.Get()') &&
+    ingress.includes('ensure_d3d12_submission_hook(queueDevice.Get())'),
+    'allocation, submission hook and context export must agree on the queue device owner');
+const owner = read('OptiScaler/hooks/D3D_DeviceOwner.h');
+assert(owner.includes('result.verified = result.mask == 63') &&
+    owner.includes('received == sent') && owner.includes('std::array<Entry, 8>') &&
+    owner.includes('result.steps[6] = left->SetPrivateData(receipt_guid, 0, nullptr)') &&
+    owner.includes('entry.left = a; entry.right = b'),
+    'device owner proof must require both exact round trips/cleanup, be bounded and pin identities');
+assert(ingress.includes('packets.fetch_add(1, std::memory_order_relaxed) < 8') &&
+    ingress.includes('pack(objectQueries[i], receipts[i].get_device)') &&
+    ingress.includes('pack(receipts[i].native_query, receipts[i].retain)'),
+    'bounded packet must contain existing object/device HRESULT receipts');
+assert(ingress.indexOf('if (deviceFailures)') < ingress.indexOf('publication.verified_native_device'),
+    'diagnostic receipts must not bypass failed ownership admission');
 console.log('Origin completion and guide ownership source contracts: PASS');
+const afw = read('third_party/ofxr/src/d3d12/luke_afw.cpp');
+assert(afw.includes('luke_motion_srv_format(motion_desc.Format) == DXGI_FORMAT_UNKNOWN') &&
+    afw.includes('srv.Format = luke_motion_srv_format(guide.motion_vectors->GetDesc().Format)') &&
+    afw.includes('clean.Format = kLukeAfwMotionFormat') &&
+    afw.includes('motion_description.Format == kLukeAfwMotionFormat') &&
+    afw.includes('texture.Format = kLukeAfwMotionFormat') &&
+    !afw.includes('description.Format != DXGI_FORMAT_R16G16_FLOAT'),
+    'float2 inputs must use their actual typed SRV and one normalized RG16F AFW output');
+console.log('Luke motion input/output format contract: PASS');
