@@ -23,15 +23,15 @@ inline bool luke_xr_eye_baseline(const std::array<float, 3>& left,
     return true;
 }
 
-// Luke's WorldScale multiplies physical HMD displacement on presentation;
-// the captured game-camera separation is physical IPD / WorldScale.
+// WorldScale and physical IPD alone do not define producer camera units.
+// A calibrated units/metre factor is stable; WorldScale is applied once.
 inline bool luke_game_eye_baseline(float xr_baseline, float world_scale,
-    float& game_baseline) noexcept {
+    float units_per_metre, float& game_baseline) noexcept {
     if (!std::isfinite(xr_baseline) || !std::isfinite(world_scale) ||
+        !std::isfinite(units_per_metre) || units_per_metre <= 0 ||
         xr_baseline < 0.01F || xr_baseline > 0.20F ||
         world_scale < 0.2F || world_scale > 5.0F) return false;
-    game_baseline = xr_baseline / world_scale;
-    return std::isfinite(game_baseline) && game_baseline > 0.0F;
+    game_baseline = float(double(xr_baseline)/world_scale*units_per_metre);
+    return std::isfinite(game_baseline) && game_baseline > 0;
 }
-
 }  // namespace xrfg

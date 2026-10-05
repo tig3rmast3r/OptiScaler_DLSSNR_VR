@@ -1918,6 +1918,72 @@ void test_protected_guide_snapshots(D3D12WarpFixture& fixture) {
     std::cout << "Protected guides: bounded exact origins, immutable submission, reset rejection, CPU/GPU pins, unused-output independence\n";
 }
 
+void test_luke_production_camera_units(D3D12WarpFixture& fixture) {
+    xrfg::configure_dlss_motion_vector_tracking(false);
+    xrfg::retire_disabled_dlss_motion_vector_resources();
+    xrfg::configure_dlss_motion_vector_tracking(true);
+    auto color = create_source_texture(fixture);
+    auto motion = create_source_texture(fixture);
+    auto depth = create_source_texture(fixture);
+    std::shared_ptr<const xrfg::DlssMotionVectorFrame> frame;
+    const auto publish = [&](unsigned n, float baseline, bool reset = false) {
+        fixture.execute_and_wait([&](ID3D12GraphicsCommandList* list) {
+            xrfg::DlssMotionVectorPublication p;
+            p.stream = 90059; p.output = color.Get(); p.motion_vectors = motion.Get();
+            p.depth = depth.Get(); p.producer_queue = fixture.queue(); p.producer_command_list = list;
+            p.output_width = p.motion_width = p.depth_width = kWidth;
+            p.output_height = p.motion_height = p.depth_height = kHeight;
+            p.resource_state = p.depth_resource_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            p.protect_snapshot_lifetime = true; p.reset = reset;
+            p.camera_data_valid = true; p.camera_right = {1, 0, 0};
+            p.camera_position = {n * .2F + ((n & 1) ? -.5F : .5F) * baseline, 0, 0};
+            p.frame_time_delta_ms = 16;
+            frame = xrfg::publish_dlss_motion_vectors(p);
+        });
+        require(frame != nullptr, "camera-unit protected production failed");
+        return frame;
+    };
+    std::shared_ptr<const xrfg::DlssMotionVectorFrame> earlier;
+    for (unsigned n = 1; n <= 12; ++n) {
+        auto produced = publish(n, 6.4F);
+        if (n < 11) require(produced->calibrated_game_eye_baseline == 0,
+            "camera calibration admitted before nine independent ABA productions");
+        else require(std::abs(produced->calibrated_game_eye_baseline - 6.4F) < .0001F,
+            "producer calibration did not cancel linear translation");
+        if (n == 9) {
+            earlier = produced;
+            for (unsigned query = 0; query != 12; ++query) {
+                const auto joined = xrfg::resolve_luke_guide_token(
+                    earlier->color_origin_token, fixture.queue(), fixture.device());
+                require(joined && joined->calibrated_game_eye_baseline == 0,
+                    "repeated consumers supplied false calibration confidence");
+            }
+        }
+    }
+    {
+        const auto old = xrfg::resolve_luke_guide_token(
+            earlier->color_origin_token, fixture.queue(), fixture.device());
+        const auto newest = xrfg::resolve_luke_guide_token(
+            frame->color_origin_token, fixture.queue(), fixture.device());
+        require(old && old->calibrated_game_eye_baseline == 0 &&
+            earlier->calibrated_game_eye_baseline == 0 && newest &&
+            std::abs(newest->calibrated_game_eye_baseline - 6.4F) < .0001F,
+            "old color identity borrowed newer camera calibration");
+    }
+    earlier.reset();
+    publish(13, 12.8F, true);
+    for (unsigned n = 14; n <= 24; ++n) {
+        const auto produced = publish(n, 12.8F);
+        if (n < 24) require(produced->calibrated_game_eye_baseline == 0,
+            "producer epoch reset retained stale unit calibration");
+        else require(std::abs(produced->calibrated_game_eye_baseline - 12.8F) < .0001F,
+            "new producer epoch could not recalibrate its units");
+    }
+    xrfg::configure_dlss_motion_vector_tracking(false);
+    xrfg::retire_disabled_dlss_motion_vector_resources();
+    std::cout << "Camera units: production-order ABA, skipped/repeated/older consumers, immutable barcode join, epoch reset PASS\n";
+}
+
 void test_stereo_capture_ring(D3D12WarpFixture& fixture) {
     std::array<ComPtr<ID3D12Resource>, 3> sources{
         create_source_texture(fixture),
@@ -3996,6 +4062,7 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::string_view(argv[1]) == "protected-guides") {
             D3D12WarpFixture fixture;
             test_protected_guide_snapshots(fixture);
+            test_luke_production_camera_units(fixture);
             fixture.require_no_debug_errors();
             return 0;
         }

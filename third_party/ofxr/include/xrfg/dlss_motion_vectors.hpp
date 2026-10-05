@@ -143,6 +143,8 @@ struct DlssMotionVectorFrame {
     // camera to restore the earlier half of the same-eye temporal interval;
     // its contaminated motion field is not sampled.
     std::shared_ptr<const DlssMotionVectorFrame> previous_opposite_guide;
+    // Calibrated same-time eye separation in the producer camera units.
+    float calibrated_game_eye_baseline{};
     std::shared_ptr<DlssSnapshotRetention> motion_retention;
     std::shared_ptr<DlssSnapshotRetention> depth_retention;
     std::uint32_t camera_frame_token{};

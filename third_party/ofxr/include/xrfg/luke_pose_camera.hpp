@@ -56,4 +56,31 @@ using LukeCameraBasis = std::array<std::array<float, 3>, 3>;
     return true;
 }
 
+// The NGX forward vector is the physical viewing direction; projection W
+// selects whether local view Z points forwards or backwards.
+[[nodiscard]] inline bool luke_view_camera_basis(const LukeCameraBasis& physical,
+    float perspective_w, LukeCameraBasis& view) noexcept {
+    if (!std::isfinite(perspective_w) || perspective_w == 0.0F) return false;
+    view = physical;
+    for (auto& row : view) for (float value : row)
+        if (!std::isfinite(value)) return false;
+    const float forward_z = std::copysign(1.0F, perspective_w);
+    for (float& value : view[2]) value *= forward_z;
+    return true;
+}
+
+[[nodiscard]] inline bool luke_destination_view_camera_basis(
+    Quaternion source_orientation, Quaternion destination_orientation,
+    const LukeCameraBasis& source_view, float perspective_w,
+    LukeCameraBasis& destination_view) noexcept {
+    if (!std::isfinite(perspective_w) || perspective_w == 0.0F) return false;
+    const float back_to_view = -std::copysign(1.0F, perspective_w);
+    auto xr_basis = source_view;
+    for (float& value : xr_basis[2]) value *= back_to_view;
+    if (!luke_destination_camera_basis(source_orientation, destination_orientation,
+            xr_basis, destination_view)) return false;
+    for (float& value : destination_view[2]) value *= back_to_view;
+    return true;
+}
+
 }  // namespace xrfg

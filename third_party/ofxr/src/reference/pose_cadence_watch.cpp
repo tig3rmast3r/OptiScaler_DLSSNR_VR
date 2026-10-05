@@ -87,23 +87,34 @@ int wmain(int argc, wchar_t** argv) {
     while (true) {
         const bool down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
         if (rising_edge(down, prior_f11)) {
+            std::filesystem::create_directories(output_directory);
+            std::ofstream status(output_directory / L"f11-helper-status.log", std::ios::app);
+            SYSTEMTIME now{}; GetLocalTime(&now);
+            status << now.wYear << '-' << now.wMonth << '-' << now.wDay << ' '
+                << now.wHour << ':' << now.wMinute << ':' << now.wSecond << " F11\n";
+            unsigned saved_count{};
             const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (snapshot != INVALID_HANDLE_VALUE) {
                 PROCESSENTRY32W process{};
                 process.dwSize = sizeof(process);
                 if (Process32FirstW(snapshot, &process)) {
                     do {
-                        if (_wcsicmp(process.szExeFile,
-                                L"HorizonForbiddenWest.exe") != 0) continue;
                         std::filesystem::path saved;
                         std::wstring error;
-                        static_cast<void>(xrfg::save_ram_timing(
+                        // The OFXR-owned mapping, not an executable whitelist,
+                        // selects live capture clients. No scan or I/O until F11.
+                        if (xrfg::save_ram_timing(
                             process.th32ProcessID, output_directory,
-                            &saved, &error, kSaveWindowSeconds));
+                            &saved, &error, kSaveWindowSeconds)) {
+                            ++saved_count;
+                            status << "pid=" << process.th32ProcessID
+                                << " saved=" << saved.string() << '\n';
+                        }
                     } while (Process32NextW(snapshot, &process));
                 }
                 CloseHandle(snapshot);
             }
+            if (!saved_count) status << "No enabled OFXR RAM capture found; press F11 while game is running\n";
         }
         Sleep(25);
     }

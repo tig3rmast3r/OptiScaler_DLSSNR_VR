@@ -6,6 +6,7 @@
 #include "xrfg/luke_physical_projection.hpp"
 #include "xrfg/luke_pose_camera.hpp"
 #include "xrfg/luke_world_scale.hpp"
+#include "xrfg/luke_camera_units.hpp"
 
 #include <array>
 #include <chrono>
@@ -69,6 +70,67 @@ int main() {
         degrees(-54), degrees(40), degrees(44), degrees(-55),
         3344, 3344, 1672, 1672, 3000, 2803),
         "mismatched colour extent rejects an unsafe unscaled guide");
+    xrfg::LukeGuideWindowFailure rejection{};
+    expect(!xrfg::luke_guide_window(luke_projection,
+        degrees(-54), degrees(40), degrees(44), degrees(-55),
+        3344, 3344, 1672, 1672, 3063, 3344, &rejection) &&
+        rejection == xrfg::LukeGuideWindowFailure::color_width_mismatch,
+        "Ghost-sized rejected crop identifies horizontal mismatch without admitting it");
+    expect(!xrfg::luke_guide_window(luke_projection,
+        degrees(-54), degrees(40), degrees(44), degrees(-55),
+        3344, 3344, 1672, 1672, 2594, 3000, &rejection) &&
+        rejection == xrfg::LukeGuideWindowFailure::color_height_mismatch,
+        "vertical extent rejection is independently observable");
+    expect(xrfg::luke_guide_window(luke_projection,
+        degrees(-54), degrees(40), degrees(44), degrees(-55),
+        3344, 3344, 1672, 1672, 2594, 2803, &rejection) &&
+        rejection == xrfg::LukeGuideWindowFailure::none,
+        "accepted crop clears prior diagnostic reason and retains original window");
+    // Exact V31001 PID36652 projection/FOV, not the Horizon-sized fixture.
+    const std::array<float, 16> ghost_projection{
+        0.8540806174278259F, 0, 0, 0,
+        0, 0.8540806174278259F, 0, 0,
+        0, 0, -0.0000010000009069699445F, 0.9999999403953552F,
+        0, 0, 10.000008583068848F, 0};
+    const auto ghost_window = xrfg::luke_guide_window(ghost_projection,
+        -0.8203047513961792F, 0.8203047513961792F,
+        0.8639379739761353F, -0.8639379739761353F,
+        3344, 3344, 1672, 1672, 3063, 3344, &rejection);
+    expect(ghost_window && ghost_window->x == 70 && ghost_window->y == 0 &&
+        ghost_window->width == 1532 && ghost_window->height == 1672 &&
+        rejection == xrfg::LukeGuideWindowFailure::none,
+        "measured positive-Z Ghost projection admits the correct guide crop");
+    auto equivalent_lh = luke_projection;
+    for (unsigned column = 0; column < 4; ++column)
+        equivalent_lh[8 + column] = -equivalent_lh[8 + column];
+    const auto lh_window = xrfg::luke_guide_window(equivalent_lh,
+        degrees(-54), degrees(40), degrees(44), degrees(-55),
+        3344, 3344, 1672, 1672, 2594, 2803);
+    expect(lh_window && left_window && lh_window->x == left_window->x &&
+        lh_window->y == left_window->y && lh_window->width == left_window->width &&
+        lh_window->height == left_window->height,
+        "equivalent handedness preserves asymmetric crop geometry");
+    auto ghost_physical = ghost_projection;
+    expect(xrfg::luke_physical_eye_projection(ghost_physical,
+        -0.8203047513961792F, 0.8203047513961792F,
+        0.8639379739761353F, -0.8639379739761353F) &&
+        near(static_cast<float>(xrfg::luke_projection_ray_ndc(
+            std::tan(-0.8203047513961792F), ghost_physical[0],
+            ghost_physical[8], ghost_physical[3], ghost_physical[11])), -1.0F) &&
+        near(static_cast<float>(xrfg::luke_projection_ray_ndc(
+            std::tan(0.8639379739761353F), ghost_physical[5],
+            ghost_physical[9], ghost_physical[7], ghost_physical[11])), 1.0F),
+        "positive-Z physical projection maps FOV edges to clip boundaries");
+    auto degenerate_projection = ghost_projection;
+    degenerate_projection[11] = 0;
+    expect(!xrfg::luke_guide_window(degenerate_projection,
+        -0.8203047513961792F, 0.8203047513961792F,
+        0.8639379739761353F, -0.8639379739761353F,
+        3344, 3344, 1672, 1672, 3063, 3344) &&
+        !xrfg::luke_physical_eye_projection(degenerate_projection,
+            -0.8203047513961792F, 0.8203047513961792F,
+            0.8639379739761353F, -0.8639379739761353F),
+        "missing perspective direction remains rejected");
     auto left_physical = luke_projection;
     auto right_physical = luke_projection;
     expect(xrfg::luke_physical_eye_projection(left_physical,
@@ -102,11 +164,50 @@ int main() {
         degrees(0), degrees(0), degrees(44), degrees(-55)),
         "degenerate physical eye FOV is rejected");
     float game_baseline{};
-    expect(xrfg::luke_game_eye_baseline(0.0643343F, 1.1F,
+    expect(xrfg::luke_game_eye_baseline(0.0643343F, 1.1F, 1.0F,
         game_baseline) && near(game_baseline, 0.0584857F),
-        "Luke game-eye baseline follows physical IPD divided by WorldScale");
-    expect(!xrfg::luke_game_eye_baseline(0.0643343F, 0.0F,
+        "metre-scale calibrated camera preserves the Horizon baseline");
+    expect(!xrfg::luke_game_eye_baseline(0.0643343F, 0.0F, 1.0F,
         game_baseline), "missing Luke WorldScale rejects AFW camera");
+    expect(xrfg::luke_game_eye_baseline(0.06406F, 1.0F, 100.0F, game_baseline) &&
+        near(game_baseline, 6.406F), "centimetre-scale producer camera uses its measured units");
+    expect(!xrfg::luke_game_eye_baseline(0.06406F, 1.0F, 0, game_baseline),
+        "missing calibration never falls back to metres");
+    for (float units : {1.0F, 100.0F}) {
+        for (float world_scale : {0.5F, 1.0F, 2.0F}) {
+            const float baseline = 0.064F * units / world_scale;
+            const float velocity = 0.002F * units;
+            xrfg::LukeUnitCamera a{{-baseline/2,0,0},{1,0,0},8,true};
+            xrfg::LukeUnitCamera b{{baseline/2+8*velocity,0,0},{1,0,0},8,true};
+            xrfg::LukeUnitCamera c{{-baseline/2+20*velocity,0,0},{1,0,0},12,true};
+            const float measured = xrfg::luke_camera_separation(a,b,c);
+            expect(near(measured, baseline), "unequal frame intervals cancel linear head translation in both unit systems");
+            xrfg::LukeCameraUnitCalibration calibration;
+            for (unsigned i=1;i<=8;++i)
+                expect(calibration.observe(1,i,measured)==0, "no admission before independent calibration samples");
+            expect(near(calibration.observe(1,9,measured),baseline), "consistent independent observations calibrate camera units");
+            expect(near(calibration.observe(1,9,measured),baseline) && calibration.samples()==9,
+                "duplicate resolver calls do not add calibration confidence");
+            expect(calibration.observe(2,10,measured)==0 && calibration.samples()==1,
+                "new NGX epoch requires fresh calibration");
+            for(unsigned i=11;i<=18;++i) calibration.observe(2,i,measured);
+            expect(near(calibration.observe(2,19,measured*2),baseline),
+                "head acceleration does not rescale an established engine unit");
+            expect(near(calibration.observe(2,20,0),baseline),
+                "frame gap cannot invalidate established unit calibration");
+            expect(calibration.observe(3,21,measured*2)==0 && calibration.samples()==1,
+                "explicit new epoch permits a fresh unit conversion");
+            float physical_baseline{};
+            expect(xrfg::luke_game_eye_baseline(.064F, world_scale, units, physical_baseline) &&
+                near(physical_baseline, baseline), "WorldScale applied exactly once to stable engine units");
+            c.valid=false;
+            expect(xrfg::luke_camera_separation(a,b,c)==0,"invalid camera metadata cannot calibrate");
+        }
+    }
+    xrfg::LukeCameraUnitCalibration unstable_units;
+    for(unsigned i=1;i<=12;++i)
+        expect(unstable_units.observe(1,i,i%2 ? 6.0F : 7.0F)==0,
+            "inconsistent acceleration/camera separation is not silently accepted");
     constexpr float physical_ipd = 0.06412F;
     const std::array<float, 3> xr_left{-physical_ipd * 0.5F, 0.0F, 0.0F};
     const std::array<float, 3> xr_right{physical_ipd * 0.5F, 0.0F, 0.0F};
@@ -172,6 +273,35 @@ int main() {
         "equal submitted orientations preserve stationary stereo");
     expect(!xrfg::luke_destination_camera_basis({0, 0, 0, 0}, yaw(10.0F),
         camera_basis, peer_basis), "invalid XR orientation rejects camera");
+    xrfg::LukeCameraBasis lh_view{}, rh_view{}, lh_peer{}, rh_peer{};
+    const xrfg::LukeCameraBasis physical_basis{{
+        {1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
+    expect(xrfg::luke_view_camera_basis(physical_basis, 1.0F, lh_view) &&
+        xrfg::luke_view_camera_basis(physical_basis, -1.0F, rh_view) &&
+        near(lh_view[2][2], 1.0F) && near(rh_view[2][2], -1.0F),
+        "view forward follows producer projection while RH behavior is retained");
+    expect(xrfg::luke_destination_view_camera_basis(yaw(0), yaw(10), lh_view,
+        1.0F, lh_peer) && xrfg::luke_destination_view_camera_basis(yaw(0), yaw(10),
+        rh_view, -1.0F, rh_peer), "both view conventions accept headset yaw");
+    for (unsigned row = 0; row < 3; ++row)
+        for (unsigned column = 0; column < 3; ++column)
+            expect(near(lh_peer[row][column], rh_peer[row][column] * (row == 2 ? -1.0F : 1.0F)),
+                "LH and RH camera yaw describe the same physical rotation");
+    for (float sign : {-1.0F, 1.0F}) {
+        xrfg::LukeCameraBasis view{};
+        expect(xrfg::luke_view_camera_basis(physical_basis, sign, view),
+            "producer forward convention is computable");
+        // A point five metres ahead and a peer shifted right must remain
+        // in front and move left in the destination view for either matrix.
+        const float view_z = 5.0F * view[2][2];
+        const float w = sign * view_z;
+        expect(w > 0 && near((-0.06F * ghost_projection[0]) / w,
+            -0.06F * ghost_projection[0] / 5.0F),
+            "stereo disparity and positive clip W agree across handedness");
+    }
+    expect(!xrfg::luke_view_camera_basis(physical_basis, 0, lh_view) &&
+        !xrfg::luke_destination_view_camera_basis(yaw(0), yaw(10), rh_view, 0, rh_peer),
+        "degenerate perspective does not select a guessed camera convention");
     const std::array<float, 3> camera_right{0.27F, 0.96F, 0.01F};
     const std::array<float, 3> camera_left_position{0.0F, 0.0F, 0.0F};
     const std::array<float, 3> camera_right_position{0.0162F, 0.0576F, 0.0006F};

@@ -1,8 +1,11 @@
 #include "xrfg/luke_afw.hpp"
+#include "xrfg/luke_depth_format.hpp"
+#include "xrfg/luke_recording_scope.hpp"
 #include "xrfg/luke_guide_window.hpp"
 #include "xrfg/luke_physical_projection.hpp"
 #include "xrfg/luke_pose_camera.hpp"
 #include "xrfg/luke_world_scale.hpp"
+#include "xrfg/luke_world_scale_config.hpp"
 #include "xrfg/bridge_flight_logger.hpp"
 #include "xrfg/two_frame_capture.hpp"
 #include "luke_depth_convert_shader.hpp"
@@ -220,29 +223,22 @@ void view_to_world(const std::array<float, 3>& right,
     output.values[15] = 1.0F;
 }
 
-float horizon_world_scale(const std::filesystem::path& plugin_path) {
-    const auto ini = plugin_path.parent_path() / L"RealVR.ini";
-    wchar_t value[64]{};
-    const DWORD count = GetPrivateProfileStringW(L"HFW", L"WorldScale",
-        L"", value, static_cast<DWORD>(std::size(value)), ini.c_str());
-    if (count == 0 || count >= std::size(value) - 1) return 0.0F;
-    wchar_t* end{};
-    const float scale = std::wcstof(value, &end);
-    return end != value && *end == L'\0' && std::isfinite(scale) &&
-        scale >= 0.2F && scale <= 5.0F ? scale : 0.0F;
+float luke_world_scale(const std::filesystem::path& plugin_path) {
+    return luke_world_scale_from_ini(plugin_path.parent_path() / L"RealVR.ini");
 }
 
 bool camera_data(const D3D12ReprojectionView& source,
     const D3D12ReprojectionView& destination,
     const DlssMotionVectorFrame& guide, std::uint32_t source_eye,
-    float world_scale, float xr_eye_baseline, CameraData& output) noexcept {
+    float world_scale, float xr_eye_baseline, float units_per_metre, CameraData& output) noexcept {
     output = {};
     if (!guide.camera_data_valid || !guide.camera_matrices_valid ||
         source_eye > 1) return false;
     float game_baseline{};
     // AER submits cross-time eye poses. Their distance includes head motion,
     // not just IPD. Use ONE simultaneous XR pair, including the middle peer.
-    if (!luke_game_eye_baseline(xr_eye_baseline, world_scale, game_baseline))
+    if (!luke_game_eye_baseline(xr_eye_baseline, world_scale,
+            units_per_metre, game_baseline))
         return false;
 
     auto source_projection = guide.camera_view_to_clip;
@@ -262,14 +258,12 @@ bool camera_data(const D3D12ReprojectionView& source,
         !invert(output.destination_view_to_clip,
             output.destination_clip_to_view)) return false;
 
-    auto forward = guide.camera_forward;
-    // Horizon publishes a negative-determinant NGX camera basis. The V23264
-    // forward-sign correction is now part of one AFW input contract for all
-    // modes; runtime testing must validate the common convention.
-    for (float& component : forward) component = -component;
-    view_to_world(guide.camera_right, guide.camera_up,
-        forward, guide.camera_position,
-        output.source_view_to_world);
+    LukeCameraBasis source_basis{};
+    if (!luke_view_camera_basis({guide.camera_right, guide.camera_up,
+            guide.camera_forward}, guide.camera_view_to_clip[11], source_basis))
+        return false;
+    view_to_world(source_basis[0], source_basis[1], source_basis[2],
+        guide.camera_position, output.source_view_to_world);
     if (!invert(output.source_view_to_world, output.source_world_to_view))
         return false;
     const float direction = source_eye == 0 ? 1.0F : -1.0F;
@@ -278,10 +272,9 @@ bool camera_data(const D3D12ReprojectionView& source,
         guide.camera_position[1] + direction * guide.camera_right[1] * game_baseline,
         guide.camera_position[2] + direction * guide.camera_right[2] * game_baseline};
     LukeCameraBasis destination_basis{};
-    if (!luke_destination_camera_basis(source.pose.orientation,
-            destination.pose.orientation,
-            {guide.camera_right, guide.camera_up, forward},
-            destination_basis)) return false;
+    if (!luke_destination_view_camera_basis(source.pose.orientation,
+            destination.pose.orientation, source_basis,
+            guide.camera_view_to_clip[11], destination_basis)) return false;
     view_to_world(destination_basis[0], destination_basis[1],
         destination_basis[2], destination_position,
         output.destination_view_to_world);
@@ -382,6 +375,8 @@ struct LukeAfwSynthesizer::Impl {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> depth_pipeline;
     D3D12_RESOURCE_STATES depth_staging_state{D3D12_RESOURCE_STATE_COMMON};
     UINT depth_descriptor_size{};
+    DXGI_FORMAT depth_source_format{};
+    UINT depth_source_width{}, depth_source_height{};
     UINT depth_width{};
     UINT depth_height{};
     Microsoft::WRL::ComPtr<ID3D12Resource> motion_resource;
@@ -396,6 +391,9 @@ struct LukeAfwSynthesizer::Impl {
     D3D12_RESOURCE_DESC color_description{};
     D3D12_RESOURCE_DESC motion_description{};
     float world_scale{};
+    float calibrated_units_per_metre{};
+    std::uint64_t unit_epoch{};
+    std::array<ULONGLONG, 64> input_rejection_report_ticks{};
     bool frame_buffers_ready{};
 
     ~Impl() {
@@ -410,11 +408,19 @@ struct LukeAfwSynthesizer::Impl {
         return table == nullptr ? nullptr : reinterpret_cast<Function>(table[slot]);
     }
 
-    HRESULT ensure_float_depth(UINT width, UINT height) noexcept {
+    HRESULT ensure_float_depth(UINT width, UINT height,
+        const D3D12_RESOURCE_DESC& source) noexcept {
+        const auto format = luke_depth_format(source.Format);
+        if (format.resource == DXGI_FORMAT_UNKNOWN ||
+            source.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+            source.Width > INT_MAX || source.DepthOrArraySize != 1 ||
+            source.SampleDesc.Count != 1) return DXGI_ERROR_UNSUPPORTED;
         if (width == 0 || height == 0 || width > INT_MAX || height > INT_MAX)
             return E_INVALIDARG;
         if (depth.texture != nullptr && depth_staging != nullptr &&
-            depth_width == width && depth_height == height) return S_OK;
+            depth_width == width && depth_height == height &&
+            depth_source_format == source.Format && depth_source_width == source.Width &&
+            depth_source_height == source.Height) return S_OK;
 
         const auto create = method<CreateTextureFn>(kCreateTextureSlot);
         if (create == nullptr) return E_NOINTERFACE;
@@ -433,11 +439,11 @@ struct LukeAfwSynthesizer::Impl {
         heap_properties.VisibleNodeMask = 1;
         D3D12_RESOURCE_DESC staging_description{};
         staging_description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        staging_description.Width = width;
-        staging_description.Height = height;
+        staging_description.Width = source.Width;
+        staging_description.Height = source.Height;
         staging_description.DepthOrArraySize = 1;
         staging_description.MipLevels = 1;
-        staging_description.Format = DXGI_FORMAT_R24G8_TYPELESS;
+        staging_description.Format = format.resource;
         staging_description.SampleDesc.Count = 1;
         staging_description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
         staging_description.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -477,7 +483,7 @@ struct LukeAfwSynthesizer::Impl {
         parameters[2].ParameterType =
             D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         parameters[2].Constants.ShaderRegister = 0;
-        parameters[2].Constants.Num32BitValues = 2;
+        parameters[2].Constants.Num32BitValues = 4;
         parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC root_description{};
         root_description.NumParameters = static_cast<UINT>(parameters.size());
@@ -509,7 +515,7 @@ struct LukeAfwSynthesizer::Impl {
         D3D12_CPU_DESCRIPTOR_HANDLE cpu =
             descriptors->GetCPUDescriptorHandleForHeapStart();
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        srv.Format = format.srv;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2D.MipLevels = 1;
@@ -529,6 +535,9 @@ struct LukeAfwSynthesizer::Impl {
         depth_pipeline = std::move(pipeline);
         depth_staging_state = D3D12_RESOURCE_STATE_COMMON;
         depth_descriptor_size = descriptor_size;
+        depth_source_format = source.Format;
+        depth_source_width = static_cast<UINT>(source.Width);
+        depth_source_height = source.Height;
         depth_width = width;
         depth_height = height;
         return S_OK;
@@ -543,8 +552,9 @@ struct LukeAfwSynthesizer::Impl {
             depth_root_signature == nullptr || depth_pipeline == nullptr)
             return E_POINTER;
         const auto source_description = source->GetDesc();
-        if ((source_description.Format != DXGI_FORMAT_D24_UNORM_S8_UINT &&
-                source_description.Format != DXGI_FORMAT_R24G8_TYPELESS) ||
+        if ((source_description.Format != depth_source_format ||
+                source_description.Width != depth_source_width ||
+                source_description.Height != depth_source_height) ||
             static_cast<std::uint64_t>(source_x) + depth_width >
                 source_description.Width ||
             static_cast<std::uint64_t>(source_y) + depth_height >
@@ -579,10 +589,10 @@ struct LukeAfwSynthesizer::Impl {
         source_location.pResource = source;
         source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         source_location.SubresourceIndex = 0;
-        D3D12_BOX source_box{source_x, source_y, 0,
-            source_x + depth_width, source_y + depth_height, 1};
+        // Depth/stencil planes require a full-subresource copy. Crop only
+        // when sampling the private shader-readable depth plane.
         list->CopyTextureRegion(&destination, 0, 0, 0,
-            &source_location, &source_box);
+            &source_location, nullptr);
 
         std::array<D3D12_RESOURCE_BARRIER, 3> before_dispatch{};
         UINT dispatch_count = 0;
@@ -607,9 +617,9 @@ struct LukeAfwSynthesizer::Impl {
         list->SetComputeRootDescriptorTable(0, gpu);
         gpu.ptr += depth_descriptor_size;
         list->SetComputeRootDescriptorTable(1, gpu);
-        const UINT depth_options[2]{depth_inverted ? 1U : 0U,
-            static_cast<UINT>(depth_dilate_mode)};
-        list->SetComputeRoot32BitConstants(2, 2, depth_options, 0);
+        const UINT depth_options[4]{depth_inverted ? 1U : 0U,
+            static_cast<UINT>(depth_dilate_mode), source_x, source_y};
+        list->SetComputeRoot32BitConstants(2, 4, depth_options, 0);
         list->Dispatch((depth_width + 7) / 8, (depth_height + 7) / 8, 1);
 
         std::array<D3D12_RESOURCE_BARRIER, 2> after_dispatch{};
@@ -931,7 +941,7 @@ HRESULT LukeAfwSynthesizer::initialize(ID3D12Device* device,
         if (device == nullptr || queue == nullptr || plugin_path.empty()) return E_INVALIDARG;
         std::scoped_lock lock(mutex_);
         auto candidate = std::make_unique<Impl>();
-        candidate->world_scale = horizon_world_scale(plugin_path);
+        candidate->world_scale = luke_world_scale(plugin_path);
         if (candidate->world_scale == 0.0F) return E_INVALIDARG;
         candidate->module = LoadLibraryExW(plugin_path.c_str(), nullptr,
             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
@@ -1002,34 +1012,80 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
         report_stage(AfwStage::descriptions_ready,
             static_cast<std::int64_t>(color_desc.Format), color_extent,
             guide.publication);
-        if (!compatible_color(color_desc, destination_desc) ||
-            color_desc.Width > INT_MAX || color_desc.Height > INT_MAX ||
-            guide.motion_width == 0 || guide.motion_height == 0 ||
-            guide.output_width == 0 || guide.output_height == 0 ||
-            color_desc.Width > guide.output_width ||
-            color_desc.Height > guide.output_height ||
-            motion_desc.Format != DXGI_FORMAT_R16G16_FLOAT ||
-            depth_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-            motion_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-            depth_desc.DepthOrArraySize != 1 || motion_desc.DepthOrArraySize != 1 ||
-            guide.depth_x + guide.depth_width > depth_desc.Width ||
-            guide.depth_y + guide.depth_height > depth_desc.Height ||
-            guide.motion_x + guide.motion_width > motion_desc.Width ||
-            guide.motion_y + guide.motion_height > motion_desc.Height)
+        const auto reject_input = [&](std::uint32_t reason) {
+            // At most one complete diagnostic per reason/second, so the
+            // circular flight log retains the cause. No change
+            // to admission, images, synchronization or plugin arguments.
+            auto& logger = bridge_flight_logger();
+            if (logger.enabled() || logger.ram_enabled()) {
+                const auto now = GetTickCount64();
+                auto& last = impl_->input_rejection_report_ticks[reason];
+                if (last && now - last < 1000) return DXGI_ERROR_UNSUPPORTED;
+                last = now;
+                logger.event(BridgeFlightOperation::luke_afw_stage,
+                    reason, 95, guide.publication, source_eye);
+                const auto extent = [](std::uint64_t w, std::uint32_t h) {
+                    return (w << 32) | h;
+                };
+                const D3D12_RESOURCE_DESC descriptors[]{color_desc, destination_desc, depth_desc, motion_desc};
+                for (std::uint32_t slot = 0; slot < 4; ++slot) {
+                    const auto& d = descriptors[slot];
+                    logger.event(BridgeFlightOperation::luke_afw_stage,
+                        slot, 96, extent(d.Width, d.Height),
+                        static_cast<std::uint64_t>(d.Format) |
+                        (static_cast<std::uint64_t>(d.Dimension) << 16) |
+                        (static_cast<std::uint64_t>(d.DepthOrArraySize) << 24) |
+                        (static_cast<std::uint64_t>(d.SampleDesc.Count) << 40));
+                }
+                logger.event(BridgeFlightOperation::luke_afw_stage, 0, 97,
+                    extent(guide.output_width, guide.output_height), extent(guide.output_x, guide.output_y));
+                logger.event(BridgeFlightOperation::luke_afw_stage, 1, 97,
+                    extent(guide.motion_width, guide.motion_height), extent(guide.motion_x, guide.motion_y));
+                logger.event(BridgeFlightOperation::luke_afw_stage, 2, 97,
+                    extent(guide.depth_width, guide.depth_height), extent(guide.depth_x, guide.depth_y));
+                const auto floats = [](float x, float y) {
+                    std::uint32_t a{}, b{};
+                    std::memcpy(&a, &x, sizeof(a)); std::memcpy(&b, &y, sizeof(b));
+                    return (static_cast<std::uint64_t>(a) << 32) | b;
+                };
+                for (std::uint32_t row = 0; row < 8; ++row)
+                    logger.event(BridgeFlightOperation::luke_afw_stage, row, 98,
+                        floats(guide.camera_view_to_clip[row * 2], guide.camera_view_to_clip[row * 2 + 1]),
+                        guide.publication);
+                logger.event(BridgeFlightOperation::luke_afw_stage, 0, 99,
+                    floats(source_view.fov.angle_left, source_view.fov.angle_right),
+                    floats(source_view.fov.angle_up, source_view.fov.angle_down));
+            }
             return DXGI_ERROR_UNSUPPORTED;
+        };
+        if (!compatible_color(color_desc, destination_desc)) return reject_input(1);
+        if (color_desc.Width > INT_MAX || color_desc.Height > INT_MAX) return reject_input(2);
+        if (!guide.motion_width || !guide.motion_height || !guide.output_width || !guide.output_height)
+            return reject_input(3);
+        if (color_desc.Width > guide.output_width || color_desc.Height > guide.output_height)
+            return reject_input(4);
+        if (motion_desc.Format != DXGI_FORMAT_R16G16_FLOAT) return reject_input(5);
+        if (depth_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+            motion_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return reject_input(6);
+        if (depth_desc.DepthOrArraySize != 1 || motion_desc.DepthOrArraySize != 1) return reject_input(7);
+        if (guide.depth_x + guide.depth_width > depth_desc.Width ||
+            guide.depth_y + guide.depth_height > depth_desc.Height) return reject_input(8);
+        if (guide.motion_x + guide.motion_width > motion_desc.Width ||
+            guide.motion_y + guide.motion_height > motion_desc.Height) return reject_input(9);
 
         // The final OpenXR eye FOV is slightly inset from the apparent edge
         // crop of Luke's square DLSS output. Project that physical FOV through
         // the producer's exact matrix and take the same viewport from depth
         // and motion. At 3344/1672 this is about X30/X345, not X0/X375;
         // the numbers are derived, never stored as calibration offsets.
+        LukeGuideWindowFailure depth_failure{}, motion_failure{};
         const auto depth_window = luke_guide_window(
             guide.camera_view_to_clip,
             source_view.fov.angle_left, source_view.fov.angle_right,
             source_view.fov.angle_up, source_view.fov.angle_down,
             guide.output_width, guide.output_height,
             guide.depth_width, guide.depth_height,
-            static_cast<UINT>(color_desc.Width), color_desc.Height);
+            static_cast<UINT>(color_desc.Width), color_desc.Height, &depth_failure);
         const auto motion_window = luke_guide_window(
             guide.camera_view_to_clip,
             source_view.fov.angle_left, source_view.fov.angle_right,
@@ -1037,8 +1093,8 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
             guide.output_width, guide.output_height,
             guide.motion_width, guide.motion_height,
             static_cast<UINT>(color_desc.Width), color_desc.Height);
-        if (!depth_window || !motion_window)
-            return DXGI_ERROR_UNSUPPORTED;
+        if (!depth_window) return reject_input(16 + static_cast<std::uint32_t>(depth_failure));
+        if (!motion_window) return reject_input(32 + static_cast<std::uint32_t>(motion_failure));
         const UINT cropped_depth_width = depth_window->width;
         const UINT cropped_depth_height = depth_window->height;
         const UINT cropped_motion_width = motion_window->width;
@@ -1074,9 +1130,27 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
             if (FAILED(completion)) return completion;
         }
 
+        if (!std::isfinite(xr_eye_baseline) || xr_eye_baseline < .01F || xr_eye_baseline > .20F)
+            return E_INVALIDARG;
+        if (impl_->unit_epoch != guide.epoch) {
+            impl_->unit_epoch = guide.epoch;
+            impl_->calibrated_units_per_metre = 0;
+        }
+        if (impl_->calibrated_units_per_metre == 0 && guide.calibrated_game_eye_baseline > 0)
+            impl_->calibrated_units_per_metre = guide.calibrated_game_eye_baseline * impl_->world_scale / xr_eye_baseline;
+        const float units = impl_->calibrated_units_per_metre;
+        float game_baseline{};
+        const bool units_ready = luke_game_eye_baseline(xr_eye_baseline, impl_->world_scale, units, game_baseline);
+        std::uint32_t baseline_bits_units{}, units_bits{};
+        std::memcpy(&baseline_bits_units, &game_baseline, sizeof(baseline_bits_units));
+        std::memcpy(&units_bits, &units, sizeof(units_bits));
+        bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage,
+            units_ready ? S_OK : S_FALSE, 104, guide.publication,
+            (std::uint64_t(baseline_bits_units) << 32) | units_bits);
+        if (!units_ready) return HRESULT_FROM_WIN32(ERROR_NOT_READY);
         CameraData camera{};
         if (!camera_data(source_view, destination_view, guide, source_eye,
-                         impl_->world_scale, xr_eye_baseline, camera)) return E_INVALIDARG;
+                         impl_->world_scale, xr_eye_baseline, units, camera)) return E_INVALIDARG;
         std::uint32_t baseline_bits{};
         std::memcpy(&baseline_bits, &xr_eye_baseline, sizeof(baseline_bits));
         bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage,
@@ -1132,12 +1206,15 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
         }
         if (impl_->depth.texture == nullptr ||
             impl_->depth_width != cropped_depth_width ||
-            impl_->depth_height != cropped_depth_height) {
+            impl_->depth_height != cropped_depth_height ||
+            impl_->depth_source_format != depth_desc.Format ||
+            impl_->depth_source_width != depth_desc.Width ||
+            impl_->depth_source_height != depth_desc.Height) {
             report_stage(AfwStage::depth_create_begin,
                 static_cast<std::int64_t>(depth_desc.Format), source_eye,
                 guide.publication);
             HRESULT result = impl_->ensure_float_depth(
-                cropped_depth_width, cropped_depth_height);
+                cropped_depth_width, cropped_depth_height, depth_desc);
             const HRESULT device_status = impl_->device->GetDeviceRemovedReason();
             if (SUCCEEDED(result) && FAILED(device_status)) result = device_status;
             report_stage(AfwStage::depth_create_end, result, source_eye,
@@ -1170,10 +1247,22 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
         const auto copy = impl_->method<CopyTextureFn>(kCopyTextureSlot);
         if (copy == nullptr) return E_NOINTERFACE;
         result = impl_->command_allocator->Reset();
-        if (FAILED(result)) return result;
+        if (FAILED(result)) {
+            bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage, result, 100, source_eye, guide.publication);
+            return result;
+        }
         result = impl_->command_list->Reset(
             impl_->command_allocator.Get(), nullptr);
-        if (FAILED(result)) return result;
+        if (FAILED(result)) {
+            bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage, result, 101, source_eye, guide.publication);
+            return result;
+        }
+        const auto initial_depth_state = impl_->depth_staging_state;
+        LukeRecordingScope recording(impl_->command_list.Get(), [&](HRESULT aborted_close) noexcept {
+            impl_->depth_staging_state = initial_depth_state;
+            bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage, result, 102, source_eye, guide.publication);
+            bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage, aborted_close, 103, source_eye, guide.publication);
+        });
         ID3D12GraphicsCommandList* command_list = impl_->command_list.Get();
         report_stage(AfwStage::command_list_reset, S_OK, source_eye,
             guide.publication);
@@ -1279,7 +1368,7 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
             middle_peer_view.pose.orientation =
                 destination_view.pose.orientation;
             if (camera_data(destination_view, middle_peer_view, *middle,
-                    1U - source_eye, impl_->world_scale, xr_eye_baseline, middle_camera)) {
+                    1U - source_eye, impl_->world_scale, xr_eye_baseline, units, middle_camera)) {
                 const Matrix4x4 current_clip_to_world = multiply(
                     camera.source_clip_to_view, camera.source_view_to_world);
                 middle_same_transform = multiply(multiply(
@@ -1412,9 +1501,8 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
             contract.camera_position = guide.camera_position;
             contract.camera_right = guide.camera_right;
             contract.camera_up = guide.camera_up;
-            contract.camera_forward = guide.camera_forward;
-            for (float& component : contract.camera_forward)
-                component = -component;
+            std::copy(camera.source_view_to_world.values + 8,
+                camera.source_view_to_world.values + 11, contract.camera_forward.begin());
             contract.source_pose = {source_view.pose.position.x,
                 source_view.pose.position.y, source_view.pose.position.z};
             contract.destination_pose = {destination_view.pose.position.x,
@@ -1503,11 +1591,13 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
                 }
             }
         }
-        const HRESULT close_result = command_list->Close();
+        const HRESULT close_result = recording.close();
         report_stage(AfwStage::command_list_closed, close_result, source_eye,
             guide.publication);
-        if (FAILED(close_result)) return close_result;
-        if (FAILED(result)) return result;
+        if (FAILED(close_result) || FAILED(result)) {
+            impl_->depth_staging_state = initial_depth_state;
+            return FAILED(close_result) ? close_result : result;
+        }
         ID3D12CommandList* lists[] = {command_list};
         if (guide.motion_retention) guide.motion_retention->begin_gpu_read();
         if (guide.depth_retention) guide.depth_retention->begin_gpu_read();

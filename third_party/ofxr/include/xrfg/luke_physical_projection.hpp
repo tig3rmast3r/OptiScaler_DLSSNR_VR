@@ -1,5 +1,7 @@
 #pragma once
 
+#include "xrfg/luke_projection_ray.hpp"
+
 #include <array>
 #include <cmath>
 #include <limits>
@@ -14,20 +16,13 @@ namespace xrfg {
     float angle_up, float angle_down) noexcept {
     for (const float value : projection)
         if (!std::isfinite(value)) return false;
-    const auto ndc = [](double tangent, double focal, double center,
-        double perspective, double depth) noexcept {
-        const double denominator = perspective * tangent - depth;
-        return denominator == 0.0
-            ? std::numeric_limits<double>::quiet_NaN()
-            : (focal * tangent - center) / denominator;
-    };
-    const double left = ndc(std::tan(angle_left), projection[0],
+    const double left = luke_projection_ray_ndc(std::tan(angle_left), projection[0],
         projection[8], projection[3], projection[11]);
-    const double right = ndc(std::tan(angle_right), projection[0],
+    const double right = luke_projection_ray_ndc(std::tan(angle_right), projection[0],
         projection[8], projection[3], projection[11]);
-    const double top = ndc(std::tan(angle_up), projection[5],
+    const double top = luke_projection_ray_ndc(std::tan(angle_up), projection[5],
         projection[9], projection[7], projection[11]);
-    const double bottom = ndc(std::tan(angle_down), projection[5],
+    const double bottom = luke_projection_ray_ndc(std::tan(angle_down), projection[5],
         projection[9], projection[7], projection[11]);
     if (!std::isfinite(left) || !std::isfinite(right) ||
         !std::isfinite(top) || !std::isfinite(bottom) ||

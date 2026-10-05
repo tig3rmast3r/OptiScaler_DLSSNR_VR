@@ -105,7 +105,7 @@ bool selected_pose(BridgeFlightOperation op, std::uint64_t a) noexcept {
             a == 23 || a == 26 || a == 27 || a == 28 || a == 31 ||
             a == 32 || a == 33 || a == 34 || a == 35 ||
             a == 36 || a == 52 || a == 53 || (a >= 54 && a <= 68) ||
-            (a >= 71 && a <= 81) || (a >= 86 && a <= 101) || a == 122;
+            (a >= 71 && a <= 81) || (a >= 86 && a <= 104) || a == 122;
     default: return false;
     }
 }

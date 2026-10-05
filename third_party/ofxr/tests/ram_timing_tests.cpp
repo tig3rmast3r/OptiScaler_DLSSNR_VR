@@ -150,8 +150,8 @@ int main(int argc, char** argv) {
           ini<<"[diagnostics]\nlogging_enabled=0\ntiming_capture=1\npose_cadence_capture=1\n"; }
         logger.initialize(root);
         require(logger.ram_enabled() && !logger.enabled(),"pose profile enabled normal logging");
-        constexpr std::array<std::uint64_t,6> selected{28,71,89,90,101,122};
-        constexpr std::array<std::uint64_t,5> unselected{102,121,200,354,999};
+        constexpr std::array<std::uint64_t,9> selected{28,71,89,90,101,102,103,104,122};
+        constexpr std::array<std::uint64_t,5> unselected{105,121,200,354,999};
         for(const auto stage:selected) logger.event(O::luke_afw_stage,-731,stage,812,913);
         for(const auto stage:unselected) logger.event(O::luke_afw_stage,-732,stage,812,913);
         require(xrfg::save_ram_timing(GetCurrentProcessId(),root,&saved,&error),"pose profile save failed");

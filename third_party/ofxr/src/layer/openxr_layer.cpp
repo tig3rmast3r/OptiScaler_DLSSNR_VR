@@ -327,6 +327,21 @@ struct ProjectionSnapshot {
     std::optional<xrfg::LukeRenderIdentity> luke_identity;
 };
 
+// Immutable metadata belongs to the two released AFW images, not the next
+// application's projection. No borrowed extension pointers are retained.
+struct HeldAfwResource {
+    XrSwapchain application_swapchain{XR_NULL_HANDLE};
+    XrSwapchain output_swapchain{XR_NULL_HANDLE};
+    std::uint32_t logical_eye{};
+};
+
+struct HeldAfwPair {
+    ProjectionSnapshot projection;
+    std::array<HeldAfwResource, 2> resources;
+    std::uint64_t revision{};
+    std::uint64_t production_serial{};
+};
+
 struct ProjectionViewReference {
     std::size_t projection_index{};
     std::size_t view_index{};
@@ -505,8 +520,7 @@ struct SessionState {
     std::uint64_t luke_afw_last_evaluated_publication{};
     // Last fully published AFW stereo pair. OpenXR permits re-submission of
     // the last released swapchain image on an XR frame with no game render.
-    std::array<XrSwapchain, 2> luke_afw_last_pair{};
-    std::uint64_t luke_afw_last_pair_revision{};
+    std::shared_ptr<const HeldAfwPair> luke_afw_last_pair;
     bool luke_frame_guide_resolved{};
     std::uint64_t luke_last_consumed_guide_publication{};
     std::shared_ptr<const xrfg::DlssMotionVectorSet>
@@ -7032,6 +7046,7 @@ struct PreparedProjectionFrame {
     std::vector<PreparedProjectionResource> resources;
     bool anchor_is_current{};
     bool preserve_previous{};
+    std::shared_ptr<const HeldAfwPair> held_afw_pair;
 };
 
 void log_luke_publication_boundary(
@@ -7897,15 +7912,75 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
     return XR_SUCCESS;
 }
 
+// Match ownership by application resource and logical eye, even if mapping
+// enumeration order changes. A space/layout/configuration transition cannot
+// reuse images whose camera packet belongs to the preceding configuration.
+[[nodiscard]] bool prepare_held_luke_afw_frame(
+    const std::shared_ptr<const HeldAfwPair>& pair,
+    const ProjectionSnapshot& snapshot,
+    std::span<const ProjectionResourceMapping> mappings,
+    const std::array<XrSwapchain, 2>& handles,
+    const std::array<std::uint32_t, 2>& logical_eyes,
+    std::uint64_t revision, PreparedProjectionFrame& output) {
+    if (!pair || pair->revision != revision || mappings.size() != 2 ||
+        !projection_resource_layout_compatible(pair->projection, snapshot)) return false;
+    for (std::size_t layer = 0; layer < snapshot.layers.size(); ++layer) {
+        if (pair->projection.layers[layer].space != snapshot.layers[layer].space ||
+            pair->projection.layers[layer].layer_flags != snapshot.layers[layer].layer_flags)
+            return false;
+    }
+    if (logical_eyes[0] > 1 || logical_eyes[1] > 1 || logical_eyes[0] == logical_eyes[1])
+        return false;
+    std::vector<PreparedProjectionResource> resources;
+    for (std::size_t index = 0; index < mappings.size(); ++index) {
+        const auto found = std::find_if(pair->resources.begin(), pair->resources.end(),
+            [&](const auto& resource) {
+                return resource.application_swapchain == mappings[index].application_swapchain &&
+                    resource.output_swapchain == handles[index] && handles[index] != XR_NULL_HANDLE &&
+                    resource.logical_eye == logical_eyes[index];
+            });
+        if (found == pair->resources.end()) return false;
+        PreparedGeneration held{};
+        held.kind = PreparedGenerationKind::prime;
+        held.reason = GenerationPrepareReason::ready;
+        held.current_handle = found->output_swapchain;
+        held.anchor_is_current = true;
+        resources.push_back({found->application_swapchain, held});
+    }
+    output.kind = PreparedGenerationKind::prime;
+    output.reason = GenerationPrepareReason::ready;
+    output.anchor_is_current = true;
+    output.resources = std::move(resources);
+    output.held_afw_pair = pair;
+    return true;
+}
+
 [[nodiscard]] bool build_afw_terminal_submission(const XrFrameEndInfo* source,
     const ProjectionSnapshot& snapshot, const PreparedProjectionFrame& produced,
     GeneratedFrameEndInfo& terminal, ProjectionSnapshot& terminal_snapshot) {
     std::vector<ProjectionResourceDestination> destinations;
     for (const auto& resource : produced.resources)
         destinations.push_back({resource.application_swapchain, resource.generation.current_handle});
-    return produced.kind != PreparedGenerationKind::none &&
-        build_generated_frame_end_info(source, snapshot, false, destinations, &terminal) &&
-        capture_projection_snapshot(&terminal.info, &terminal_snapshot);
+    if (produced.kind == PreparedGenerationKind::none ||
+        !build_generated_frame_end_info(source, snapshot, false, destinations, &terminal))
+        return false;
+    if (produced.held_afw_pair) {
+        const auto& owned = produced.held_afw_pair->projection;
+        if (!projection_resource_layout_compatible(owned, snapshot)) return false;
+        for (std::size_t layer = 0; layer < terminal.projections.size(); ++layer) {
+            auto& copy = terminal.projections[layer];
+            const auto& saved = owned.layers[layer];
+            if (copy.layer.space != saved.space || copy.layer.layerFlags != saved.layer_flags)
+                return false;
+            for (std::size_t view = 0; view < copy.views.size(); ++view) {
+                copy.views[view].pose = saved.views[view].pose;
+                copy.views[view].fov = saved.views[view].fov;
+            }
+        }
+        // displayTime names this physical presentation interval; the retained
+        // render pose/FOV still describe the pixels generated on the old one.
+    }
+    return capture_projection_snapshot(&terminal.info, &terminal_snapshot);
 }
 
 [[nodiscard]] std::shared_ptr<const CompletedAfwFrame> freeze_completed_afw_frame(
@@ -8177,38 +8252,21 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
 
         const auto afw_status = xrfg::embedded::afw_snapshot();
         const auto hold_last_pair = [&]() -> bool {
-            bool can_hold = false;
+            std::shared_ptr<const HeldAfwPair> pair;
             {
                 std::scoped_lock guide_lock(session->luke_guide_mutex);
-                can_hold = session->luke_afw_last_pair_revision ==
-                        afw_status.revision &&
-                    session->luke_afw_last_pair[0] != XR_NULL_HANDLE &&
-                    session->luke_afw_last_pair[1] != XR_NULL_HANDLE &&
-                    session->luke_afw_last_pair[0] ==
-                        entries[0].generation->current[kAfwScratchSlot].handle &&
-                    session->luke_afw_last_pair[1] ==
-                        entries[1].generation->current[kAfwScratchSlot].handle;
+                pair = session->luke_afw_last_pair;
             }
-            if (!can_hold) return false;
-            // No new AFW color was produced on this XR interval. Present the
-            // held stereo pair, but keep the post-AFW temporal anchor so the
-            // next fresh pair can interpolate from it.
-            output.kind = PreparedGenerationKind::prime;
-            output.reason = GenerationPrepareReason::ready;
-            output.anchor_is_current = true;
-            output.resources.reserve(entries.size());
-            for (std::size_t index = 0; index < entries.size(); ++index) {
-                PreparedGeneration held{};
-                held.kind = PreparedGenerationKind::prime;
-                held.reason = GenerationPrepareReason::ready;
-                held.current_handle = entries[index].generation->current[kAfwScratchSlot].handle;
-                held.anchor_is_current = true;
-                output.resources.push_back({
-                    mappings[index].application_swapchain, held});
-            }
+            if (!prepare_held_luke_afw_frame(pair, snapshot, mappings,
+                    {entries[0].generation->current[kAfwScratchSlot].handle,
+                     entries[1].generation->current[kAfwScratchSlot].handle},
+                    {entries[0].logical_eye, entries[1].logical_eye},
+                    afw_status.revision, output)) return false;
+            // No new AFW color was produced. Keep both image ownership and
+            // camera metadata, while leaving the post-AFW temporal anchor intact.
             xrfg::bridge_flight_logger().event(
                 xrfg::BridgeFlightOperation::luke_afw_stage,
-                1, 33, afw_status.revision, 0);
+                1, 33, afw_status.revision, pair->production_serial);
             return true;
         };
         if (!released_eye) {
@@ -8249,8 +8307,7 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
         // production. No latest-guide or eye-parity join survives here.
         {
             std::scoped_lock guide_lock(session->luke_guide_mutex);
-            session->luke_afw_last_pair = {};
-            session->luke_afw_last_pair_revision = 0;
+            session->luke_afw_last_pair.reset();
         }
 
         // The peer is an AFW output, not a second temporal-synthesis input.
@@ -8515,12 +8572,17 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
                 : GenerationPrepareReason::private_release_failed;
             return output;
         }
+        auto pair = std::make_shared<HeldAfwPair>();
+        pair->projection = snapshot;
+        pair->revision = afw_status.revision;
+        pair->production_serial = frame_serial;
+        for (std::size_t index = 0; index < entries.size(); ++index)
+            pair->resources[index] = {mappings[index].application_swapchain,
+                entries[index].generation->current[kAfwScratchSlot].handle,
+                entries[index].logical_eye};
         {
             std::scoped_lock guide_lock(session->luke_guide_mutex);
-            session->luke_afw_last_pair = {
-                entries[0].generation->current[kAfwScratchSlot].handle,
-                entries[1].generation->current[kAfwScratchSlot].handle};
-            session->luke_afw_last_pair_revision = afw_status.revision;
+            session->luke_afw_last_pair = std::move(pair);
         }
         xrfg::two_frame_capture_mark_afw_evaluation();
         xrfg::report_dlss_motion_vector_use();
@@ -9111,8 +9173,7 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
         state->luke_afw_released_eye.reset();
         state->luke_afw_last_guide_publication = {};
         state->luke_afw_last_evaluated_publication = 0;
-        state->luke_afw_last_pair = {};
-        state->luke_afw_last_pair_revision = 0;
+        state->luke_afw_last_pair.reset();
         state->luke_frame_guide_resolved = false;
         state->luke_last_consumed_guide_publication = 0;
         state->luke_frame_motion_vectors.reset();
@@ -9313,8 +9374,7 @@ XrResult layer_end_frame_impl(
         clear_generation_continuity(state);
         {
             std::scoped_lock guide_lock(state->luke_guide_mutex);
-            state->luke_afw_last_pair = {};
-            state->luke_afw_last_pair_revision = 0;
+            state->luke_afw_last_pair.reset();
             state->luke_afw_last_evaluated_publication = 0;
         }
         for (const auto& chain : find_swapchains(state)) {

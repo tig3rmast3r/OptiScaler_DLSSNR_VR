@@ -1,4 +1,5 @@
 #include "xrfg/dlss_motion_vectors.hpp"
+#include "xrfg/luke_camera_units.hpp"
 #include "xrfg/luke_color_token.hpp"
 #include "xrfg/two_frame_capture.hpp"
 
@@ -34,6 +35,7 @@ struct SnapshotSlot {
 };
 
 struct StreamState {
+    LukeCameraUnitCalibration camera_units;
     std::uint64_t epoch{1};
     std::uint64_t serial{};
     std::uint64_t first_publication{};
@@ -443,6 +445,30 @@ std::shared_ptr<const DlssMotionVectorFrame> publish_dlss_motion_vectors(
         frame->camera_clip_to_view = publication.camera_clip_to_view;
         frame->camera_matrices_valid = publication.camera_matrices_valid;
         frame->producer_command_list = publication.producer_command_list;
+        if (publication.protect_snapshot_lifetime) {
+            // Calibrate exactly once in immutable production order. Consumer
+            // queries may lag, repeat or skip; none may select newer cameras
+            // to calibrate an older color-carried identity.
+            const auto camera_sample = [](const auto& value) {
+                return LukeUnitCamera{value->camera_position, value->camera_right,
+                    value->frame_time_delta_ms, value->camera_data_valid && !value->reset};
+            };
+            const auto& older = stream.previous;
+            const auto& middle = stream.latest;
+            const bool consecutive = older && middle &&
+                older->stream == frame->stream && middle->stream == frame->stream &&
+                older->epoch == frame->epoch && middle->epoch == frame->epoch &&
+                older->serial + 1 == middle->serial && middle->serial + 1 == frame->serial &&
+                older->publication + 1 == middle->publication &&
+                middle->publication + 1 == frame->publication &&
+                older->color_origin_token != 0 &&
+                std::uint64_t(older->color_origin_token) + 1 == middle->color_origin_token &&
+                std::uint64_t(middle->color_origin_token) + 1 == frame->color_origin_token;
+            const float sample = consecutive
+                ? luke_camera_separation(camera_sample(older), camera_sample(middle), camera_sample(frame)) : 0;
+            frame->calibrated_game_eye_baseline = stream.camera_units.observe(
+                frame->epoch, frame->publication, sample);
+        }
         if (two_frame_capture_active()) {
             TwoFrameGuideContract contract{};
             contract.stage = "ngx_ingress";

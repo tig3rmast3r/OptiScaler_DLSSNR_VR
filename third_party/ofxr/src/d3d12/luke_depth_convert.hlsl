@@ -4,6 +4,8 @@ cbuffer DepthDilation : register(b0)
 {
     uint DepthInverted;
     uint DilateMode;
+    uint SourceX;
+    uint SourceY;
 };
 
 [numthreads(8, 8, 1)]
@@ -16,11 +18,11 @@ void ConvertLukeDepth(uint3 thread_id : SV_DispatchThreadID)
         return;
     if (DilateMode == 0) {
         ConvertedDepth[thread_id.xy] = SourceDepth.Load(
-            int3(thread_id.xy, 0));
+            int3(thread_id.xy + uint2(SourceX, SourceY), 0));
         return;
     }
     // One guide pixel horizontally, optionally one vertically as well.
-    // Horizon's captured depth is inverted (near = larger).
+    // The producer flag determines whether near depth is larger.
     float nearest = DepthInverted != 0 ? 0.0 : 1.0;
     [unroll]
     for (int y = -1; y <= 1; ++y) {
@@ -29,7 +31,7 @@ void ConvertLukeDepth(uint3 thread_id : SV_DispatchThreadID)
         [unroll]
         for (int x = -1; x <= 1; ++x) {
             int sample_x = clamp(int(thread_id.x) + x, 0, int(width) - 1);
-            float candidate = SourceDepth.Load(int3(sample_x, sample_y, 0));
+            float candidate = SourceDepth.Load(int3(sample_x + SourceX, sample_y + SourceY, 0));
             nearest = DepthInverted != 0
                 ? max(nearest, candidate) : min(nearest, candidate);
         }

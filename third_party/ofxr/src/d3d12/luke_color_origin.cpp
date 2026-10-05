@@ -167,7 +167,7 @@ void report_read(HRESULT result, std::uint32_t token, UINT width, UINT height) n
             telemetry.file = CreateFileW(destination.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ |
                 FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (telemetry.file != INVALID_HANDLE_VALUE) {
-                constexpr char header[] = "# V30058 compact token32+CRC16, one256x8 band\n"
+                constexpr char header[] = "# V30059 compact token32+CRC16, one256x8 band\n"
                     "# uptime_ms,read_ok,read_missing,read_error,last_hr,token,roi_width,roi_height\n";
                 DWORD written{};
                 WriteFile(telemetry.file, header, static_cast<DWORD>(sizeof(header)-1), &written, nullptr);

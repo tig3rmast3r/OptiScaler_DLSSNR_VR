@@ -222,6 +222,103 @@ void until(const std::shared_ptr<SessionState>& state, Predicate condition) {
     check(state->presenter_condition.wait_for(lock, std::chrono::seconds(3), condition), "timed out");
 }
 
+void held_afw_pair_gpu_test(const std::shared_ptr<SessionState>& state,
+    const XrFrameEndInfo& end, const ProjectionSnapshot& snapshot,
+    const std::vector<ProjectionResourceMapping>& mappings, unsigned pixel_serial) {
+    auto pair = std::make_shared<HeldAfwPair>();
+    pair->projection = snapshot;
+    pair->revision = xrfg::embedded::afw_snapshot().revision;
+    pair->production_serial = pixel_serial;
+    std::array<XrSwapchain, 2> handles{};
+    for (std::size_t index = 0; index < mappings.size(); ++index) {
+        auto chain = find_swapchain(mappings[index].application_swapchain);
+        chain->dlss_logical_eye_index = static_cast<std::uint32_t>(index);
+        handles[index] = chain->frame_generation->current[kAfwScratchSlot].handle;
+        pair->resources[index] = {chain->handle, handles[index], static_cast<std::uint32_t>(index)};
+    }
+    state->luke_afw_enabled = true;
+    state->graphics_binding_capabilities = 8;
+    state->luke_afw = std::make_shared<xrfg::LukeAfwSynthesizer>();
+    state->luke_afw_last_pair = pair;
+    std::vector<ProjectionResourceDestination> identities;
+    for (const auto& mapping : mappings)
+        identities.push_back({mapping.application_swapchain, mapping.application_swapchain});
+    GeneratedFrameEndInfo newer;
+    check(build_generated_frame_end_info(&end, snapshot, false, identities, &newer), "held test new input");
+    for (unsigned interval = 1; interval <= 4; ++interval) {
+        newer.info.displayTime = end.displayTime + interval * 11'111'111;
+        for (auto& projection : newer.projections)
+            for (auto& view : projection.views) {
+                view.pose.position = {float(interval), float(interval + 10), -float(interval)};
+                view.pose.orientation = {0.0f, 0.6f, 0.0f, 0.8f};
+                view.fov = {-0.5f, 0.9f, 0.8f, -0.6f};
+            }
+        ProjectionSnapshot current;
+        check(capture_projection_snapshot(&newer.info, &current), "held test current snapshot");
+        auto reordered = mappings;
+        std::reverse(reordered.begin(), reordered.end());
+        std::vector<PostAfwFrameInput> temporal_inputs;
+        const auto held = prepare_luke_afw_frame(state, current, reordered, std::nullopt,
+            100 + interval, false, temporal_inputs);
+        check(held.kind == PreparedGenerationKind::prime && held.held_afw_pair == pair &&
+            temporal_inputs.empty(), "actual held preparation lost immutable packet");
+        GeneratedFrameEndInfo terminal;
+        ProjectionSnapshot terminal_snapshot;
+        check(build_afw_terminal_submission(&newer.info, current, held, terminal, terminal_snapshot),
+            "held terminal construction");
+        // This downstream call inspects what the runtime receives, and reads
+        // BOTH retained D3D11 images. A metadata-only cache cannot pass it.
+        const auto runtime_end = [&](const XrFrameEndInfo* frame) {
+            check(frame->displayTime == newer.info.displayTime, "held presentation time regressed");
+            const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(frame->layers[0]);
+            check(projection->space == snapshot.layers[0].space, "held camera space changed");
+            for (unsigned eye = 0; eye != 2; ++eye) {
+                const auto& received = projection->views[eye];
+                const auto& saved = snapshot.layers[0].views[eye];
+                check(std::memcmp(&received.pose, &saved.pose, sizeof(XrPosef)) == 0 &&
+                    std::memcmp(&received.fov, &saved.fov, sizeof(XrFovf)) == 0,
+                    "runtime received a newer pose/FOV for retained pixels");
+                check(received.subImage.swapchain == handles[eye], "held eye resource swapped");
+                state->d3d11_context->CopyResource(readback.Get(), gpu_outputs.at(received.subImage.swapchain));
+                D3D11_MAPPED_SUBRESOURCE mapped{};
+                check(SUCCEEDED(state->d3d11_context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped)),
+                    "held image readback");
+                const auto* pixel = static_cast<const unsigned char*>(mapped.pData);
+                const bool correct = pixel[0] == pixel_serial && pixel[1] == (eye ? 160 : 80);
+                state->d3d11_context->Unmap(readback.Get(), 0);
+                check(correct, "held packet paired with stale/wrong-eye pixels");
+            }
+            return XR_SUCCESS;
+        };
+        check(runtime_end(&terminal.info) == XR_SUCCESS, "held runtime submission");
+        check(newer.projections[0].views[0].pose.position.y == float(interval + 10),
+            "held builder overwrote caller metadata");
+    }
+    PreparedProjectionFrame rejected;
+    auto changed = snapshot;
+    check(!prepare_held_luke_afw_frame(pair, changed, mappings, handles, {0, 1}, pair->revision + 1, rejected),
+        "held pair survived menu revision");
+    auto wrong_handles = handles; wrong_handles[0] = reinterpret_cast<XrSwapchain>(0xbad);
+    check(!prepare_held_luke_afw_frame(pair, changed, mappings, wrong_handles, {0, 1}, pair->revision, rejected),
+        "held pair survived private resource replacement");
+    check(!prepare_held_luke_afw_frame(pair, changed, mappings, handles, {1, 0}, pair->revision, rejected),
+        "held pair survived logical-eye reassignment");
+    changed.layers[0].space = reinterpret_cast<XrSpace>(0xbad);
+    check(!prepare_held_luke_afw_frame(pair, changed, mappings, handles, {0, 1}, pair->revision, rejected),
+        "held pair survived recenter/space change");
+    changed = snapshot; changed.layers[0].layer_flags ^= XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    check(!prepare_held_luke_afw_frame(pair, changed, mappings, handles, {0, 1}, pair->revision, rejected),
+        "held pair survived layer flag change");
+    changed = snapshot; changed.layers[0].views[0].subImage.imageRect.offset.x++;
+    check(!prepare_held_luke_afw_frame(pair, changed, mappings, handles, {0, 1}, pair->revision, rejected),
+        "held pair survived crop change");
+    check(!prepare_held_luke_afw_frame({}, snapshot, mappings, handles, {0, 1}, pair->revision, rejected),
+        "invalidated pair revived");
+    state->luke_afw_last_pair.reset(); state->luke_afw.reset();
+    state->luke_afw_enabled = false; state->graphics_binding_capabilities = 0;
+    std::cout << "Held AFW: actual preparation + terminal submission, four moved camera/FOV intervals, reversed mappings, both GPU eyes; ownership transitions rejected\n";
+}
+
 void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = false, bool luke = false, bool gap = false,
                   bool afw_slot_probe = false, bool post_afw_packet = false) {
     terminal_optical_test = post_afw_packet;
@@ -545,6 +642,7 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
                         check(fresh, "AFW scratch slot metadata references stale/wrong-eye pixels");
                     }
                 }
+                held_afw_pair_gpu_test(state, end, snapshot, mappings.mappings, n);
                 generation->current_slot = generation->synthetic_slot = 0;
                 right_generation->current_slot = right_generation->synthetic_slot = 0;
                 std::cout << "AFW GPU source/publication/release: frozen admission color despite late metadata change, both eyes/four cursor states; fresh pixels verified\n";
