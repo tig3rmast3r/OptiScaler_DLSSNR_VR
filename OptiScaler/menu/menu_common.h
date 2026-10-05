@@ -97,6 +97,10 @@ class MenuCommon
 
     inline static UINT64 _frameCount = 0;
 
+    // Extent of the upscaler output when the menu is drawn into UEVR.
+    inline static float _menuTargetWidth = 0.0f;
+    inline static float _menuTargetHeight = 0.0f;
+
     // reflex
     inline static float _limitFps = std::numeric_limits<float>::infinity();
 
@@ -188,6 +192,7 @@ class MenuCommon
     static bool IsInited() { return _isInited; }
     static bool IsVisible() { return _isVisible; }
     static HWND Handle() { return _handle; }
+    static void SetRenderExtent(float width, float height) noexcept;
 
     static bool RenderMenu();
     static void Init(HWND InHwnd, bool isUWP);

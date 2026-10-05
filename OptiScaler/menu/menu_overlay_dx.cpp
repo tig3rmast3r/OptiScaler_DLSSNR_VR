@@ -528,7 +528,7 @@ void MenuOverlayDx::CleanupRenderTarget(bool clearQueue, HWND hWnd)
 void MenuOverlayDx::Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags,
                             const DXGI_PRESENT_PARAMETERS* pPresentParameters, IUnknown* pDevice, HWND hWnd, bool isUWP)
 {
-    if (!Config::Instance()->OverlayMenu.value_or_default())
+    if (Config::Instance()->UseUpscalerMenu())
     {
         MenuOverlayBase::Present();
         return;

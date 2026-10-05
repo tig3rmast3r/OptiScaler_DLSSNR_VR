@@ -835,7 +835,7 @@ void MenuCommon::PopulateCombo(const std::string& name, TStorage& currentValue,
 static ImVec4 toneMapColor(const ImVec4& color)
 {
     if (State::Instance().isHdrActive ||
-        (!Config::Instance()->OverlayMenu.value_or_default() && State::Instance().currentFeature != nullptr &&
+        (Config::Instance()->UseUpscalerMenu() && State::Instance().currentFeature != nullptr &&
          State::Instance().currentFeature->IsHdr()))
     {
         // Controls how strongly HDR/UI colors are pushed into the tone mapper before compression.
@@ -867,7 +867,7 @@ static void MenuHdrCheck(ImGuiIO io)
 {
     // If game is using HDR, apply tone mapping to the ImGui style
     if (State::Instance().isHdrActive ||
-        (!Config::Instance()->OverlayMenu.value_or_default() && State::Instance().currentFeature != nullptr &&
+        (Config::Instance()->UseUpscalerMenu() && State::Instance().currentFeature != nullptr &&
          State::Instance().currentFeature->IsHdr()))
     {
         if (!_hdrTonemapApplied)
@@ -1235,7 +1235,7 @@ void MenuCommon::UpdateRenderTiming(RenderMenuContext& ctx)
     auto& frameTime = ctx.frameTime;
     auto& frameRate = ctx.frameRate;
 
-    if (config->OverlayMenu.value_or_default())
+    if (!config->UseUpscalerMenu())
     {
         _frameCount++;
 
@@ -1480,7 +1480,18 @@ void MenuCommon::BeginMenuFrameIfNeeded(RenderMenuContext& ctx)
             ImGui_ImplUwp_NewFrame(displaySize);
         }
 
-        OptiInput::FeedImGui(_isVisible);
+        float mouseScaleX = 1.0f;
+        float mouseScaleY = 1.0f;
+        if (config->UseUpscalerMenu() && _menuTargetWidth > 0.0f && _menuTargetHeight > 0.0f)
+        {
+            if (io.DisplaySize.x > 0.0f)
+                mouseScaleX = _menuTargetWidth / io.DisplaySize.x;
+            if (io.DisplaySize.y > 0.0f)
+                mouseScaleY = _menuTargetHeight / io.DisplaySize.y;
+            io.DisplaySize = ImVec2(_menuTargetWidth, _menuTargetHeight);
+        }
+
+        OptiInput::FeedImGui(_isVisible, mouseScaleX, mouseScaleY);
 
         MenuHdrCheck(io);
         ImGui::NewFrame();
@@ -1572,7 +1583,7 @@ void MenuCommon::RenderNotifications(RenderMenuContext& ctx)
 
     // Notifications
     bool tonemapRequired = State::Instance().isHdrActive ||
-                           (!Config::Instance()->OverlayMenu.value_or_default() &&
+                           (Config::Instance()->UseUpscalerMenu() &&
                             State::Instance().currentFeature != nullptr && State::Instance().currentFeature->IsHdr());
 
     float screenHeight = State::Instance().screenHeight;
@@ -7757,7 +7768,7 @@ void MenuCommon::Init(HWND InHwnd, bool isUWP)
         }
     }
 
-    if (!Config::Instance()->OverlayMenu.value_or_default())
+    if (Config::Instance()->UseUpscalerMenu())
     {
         _hdrTonemapApplied = false;
     }
@@ -7772,6 +7783,12 @@ void MenuCommon::Init(HWND InHwnd, bool isUWP)
 
     ApplyThemeStyle();
     _isInited = true;
+}
+
+void MenuCommon::SetRenderExtent(float width, float height) noexcept
+{
+    _menuTargetWidth = width;
+    _menuTargetHeight = height;
 }
 
 void MenuCommon::Shutdown()

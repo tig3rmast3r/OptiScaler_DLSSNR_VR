@@ -42,7 +42,7 @@ static DescriptorHeapAllocator g_pd3dSrvDescHeapAlloc;
 
 bool Menu_Dx12::Render(ID3D12GraphicsCommandList* pCmdList, ID3D12Resource* outTexture)
 {
-    if (Config::Instance()->OverlayMenu.value_or_default())
+    if (!Config::Instance()->UseUpscalerMenu())
         return false;
 
     if (pCmdList == nullptr || outTexture == nullptr)
@@ -54,6 +54,8 @@ bool Menu_Dx12::Render(ID3D12GraphicsCommandList* pCmdList, ID3D12Resource* outT
     //	return true;
 
     auto outDesc = outTexture->GetDesc();
+    MenuCommon::SetRenderExtent(static_cast<float>(outDesc.Width),
+                                static_cast<float>(outDesc.Height));
 
     CreateRenderTarget(outDesc);
 
@@ -199,7 +201,7 @@ bool Menu_Dx12::Render(ID3D12GraphicsCommandList* pCmdList, ID3D12Resource* outT
 
 Menu_Dx12::Menu_Dx12(HWND handle, ID3D12Device* pDevice) : MenuDxBase(handle), _device(pDevice)
 {
-    if (Config::Instance()->OverlayMenu.value_or_default())
+    if (!Config::Instance()->UseUpscalerMenu())
         return;
 
     D3D12_DESCRIPTOR_HEAP_DESC rtvDesc = {};

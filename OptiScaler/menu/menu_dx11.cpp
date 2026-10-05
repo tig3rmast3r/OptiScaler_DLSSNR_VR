@@ -72,11 +72,21 @@ void Menu_Dx11::CreateRenderTarget(ID3D11Resource* out)
 
 bool Menu_Dx11::Render(ID3D11DeviceContext* pCmdList, ID3D11Resource* outTexture)
 {
-    if (Config::Instance()->OverlayMenu.value_or_default())
+    if (!Config::Instance()->UseUpscalerMenu())
         return false;
 
     if (pCmdList == nullptr || outTexture == nullptr)
         return false;
+
+    ID3D11Texture2D* outputTexture2D = nullptr;
+    if (outTexture->QueryInterface(IID_PPV_ARGS(&outputTexture2D)) == S_OK)
+    {
+        D3D11_TEXTURE2D_DESC outputDesc {};
+        outputTexture2D->GetDesc(&outputDesc);
+        MenuCommon::SetRenderExtent(static_cast<float>(outputDesc.Width),
+                                    static_cast<float>(outputDesc.Height));
+        outputTexture2D->Release();
+    }
 
     frameCounter++;
 

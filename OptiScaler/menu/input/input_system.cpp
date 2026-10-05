@@ -1112,7 +1112,7 @@ void BeginFrame(HWND targetHwnd, HWND inputHwnd, bool isUwp)
     BeginFrameLocked(targetHwnd, inputHwnd, inputHwnd != nullptr, isUwp);
 }
 
-void FeedImGui(bool menuVisible)
+void FeedImGui(bool menuVisible, float mouseScaleX, float mouseScaleY)
 {
     std::unique_lock lock(_state.Mutex);
 
@@ -1211,7 +1211,8 @@ void FeedImGui(bool menuVisible)
     AddKey(ImGuiKey_LeftAlt, VK_LMENU);
     AddKey(ImGuiKey_RightAlt, VK_RMENU);
 
-    io.AddMousePosEvent(static_cast<float>(_state.MouseClientPos.x), static_cast<float>(_state.MouseClientPos.y));
+    io.AddMousePosEvent(static_cast<float>(_state.MouseClientPos.x) * mouseScaleX,
+                        static_cast<float>(_state.MouseClientPos.y) * mouseScaleY);
 
     if (_state.MouseWheel != 0.0f)
         io.AddMouseWheelEvent(0.0f, _state.MouseWheel);

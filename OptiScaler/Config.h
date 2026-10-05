@@ -429,6 +429,7 @@ class Config
     // Menu
     CustomOptional<float, NoDefault> MenuScale;
     CustomOptional<bool> OverlayMenu { true };
+    CustomOptional<bool> RenderMenuInUpscaler { false };
     CustomOptional<int> ShortcutKey { VK_INSERT };
     CustomOptional<bool> ExtendedLimits { false };
     CustomOptional<bool> ShowFps { false };
@@ -764,6 +765,11 @@ class Config
     std::vector<std::string> GetConfigLog();
 
     static Config* Instance();
+
+    [[nodiscard]] bool UseUpscalerMenu() const
+    {
+        return !OverlayMenu.value_or_default() || RenderMenuInUpscaler.value_or_default();
+    }
 
   private:
     inline static Config* _config;

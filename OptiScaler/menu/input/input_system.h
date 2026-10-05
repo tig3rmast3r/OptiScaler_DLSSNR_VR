@@ -200,7 +200,7 @@ void Shutdown();
 
 void BeginFrame(HWND targetHwnd, bool isUwp = false);
 void BeginFrame(HWND targetHwnd, HWND inputHwnd, bool isUwp = false);
-void FeedImGui(bool menuVisible);
+void FeedImGui(bool menuVisible, float mouseScaleX = 1.0f, float mouseScaleY = 1.0f);
 void EndFrame(bool menuVisible);
 
 void SetMenuVisible(bool visible);

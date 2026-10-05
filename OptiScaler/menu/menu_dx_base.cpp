@@ -12,7 +12,7 @@
 
 bool MenuDxBase::RenderMenu()
 {
-    if (Config::Instance()->OverlayMenu.value_or_default())
+    if (!Config::Instance()->UseUpscalerMenu())
         return false;
 
     if (MenuCommon::RenderMenu())
@@ -26,7 +26,7 @@ bool MenuDxBase::RenderMenu()
 
 bool MenuDxBase::IsHandleDifferent()
 {
-    if (Config::Instance()->OverlayMenu.value_or_default())
+    if (!Config::Instance()->UseUpscalerMenu())
         return false;
 
     HWND frontWindow = Util::GetProcessWindow();
@@ -45,7 +45,7 @@ void MenuDxBase::Dx12Ready() { MenuCommon::Dx12Inited(); }
 
 MenuDxBase::MenuDxBase(HWND handle) : _handle(handle)
 {
-    if (Config::Instance()->OverlayMenu.value_or_default())
+    if (!Config::Instance()->UseUpscalerMenu())
         return;
 
     MenuCommon::Init(handle, false);
