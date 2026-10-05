@@ -30,11 +30,21 @@ struct D3D12FsrEyeInput {
     float camera_far{1000.0F};
     float camera_fov_vertical{1.5707963F};
     Pose camera_pose{};
+    Vec3 camera_position{};
+    Vec3 camera_up{};
+    Vec3 camera_right{};
+    Vec3 camera_forward{};
     bool depth_inverted{};
     bool depth_infinite{};
     bool motion_vectors_jittered{};
     bool reset{};
+    bool camera_data_valid{};
 };
+
+[[nodiscard]] bool fsr_generated_array_description(
+    const D3D12_RESOURCE_DESC& destination_description,
+    std::span<const D3D12FsrEyeInput> eyes,
+    D3D12_RESOURCE_DESC* generated_description) noexcept;
 
 class D3D12FsrFrameGenerator final {
 public:

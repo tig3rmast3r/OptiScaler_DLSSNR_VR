@@ -1,5 +1,7 @@
-﻿#include "xrfg/d3d12_frame_synthesizer.hpp"
+#include "xrfg/d3d12_frame_synthesizer.hpp"
 #include "xrfg/fsr_frame_generation.hpp"
+#include "xrfg/gpu_flight_diagnostics.hpp"
+#include "xrfg/two_frame_capture.hpp"
 #include "d3d12_fsr_frame_generator.hpp"
 #include "xrfg/d3d12_ram_timing.hpp"
 #include "xrfg/bridge_flight_logger.hpp"
@@ -80,44 +82,13 @@ void log_post_hud_admission(bool ready, std::int64_t display_time,
     static std::atomic<std::uint64_t> pair_count{};
     const auto pair = pair_count.fetch_add(1, std::memory_order_relaxed);
     if (pair % 120U != 0U) return;
-    static HANDLE file = []() noexcept {
-        std::array<wchar_t, 32768> path{};
-        const DWORD length = GetModuleFileNameW(
-            nullptr, path.data(), static_cast<DWORD>(path.size()));
-        if (length == 0 || length >= path.size()) return INVALID_HANDLE_VALUE;
-        wchar_t* slash = std::wcsrchr(path.data(), L'\\');
-        if (slash == nullptr) return INVALID_HANDLE_VALUE;
-        *++slash = L'\0';
-        constexpr wchar_t name[] = L"ofxr-fsr-post-hud-V23224.log";
-        if (static_cast<std::size_t>(slash - path.data()) +
-                std::size(name) > path.size()) return INVALID_HANDLE_VALUE;
-        if (wcscpy_s(slash, path.size() -
-                static_cast<std::size_t>(slash - path.data()), name) != 0)
-            return INVALID_HANDLE_VALUE;
-        return CreateFileW(path.data(), GENERIC_WRITE, FILE_SHARE_READ,
-                           nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
-                           nullptr);
-    }();
-    if (file == INVALID_HANDLE_VALUE) return;
-    char line[192]{};
-    const int size = std::snprintf(line, sizeof(line),
-        "pid=%lu tick=%llu pair=%llu post_hud=%u time=%lld scene_format=%u final_format=%u\r\n",
-        static_cast<unsigned long>(GetCurrentProcessId()),
-        static_cast<unsigned long long>(GetTickCount64()),
-        static_cast<unsigned long long>(pair), ready ? 1U : 0U,
-        static_cast<long long>(display_time),
-        static_cast<unsigned>(scene_format),
-        static_cast<unsigned>(final_format));
-    if (size <= 0 || size >= sizeof(line)) return;
-    static std::mutex file_mutex;
-    std::scoped_lock lock{file_mutex};
-    DWORD written{};
-    static_cast<void>(WriteFile(file, line, static_cast<DWORD>(size),
-                                &written, nullptr));
+    bridge_flight_logger().event(BridgeFlightOperation::fsr_hudless_pair,
+        ready ? 120 : -120, static_cast<std::uint64_t>(display_time),
+        static_cast<std::uint64_t>(scene_format), static_cast<std::uint64_t>(final_format));
 }
 void dred_marker(ID3D12GraphicsCommandList* command_list, const char* label) noexcept {
     if (command_list != nullptr && label != nullptr &&
-        bridge_flight_logger().enabled()) {
+        bridge_flight_logger().gpu_instrumentation_enabled()) {
         command_list->SetMarker(1U, label, static_cast<UINT>(std::strlen(label)));
     }
 }
@@ -127,6 +98,7 @@ constexpr UINT kFidelityFxFlowBlockSize = 8;
 constexpr UINT kNvidiaFlowBlockSize = 4;
 constexpr UINT kEyeGapPixels = 64;
 constexpr UINT kMinimumFlowDimension = 64;
+constexpr UINT kMaxReprojectionViews = 2;
 
 struct NvidiaInputScaleRatio {
     UINT numerator;
@@ -145,7 +117,6 @@ struct NvidiaInputScaleRatio {
         return {1U, 1U};
     }
 }
-constexpr UINT kMaxReprojectionViews = 2;
 constexpr UINT kSrvDescriptorCount = 8;
 constexpr UINT kUavDescriptorCount = 3;
 constexpr UINT kDescriptorBlockSize =
@@ -192,6 +163,58 @@ constexpr D3D12_RESOURCE_STATES kShaderReadState =
            ((static_cast<std::uint64_t>(rect.height) & 0xffffULL) << 48U);
 }
 
+[[nodiscard]] constexpr D3D12ImageRect centered_aspect_rect(
+    D3D12ImageRect source,
+    const D3D12ImageRect& target) noexcept {
+    if (source.width == 0 || source.height == 0 ||
+        target.width == 0 || target.height == 0) {
+        return source;
+    }
+    const std::uint64_t source_width = source.width;
+    const std::uint64_t source_height = source.height;
+    const std::uint64_t target_width = target.width;
+    const std::uint64_t target_height = target.height;
+    if (source_width * target_height > source_height * target_width) {
+        const std::uint64_t width = std::clamp<std::uint64_t>(
+            (source_height * target_width + target_height / 2U) /
+                target_height,
+            1U, source_width);
+        source.offset_x += static_cast<std::uint32_t>(
+            (source_width - width) / 2U);
+        source.width = static_cast<std::uint32_t>(width);
+    } else if (source_width * target_height <
+               source_height * target_width) {
+        const std::uint64_t height = std::clamp<std::uint64_t>(
+            (source_width * target_height + target_width / 2U) /
+                target_width,
+            1U, source_height);
+        source.offset_y += static_cast<std::uint32_t>(
+            (source_height - height) / 2U);
+        source.height = static_cast<std::uint32_t>(height);
+    }
+    return source;
+}
+
+constexpr auto kGhostSquareGuideRect = centered_aspect_rect(
+    {0U, 0U, 1672U, 1672U}, {0U, 0U, 3063U, 3344U});
+static_assert(kGhostSquareGuideRect.offset_x == 70U);
+static_assert(kGhostSquareGuideRect.offset_y == 0U);
+static_assert(kGhostSquareGuideRect.width == 1532U);
+static_assert(kGhostSquareGuideRect.height == 1672U);
+
+[[nodiscard]] bool same_identity(
+    IUnknown* expected,
+    IUnknown* actual) noexcept {
+    if (expected == nullptr || actual == nullptr) {
+        return false;
+    }
+    ComPtr<IUnknown> expected_identity;
+    ComPtr<IUnknown> actual_identity;
+    return SUCCEEDED(expected->QueryInterface(IID_PPV_ARGS(expected_identity.GetAddressOf()))) &&
+           SUCCEEDED(actual->QueryInterface(IID_PPV_ARGS(actual_identity.GetAddressOf()))) &&
+           expected_identity.Get() == actual_identity.Get();
+}
+
 [[nodiscard]] bool same_device(
     ID3D12Device* expected,
     ID3D12DeviceChild* object) noexcept {
@@ -200,15 +223,8 @@ constexpr D3D12_RESOURCE_STATES kShaderReadState =
     }
 
     ComPtr<ID3D12Device> actual;
-    if (FAILED(object->GetDevice(IID_PPV_ARGS(actual.GetAddressOf())))) {
-        return false;
-    }
-
-    ComPtr<IUnknown> expected_identity;
-    ComPtr<IUnknown> actual_identity;
-    return SUCCEEDED(expected->QueryInterface(IID_PPV_ARGS(expected_identity.GetAddressOf()))) &&
-           SUCCEEDED(actual->QueryInterface(IID_PPV_ARGS(actual_identity.GetAddressOf()))) &&
-           expected_identity.Get() == actual_identity.Get();
+    return SUCCEEDED(object->GetDevice(IID_PPV_ARGS(actual.GetAddressOf()))) &&
+           same_identity(expected, actual.Get());
 }
 
 [[nodiscard]] bool same_adapter(
@@ -753,8 +769,10 @@ void clear_synthetic_marker(ID3D12GraphicsCommandList* commands,
 [[nodiscard]] CameraMapping make_camera_mapping(
     const D3D12ReprojectionView& source,
     const D3D12ReprojectionView& target,
-    UINT width,
-    UINT height) noexcept {
+    UINT source_width,
+    UINT source_height,
+    UINT target_width,
+    UINT target_height) noexcept {
     const Quaternion source_orientation = normalize(source.pose.orientation);
     const Quaternion target_orientation = normalize(target.pose.orientation);
     const Quaternion inverse_source{
@@ -766,9 +784,9 @@ void clear_synthetic_marker(ID3D12GraphicsCommandList* commands,
     const Quaternion target_to_source =
         normalize(multiply(inverse_source, target_orientation));
     const D3D12ImageRect source_rect =
-        resolved_rect(source.image_rect, width, height);
+        resolved_rect(source.image_rect, source_width, source_height);
     const D3D12ImageRect target_rect =
-        resolved_rect(target.image_rect, width, height);
+        resolved_rect(target.image_rect, target_width, target_height);
     return {
         {
             target_to_source.x,
@@ -791,6 +809,15 @@ void clear_synthetic_marker(ID3D12GraphicsCommandList* commands,
             static_cast<float>(target_rect.height),
         },
     };
+}
+
+[[nodiscard]] CameraMapping make_camera_mapping(
+    const D3D12ReprojectionView& source,
+    const D3D12ReprojectionView& target,
+    UINT width,
+    UINT height) noexcept {
+    return make_camera_mapping(
+        source, target, width, height, width, height);
 }
 
 }  // namespace
@@ -951,6 +978,7 @@ struct D3D12FrameSynthesizer::Impl {
     // The value the most recent submission signalled once the synthetic's
     // pixels existed, as opposed to the value the whole pair completes at.
     std::uint64_t last_synthetic_fence_value{};
+    std::array<std::uint64_t, 2> last_fsr_context_fence_values{};
     std::uint64_t next_nvidia_fence_value{1};
     std::uint64_t last_nvidia_fence_value{};
     std::uint64_t fsr_eye_diagnostic_pair{};
@@ -961,15 +989,21 @@ struct D3D12FrameSynthesizer::Impl {
     D3D12OpticalFlowBackend backend{D3D12OpticalFlowBackend::fidelity_fx};
     D3D12NvidiaOpticalFlowOptions nvidia_options{};
     D3D12FrameGenerationMode generation_mode{D3D12FrameGenerationMode::ofxr};
-    std::unique_ptr<D3D12FsrFrameGenerator> fsr_frame_generator;
+    // Full projection and anchored Cinema use different FSR display domains.
+    // Keep their contexts and temporal histories physically independent: the
+    // Witcher can alternate both domains within a few OpenXR frames.
+    std::array<std::unique_ptr<D3D12FsrFrameGenerator>, 2>
+        fsr_frame_generators;
     bool synthesis_enabled{};
     bool completion_unknown{};
-    bool fsr_context_reset_pending{};
+    std::array<bool, 2> fsr_context_reset_pending{};
+    std::uint32_t active_fsr_domain{};
+    bool recording_uses_fsr_context{};
     bool fsr_stale_guide_gap{};
     bool ffx_context_created{};
     bool flow_output_consumed{};
     bool nvidia_gpu_timing_enabled{};
-
+    bool allow_luke_guide_device_alias{};
     ~Impl() {
         // Nothing outside this object waits on the synthesis queue. Its work
         // writes into the slot command allocators and reads the history
@@ -2181,7 +2215,8 @@ struct D3D12FrameSynthesizer::Impl {
         D3D12OpticalFlowBackend input_backend,
         D3D12NvidiaOpticalFlowOptions input_nvidia_options,
         bool enable_nvidia_gpu_timing,
-        D3D12FrameGenerationMode input_generation_mode) {
+        D3D12FrameGenerationMode input_generation_mode,
+        bool input_allow_luke_guide_device_alias) {
         if (input_device == nullptr || input_queue == nullptr ||
             input_history == nullptr || !input_history->initialized() ||
             input_current_images.empty() || input_synthetic_images.empty() ||
@@ -2346,6 +2381,8 @@ struct D3D12FrameSynthesizer::Impl {
         generation_mode = input_generation_mode;
         // Timing is no longer NVIDIA only: the span marks below are written by
         // both backends, and FidelityFX is the one that had no measurement.
+        allow_luke_guide_device_alias =
+            input_allow_luke_guide_device_alias;
         nvidia_gpu_timing_enabled =
             enable_nvidia_gpu_timing;
         const UINT node_mask = queue->GetDesc().NodeMask;
@@ -2396,10 +2433,12 @@ struct D3D12FrameSynthesizer::Impl {
             return result;
         }
         if (generation_mode == D3D12FrameGenerationMode::fsr3) {
-            fsr_frame_generator = std::make_unique<D3D12FsrFrameGenerator>();
-            result = fsr_frame_generator->initialize(
-                device.Get(), image_description, view_format);
-            if (FAILED(result)) return result;
+            for (auto& generator : fsr_frame_generators) {
+                generator = std::make_unique<D3D12FsrFrameGenerator>();
+                result = generator->initialize(
+                    device.Get(), image_description, view_format);
+                if (FAILED(result)) return result;
+            }
         }
         synthesis_enabled = true;
         return S_OK;
@@ -2795,6 +2834,22 @@ struct D3D12FrameSynthesizer::Impl {
         }
     }
 
+    [[nodiscard]] bool compatible_game_motion_resource(
+        const DlssMotionVectorFrame& frame,
+        ID3D12Resource* resource) const noexcept {
+        if (same_device(device.Get(), resource)) return true;
+        // Luke Ross' Streamline interposer can expose a different canonical
+        // device identity from a resource's GetDevice. Accept that alias only
+        // for the Luke bridge, only on the same adapter, and only when the
+        // in-process publisher retained the exact producer device it already
+        // verified while recording the snapshot copy.
+        return allow_luke_guide_device_alias &&
+            same_adapter(device.Get(), resource) &&
+            frame.verified_producer_device &&
+            same_identity(
+                device.Get(), frame.verified_producer_device.Get());
+    }
+
     [[nodiscard]] HRESULT create_game_motion_views(
         WorkSlot& slot,
         const DlssMotionVectorSet& frames) noexcept {
@@ -2808,7 +2863,8 @@ struct D3D12FrameSynthesizer::Impl {
         for (UINT eye = 0; eye < frames.eye_count; ++eye) {
             const auto& frame = frames.eyes[eye];
             if (!frame || !frame->motion_vectors ||
-                !same_device(device.Get(), frame->motion_vectors.Get())) {
+                !compatible_game_motion_resource(
+                    *frame, frame->motion_vectors.Get())) {
                 return E_INVALIDARG;
             }
             const D3D12_RESOURCE_DESC resource = frame->motion_vectors->GetDesc();
@@ -2861,30 +2917,44 @@ struct D3D12FrameSynthesizer::Impl {
     // ALLOW_SIMULTANEOUS_ACCESS and copying across on the application's
     // queue - which is what the D3D11 interop path already does.
 
-    [[nodiscard]] bool valid_game_motion_pair(
+    [[nodiscard]] std::uint64_t game_motion_pair_failure_code(
         const RollingSource& previous_source,
         const RollingSource& current_source,
         UINT expected_eye_count) const noexcept {
         const auto& previous_vectors = previous_source.motion_vectors;
         const auto& current = current_source.motion_vectors;
-        if (!previous_vectors || !current || previous_vectors->eye_count == 0 ||
-            previous_vectors->eye_count != current->eye_count ||
-            current->eye_count != expected_eye_count ||
-            current->eye_count > kDlssMotionVectorEyeCount) {
-            return false;
-        }
+        if (!previous_vectors) return 1;
+        if (!current) return 2;
+        if (previous_vectors->eye_count == 0) return 3;
+        if (previous_vectors->eye_count != current->eye_count) return 4;
+        if (current->eye_count != expected_eye_count) return 5;
+        if (current->eye_count > kDlssMotionVectorEyeCount) return 6;
         for (UINT eye = 0; eye < current->eye_count; ++eye) {
             const auto& a = previous_vectors->eyes[eye];
             const auto& b = current->eyes[eye];
-            if (!a || !b || b->reset || a->stream != b->stream ||
-                a->epoch != b->epoch || a->serial == 0 ||
-                b->previous_serial != a->serial || b->serial <= a->serial ||
-                !b->motion_vectors || !b->producer_queue ||
-                !same_device(device.Get(), b->motion_vectors.Get())) {
-                return false;
-            }
+            if (!a) return 10 + 100 * eye;
+            if (!b) return 11 + 100 * eye;
+            if (b->reset) return 12 + 100 * eye;
+            if (a->stream != b->stream) return 13 + 100 * eye;
+            if (a->epoch != b->epoch) return 14 + 100 * eye;
+            if (a->serial == 0) return 15 + 100 * eye;
+            if (b->previous_serial != a->serial) return 16 + 100 * eye;
+            if (b->serial <= a->serial) return 17 + 100 * eye;
+            if (!b->motion_vectors) return 18 + 100 * eye;
+            if (!b->producer_queue) return 19 + 100 * eye;
+            if (!compatible_game_motion_resource(
+                    *b, b->motion_vectors.Get()))
+                return 20 + 100 * eye;
         }
-        return true;
+        return 0;
+    }
+
+    [[nodiscard]] bool valid_game_motion_pair(
+        const RollingSource& previous_source,
+        const RollingSource& current_source,
+        UINT expected_eye_count) const noexcept {
+        return game_motion_pair_failure_code(
+            previous_source, current_source, expected_eye_count) == 0;
     }
 
     [[nodiscard]] bool has_complete_game_motion_set(
@@ -2904,7 +2974,6 @@ struct D3D12FrameSynthesizer::Impl {
         }
         return true;
     }
-
 
     void synthetic_target_state(ID3D12GraphicsCommandList* list,
                                 std::uint32_t index, bool rendering) {
@@ -3227,6 +3296,10 @@ struct D3D12FrameSynthesizer::Impl {
         std::uint32_t current_destination_index,
         const std::optional<OverlayPlacement>& debug_marker) noexcept {
         const auto& guides = current_source.motion_vectors;
+        const bool cinema_projection =
+            current_source.presentation_transform.active;
+        const std::uint32_t fsr_domain = cinema_projection ? 1U : 0U;
+        auto& fsr_frame_generator = fsr_frame_generators[fsr_domain];
         if (!fsr_frame_generator || target_views.empty() ||
             target_views.size() != current_source.view_count ||
             target_views.size() != previous_source.view_count) {
@@ -3235,6 +3308,30 @@ struct D3D12FrameSynthesizer::Impl {
         if (!guides) {
             report_fsr_frame_generation_status(
                 FsrFrameGenerationStatus::waiting_for_guides);
+            if (has_complete_game_motion_set(previous_source)) {
+                // The alternating-eye matcher deliberately returns no pair on
+                // the odd publication between two complete Ghost stereo sets.
+                // Pass this AFW frame through without discarding the last
+                // complete source; the next even publication can pair with it.
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_recovery,
+                    kD3D12FrameSynthesisStaleGuides,
+                    5,
+                    previous_source.motion_vectors->eyes[0]->serial,
+                    current_source.ticket.serial);
+                return kD3D12FrameSynthesisStaleGuides;
+            }
+            const auto previous_serial = previous_source.motion_vectors &&
+                    previous_source.motion_vectors->eye_count != 0 &&
+                    previous_source.motion_vectors->eyes[0]
+                ? previous_source.motion_vectors->eyes[0]->serial
+                : 0;
+            bridge_flight_logger().event(
+                BridgeFlightOperation::fsr_recovery,
+                DXGI_ERROR_WAS_STILL_DRAWING,
+                6,
+                previous_serial,
+                current_source.ticket.serial);
             return DXGI_ERROR_WAS_STILL_DRAWING;
         }
         const UINT expected_guide_eyes = std::min<UINT>(
@@ -3253,14 +3350,30 @@ struct D3D12FrameSynthesizer::Impl {
                 current_source.ticket.serial);
             return kD3D12FrameSynthesisStaleGuides;
         }
-        if (!valid_game_motion_pair(
-                previous_source, current_source, expected_guide_eyes)) {
+        const std::uint64_t guide_failure =
+            game_motion_pair_failure_code(
+                previous_source, current_source, expected_guide_eyes);
+        if (guide_failure != 0) {
             report_fsr_frame_generation_status(
                 FsrFrameGenerationStatus::waiting_for_guides);
+            const auto previous_serial = previous_source.motion_vectors &&
+                    previous_source.motion_vectors->eye_count != 0 &&
+                    previous_source.motion_vectors->eyes[0]
+                ? previous_source.motion_vectors->eyes[0]->serial
+                : 0;
+            const auto current_serial = current_source.motion_vectors &&
+                    current_source.motion_vectors->eye_count != 0 &&
+                    current_source.motion_vectors->eyes[0]
+                ? current_source.motion_vectors->eyes[0]->serial
+                : 0;
+            bridge_flight_logger().event(
+                BridgeFlightOperation::fsr_recovery,
+                DXGI_ERROR_WAS_STILL_DRAWING,
+                100 + guide_failure,
+                previous_serial,
+                current_serial);
             return DXGI_ERROR_WAS_STILL_DRAWING;
         }
-        const bool cinema_projection =
-            current_source.presentation_transform.active;
         if (cinema_projection &&
             (current_source.presentation_transform.view_count !=
                  target_views.size() ||
@@ -3326,14 +3439,36 @@ struct D3D12FrameSynthesizer::Impl {
                 guide_eye >= guides->eye_count || !guides->eyes[guide_eye]) {
                 report_fsr_frame_generation_status(
                     FsrFrameGenerationStatus::waiting_for_guides);
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_recovery,
+                    DXGI_ERROR_WAS_STILL_DRAWING,
+                    201 + view_index,
+                    resource_slice,
+                    guides->eye_count);
                 return DXGI_ERROR_WAS_STILL_DRAWING;
             }
             const auto& guide = *guides->eyes[guide_eye];
             if (!guide.depth || !guide.motion_vectors ||
-                !same_device(device.Get(), guide.depth.Get()) ||
-                !same_device(device.Get(), guide.motion_vectors.Get())) {
+                !compatible_game_motion_resource(
+                    guide, guide.depth.Get()) ||
+                !compatible_game_motion_resource(
+                    guide, guide.motion_vectors.Get())) {
                 report_fsr_frame_generation_status(
                     FsrFrameGenerationStatus::waiting_for_guides);
+                const std::uint64_t resource_failure = !guide.depth
+                    ? 220
+                    : !guide.motion_vectors
+                        ? 221
+                        : !compatible_game_motion_resource(
+                              guide, guide.depth.Get())
+                            ? 222
+                            : 223;
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_recovery,
+                    DXGI_ERROR_WAS_STILL_DRAWING,
+                    resource_failure,
+                    guide.serial,
+                    view_index);
                 return DXGI_ERROR_WAS_STILL_DRAWING;
             }
             // FSR's colour/optical-flow/temporal input is scene only. The
@@ -3354,7 +3489,8 @@ struct D3D12FrameSynthesizer::Impl {
                     guide.output_width, guide.output_height};
             } else if (cinema_projection) {
                 if (!guide.output ||
-                    !same_device(device.Get(), guide.output.Get()) ||
+                    !compatible_game_motion_resource(
+                        guide, guide.output.Get()) ||
                     guide.output_width == 0 || guide.output_height == 0) {
                     report_fsr_frame_generation_status(
                         FsrFrameGenerationStatus::waiting_for_guides);
@@ -3372,18 +3508,31 @@ struct D3D12FrameSynthesizer::Impl {
                 color_rect = {guide.output_x, guide.output_y,
                               guide.output_width, guide.output_height};
             }
+            D3D12ImageRect depth_rect{
+                guide.depth_x, guide.depth_y,
+                guide.depth_width, guide.depth_height};
+            D3D12ImageRect motion_rect{
+                guide.motion_x, guide.motion_y,
+                guide.motion_width, guide.motion_height};
+            if (allow_luke_guide_device_alias && !cinema_projection) {
+                // Luke's final AER eye is 3063x3344 while the pre-AER DLSS
+                // depth and motion guides are square. FSR assumes render and
+                // display rectangles describe the same aspect ratio. Crop the
+                // guides around their optical center so the post-AER colour
+                // and its guides share one projection domain.
+                depth_rect = centered_aspect_rect(depth_rect, color_rect);
+                motion_rect = centered_aspect_rect(motion_rect, color_rect);
+            }
             inputs[view_index] = {
                 color_resource,
                 color_slice,
                 resource_slice,
                 color_rect,
                 guide.depth.Get(),
-                {guide.depth_x, guide.depth_y,
-                 guide.depth_width, guide.depth_height},
+                depth_rect,
                 guide.depth_resource_state,
                 guide.motion_vectors.Get(),
-                {guide.motion_x, guide.motion_y,
-                 guide.motion_width, guide.motion_height},
+                motion_rect,
                 guide.resource_state,
                 guide.scale_x,
                 guide.scale_y,
@@ -3392,15 +3541,26 @@ struct D3D12FrameSynthesizer::Impl {
                 guide.frame_time_delta_ms,
                 guide.camera_near,
                 guide.camera_far,
-                std::abs(current_source.views[view_index].fov.angle_up -
-                         current_source.views[view_index].fov.angle_down),
+                guide.camera_data_valid
+                    ? guide.camera_fov_vertical
+                    : std::abs(current_source.views[view_index].fov.angle_up -
+                               current_source.views[view_index].fov.angle_down),
                 current_source.views[view_index].pose,
+                {guide.camera_position[0], guide.camera_position[1],
+                 guide.camera_position[2]},
+                {guide.camera_up[0], guide.camera_up[1], guide.camera_up[2]},
+                {guide.camera_right[0], guide.camera_right[1],
+                 guide.camera_right[2]},
+                {guide.camera_forward[0], guide.camera_forward[1],
+                 guide.camera_forward[2]},
                 guide.depth_inverted,
                 guide.depth_infinite,
                 guide.jittered,
                 guide.reset,
+                guide.camera_data_valid,
             };
             midpoint_views[view_index] = current_source.views[view_index];
+            midpoint_views[view_index].image_rect = color_rect;
             midpoint_views[view_index].pose = interpolate_pose(
                 previous_source.views[view_index].pose,
                 current_source.views[view_index].pose, 0.5F);
@@ -3521,37 +3681,39 @@ struct D3D12FrameSynthesizer::Impl {
         // FidelityFX contexts own GPU resources shared by every OFXR work
         // slot. Recreating one while a different slot still references the
         // old context is unsafe even when the current slot itself is free.
-        // Defer the whole transaction until the bridge's own fence proves all
-        // earlier FSR work has retired. The caller treats this as an ordinary
-        // guide/continuity miss and primes again without burning the route.
+        // Wait only for the last submission that actually used those FSR
+        // contexts. Prime/pass-through copies use the common bridge fence too,
+        // but do not reference the contexts and must not keep moving the reset
+        // target forward forever.
         if (fsr_frame_generator->requires_idle_reconfigure(
                 std::span<const D3D12FsrEyeInput>(
                     inputs.data(), target_views.size()))) {
-            // Do not let a transient Cinema/non-Cinema guide revert erase the
-            // need to reset FSR temporal state. Once a domain discontinuity is
-            // observed, keep it latched until every older bridge submission
-            // has retired and the shared contexts can be safely discarded.
-            fsr_context_reset_pending = true;
+            // Once a change within this domain is observed, keep it latched
+            // until every older submission using this domain has retired.
+            fsr_context_reset_pending[fsr_domain] = true;
         }
-        if (fsr_context_reset_pending) {
+        if (fsr_context_reset_pending[fsr_domain]) {
             const std::uint64_t completed = fence->GetCompletedValue();
-            if (completed < last_submitted_fence_value) {
+            const std::uint64_t context_fence =
+                last_fsr_context_fence_values[fsr_domain];
+            if (completed < context_fence) {
                 bridge_flight_logger().event(
                     BridgeFlightOperation::fsr_recovery,
                     DXGI_ERROR_WAS_STILL_DRAWING,
                     1,
                     completed,
-                    last_submitted_fence_value);
+                    context_fence);
                 return DXGI_ERROR_WAS_STILL_DRAWING;
             }
             fsr_frame_generator->reset();
-            fsr_context_reset_pending = false;
+            fsr_context_reset_pending[fsr_domain] = false;
+            last_fsr_context_fence_values[fsr_domain] = 0;
             bridge_flight_logger().event(
                 BridgeFlightOperation::fsr_recovery,
                 S_OK,
                 2,
                 completed,
-                last_submitted_fence_value);
+                context_fence);
         }
 
         if (backend == D3D12OpticalFlowBackend::nvidia) {
@@ -3565,6 +3727,8 @@ struct D3D12FrameSynthesizer::Impl {
             std::span<const D3D12FsrEyeInput>(inputs.data(), target_views.size()),
             &generated);
         if (FAILED(result) || !generated) return FAILED(result) ? result : E_FAIL;
+        active_fsr_domain = fsr_domain;
+        recording_uses_fsr_context = true;
 
         ID3D12Resource* const current_resource = current_source.resource.Get();
         ID3D12Resource* const current_destination =
@@ -3626,11 +3790,15 @@ struct D3D12FrameSynthesizer::Impl {
         parameters.width = static_cast<UINT>(image_description.Width);
         parameters.height = image_description.Height;
         parameters.array_size = image_description.DepthOrArraySize;
+        const auto generated_description = generated->GetDesc();
+        parameters.packed_width =
+            static_cast<UINT>(generated_description.Width);
+        parameters.packed_height = generated_description.Height;
         for (UINT view_index = 0; view_index < target_views.size(); ++view_index) {
             parameters.previous_mappings[view_index] = make_camera_mapping(
                 midpoint_views[view_index], target_views[view_index],
-                static_cast<UINT>(image_description.Width),
-                image_description.Height);
+                parameters.packed_width, parameters.packed_height,
+                parameters.width, parameters.height);
         }
         for (UINT view_index = 0; view_index < target_views.size(); ++view_index) {
             const UINT slice = resolved_array_slice(
@@ -3641,7 +3809,6 @@ struct D3D12FrameSynthesizer::Impl {
                 0, offset_gpu_handle(gpu_start, descriptor_base,
                                      descriptor_increment));
             if (cinema_projection) {
-                const auto generated_description = generated->GetDesc();
                 FsrCinemaPanelParameters cinema_parameters{};
                 cinema_parameters.clip_positions =
                     current_source.presentation_transform
@@ -3727,6 +3894,7 @@ struct D3D12FrameSynthesizer::Impl {
         // acquire_work_slot already established completion before reuse.
         slot.ram_gpu.harvest();
         slot.ram_pair=false;
+        recording_uses_fsr_context = false;
         HRESULT result = slot.allocator->Reset();
         if (FAILED(result)) {
             synthesis_enabled = false;
@@ -4822,7 +4990,9 @@ struct D3D12FrameSynthesizer::Impl {
                 // and surface recoverable backpressure so continuity primes
                 // again instead of permanently disabling frame generation.
                 const HRESULT rejected_close = result;
-                fsr_context_reset_pending = true;
+                if (recording_uses_fsr_context) {
+                    fsr_context_reset_pending[active_fsr_domain] = true;
+                }
                 slot.command_list.Reset();
                 result = slot.allocator->Reset();
                 if (SUCCEEDED(result)) {
@@ -4857,6 +5027,7 @@ struct D3D12FrameSynthesizer::Impl {
         }
         ID3D12CommandList* lists[] = {slot.command_list.Get()};
         queue->ExecuteCommandLists(1, lists);
+        two_frame_capture_submission(queue.Get(), 1, lists);
         completion_unknown = true;
 
         std::uint64_t value = 0;
@@ -5080,6 +5251,7 @@ struct D3D12FrameSynthesizer::Impl {
         ID3D12CommandList* synthesis_lists[] = {
             slot.synthesis_command_list.Get()};
         queue->ExecuteCommandLists(1, synthesis_lists);
+        two_frame_capture_submission(queue.Get(), 1, synthesis_lists);
 
         // The synthetic's pixels exist once this signals. The current copy
         // is held back so it is not queued ahead of the synthetic frame.
@@ -5178,6 +5350,24 @@ struct D3D12FrameSynthesizer::Impl {
             history->cancel_consumer(next.lease);
             next.clear();
         };
+        if (generation_mode == D3D12FrameGenerationMode::fsr3 &&
+            !has_complete_game_motion_set(next)) {
+            // FSR cannot recover from a prime that has no temporal guides: the
+            // first later guide set would always be compared with this empty
+            // anchor, rejected, retired, and followed by another empty prime.
+            // Wait for the first complete DLSS set so the retained source can
+            // participate in the next real temporal pair.
+            report_fsr_frame_generation_status(
+                FsrFrameGenerationStatus::waiting_for_guides);
+            bridge_flight_logger().event(
+                BridgeFlightOperation::fsr_recovery,
+                DXGI_ERROR_WAS_STILL_DRAWING,
+                7,
+                current.serial,
+                current.fence_value);
+            cancel_next();
+            return DXGI_ERROR_WAS_STILL_DRAWING;
+        }
         if (next.resource.Get() ==
             current_destinations[current_destination_index].resource.Get()) {
             cancel_next();
@@ -5324,6 +5514,33 @@ struct D3D12FrameSynthesizer::Impl {
                 !same_camera(current_view, target_view)) {
                 return E_INVALIDARG;
             }
+        }
+        if (allow_luke_guide_device_alias && bridge_flight_logger().ram_enabled()) {
+            const auto identity = reinterpret_cast<std::uint64_t>(previous.producer_fence.Get());
+            bridge_flight_logger().event(BridgeFlightOperation::luke_temporal_pair,
+                0, identity, previous.ticket.serial, current.serial);
+            bridge_flight_logger().event(BridgeFlightOperation::luke_temporal_pair,
+                1, identity, current.serial,
+                (static_cast<std::uint64_t>(current_destination_index) << 32) | synthetic_destination_index);
+            const std::span<const D3D12ReprojectionView> cameras[]{
+                previous_views, current_source_views, synthetic_target_views};
+            for (int phase = 0; phase < 3; ++phase)
+                for (std::size_t view = 0; view < cameras[phase].size(); ++view) {
+                    const auto& camera = cameras[phase][view];
+                    const float values[]{camera.pose.position.x, camera.pose.position.y, camera.pose.position.z,
+                        camera.pose.orientation.x, camera.pose.orientation.y, camera.pose.orientation.z,
+                        camera.pose.orientation.w, camera.fov.angle_left, camera.fov.angle_right,
+                        camera.fov.angle_up, camera.fov.angle_down, 0.0f};
+                    for (int pair = 0; pair < 6; ++pair) {
+                        std::uint32_t x{}, y{};
+                        std::memcpy(&x, &values[pair * 2], sizeof(x));
+                        std::memcpy(&y, &values[pair * 2 + 1], sizeof(y));
+                        bridge_flight_logger().event(BridgeFlightOperation::luke_temporal_pose,
+                            phase * 100 + view * 10 + pair, identity,
+                            phase == 0 ? previous.ticket.serial : current.serial,
+                            (static_cast<std::uint64_t>(x) << 32) | y);
+                    }
+                }
         }
         // NVIDIA D3D11 interop submits the current copy immediately and uses
         // per-slot command resources. A prior pair may still be executing if
@@ -5551,6 +5768,9 @@ struct D3D12FrameSynthesizer::Impl {
             }
             return result;
         }
+        if (generation_mode == D3D12FrameGenerationMode::fsr3) {
+            last_fsr_context_fence_values[active_fsr_domain] = fence_value;
+        }
         if (used_game_motion) report_dlss_motion_vector_use();
 
         next.last_use_fence_value = fence_value;
@@ -5675,7 +5895,8 @@ HRESULT D3D12FrameSynthesizer::initialize(
     D3D12OpticalFlowBackend backend,
     D3D12NvidiaOpticalFlowOptions nvidia_options,
     bool enable_nvidia_gpu_timing,
-    D3D12FrameGenerationMode generation_mode) noexcept {
+    D3D12FrameGenerationMode generation_mode,
+    bool allow_luke_guide_device_alias) noexcept {
     try {
         std::scoped_lock lock(mutex_);
         if (impl_ != nullptr) {
@@ -5693,7 +5914,8 @@ HRESULT D3D12FrameSynthesizer::initialize(
             backend,
             nvidia_options,
             enable_nvidia_gpu_timing,
-            generation_mode);
+            generation_mode,
+            allow_luke_guide_device_alias);
         if (FAILED(result)) {
             return result;
         }
@@ -5720,7 +5942,8 @@ HRESULT D3D12FrameSynthesizer::reconfigure(D3D12OpticalFlowBackend backend,
         auto candidate = std::make_unique<Impl>();
         const HRESULT result = candidate->initialize(impl_->device.Get(), impl_->queue.Get(),
             impl_->history, current, synthetic, impl_->view_format, impl_->release_state,
-            backend, options, impl_->nvidia_gpu_timing_enabled, generation_mode);
+            backend, options, impl_->nvidia_gpu_timing_enabled, generation_mode,
+            impl_->allow_luke_guide_device_alias);
         if (FAILED(result)) return result;
         impl_ = std::move(candidate);
         return S_OK;

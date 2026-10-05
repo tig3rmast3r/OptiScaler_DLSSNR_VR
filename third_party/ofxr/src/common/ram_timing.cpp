@@ -11,7 +11,11 @@
 
 namespace xrfg {
 namespace {
-constexpr unsigned kLanes = 16, kCapacity = 65536, kSchema = 222;
+// Startup GPU workers are persistent owners too: V224's eight lanes excluded
+// the later SR/XR/AFW threads. Cover 64 independent threads in a bounded 1 GiB
+// record pool. Hot lanes retain a shorter window; the saver reports truncation.
+// No disk I/O during capture; each lane remains independently owned.
+constexpr unsigned kLanes = 64, kCapacity = 262144, kSchema = 225;
 constexpr std::uint64_t kMagic = 0x4f46585252414d31ULL;
 static_assert(std::atomic<LONG>::is_always_lock_free);
 struct Record {
@@ -37,10 +41,11 @@ struct Shared {
     wchar_t executable[512]{};
     std::array<Lane, kLanes> lanes;
 };
+static_assert(sizeof(Shared) <= 0xffffffffULL, "mapping size must fit the low DWORD");
 std::wstring mapping_name(DWORD pid) {
-    return L"Local\\OFXR-RamTiming-V222-" + std::to_wstring(pid);
+    return L"Local\\OFXR-RamTiming-V225-" + std::to_wstring(pid);
 }
-bool selected(BridgeFlightOperation op) noexcept {
+bool selected_generic(BridgeFlightOperation op) noexcept {
     using O = BridgeFlightOperation;
     switch (op) {
     case O::application_wait_frame: case O::application_begin_frame:
@@ -62,12 +67,56 @@ bool selected(BridgeFlightOperation op) noexcept {
     default: return false;
     }
 }
+bool selected_pose(BridgeFlightOperation op, std::uint64_t a) noexcept {
+    using O = BridgeFlightOperation;
+    switch (op) {
+    case O::application_wait_frame: case O::application_end_frame:
+    case O::downstream_first_end_frame: case O::internal_wait_frame:
+    case O::internal_begin_frame: case O::internal_end_frame:
+    case O::d3d11_publish: case O::synthesis_pair: case O::synthesis_prime:
+    case O::private_swapchain_acquire: case O::private_swapchain_wait:
+    case O::private_swapchain_release:
+    case O::embedded_configuration: case O::session_state:
+    case O::luke_frame_contract: case O::luke_pose_contract:
+    case O::gpu_history: case O::gpu_synthesis: case O::gpu_timing_error:
+    case O::luke_inline_clock: case O::luke_physical_submit:
+    case O::luke_publication_fence: case O::luke_publication_images:
+    case O::luke_publication_slots: case O::luke_input_guide: case O::luke_input_camera:
+    case O::luke_locate_context: case O::luke_locate_pose:
+    case O::luke_inline_view: case O::luke_inline_pose_bits:
+    case O::luke_space_created: case O::luke_space_locate:
+    case O::luke_space_time: case O::luke_render_camera:
+    case O::luke_temporal_pair: case O::luke_temporal_pose:
+    case O::three_slot_worker_wait: case O::three_slot_buffer_wait:
+    case O::three_slot_handoff: case O::three_slot_gpu_ready: case O::three_slot_present:
+    case O::timing_worker_run: case O::timing_worker_prepare:
+    case O::timing_synthesis_complete: case O::timing_publication_complete:
+    case O::timing_aux_complete: case O::timing_worker_build:
+    case O::timing_slot_wait: case O::timing_director_wait:
+    case O::timing_worker_publish: case O::timing_runtime_gate:
+    case O::generation_prepare:
+    case O::composition_layer: case O::composition_publish:
+    case O::presenter_clock_capability:
+        return true;
+    case O::luke_afw_stage:
+        // AFW CPU/queue boundaries plus guide, XR release, hold and pair.
+        // The existing GPU timestamp queries are now visible in this profile.
+        return a == 13 || a == 18 || a == 19 || a == 22 ||
+            a == 23 || a == 26 || a == 27 || a == 28 || a == 31 ||
+            a == 32 || a == 33 || a == 34 || a == 35 ||
+            a == 36 || a == 52 || a == 53 || (a >= 54 && a <= 68) ||
+            (a >= 71 && a <= 81) || (a >= 86 && a <= 101) || a == 122;
+    default: return false;
+    }
+}
 const char* name(unsigned value) noexcept {
     using O = BridgeFlightOperation;
     switch (static_cast<O>(value)) {
 #define ENTRY(x) case O::x: return #x
     ENTRY(application_wait_frame); ENTRY(application_begin_frame); ENTRY(application_end_frame);
     ENTRY(application_swapchain_release); ENTRY(internal_wait_frame); ENTRY(internal_begin_frame);
+    ENTRY(downstream_first_end_frame); ENTRY(embedded_configuration);
+    ENTRY(luke_frame_contract); ENTRY(luke_pose_contract); ENTRY(luke_afw_stage);
     ENTRY(application_swapchain_acquire); ENTRY(application_swapchain_wait);
     ENTRY(private_swapchain_acquire); ENTRY(private_swapchain_wait); ENTRY(private_swapchain_release);
     ENTRY(internal_end_frame); ENTRY(presenter_pace); ENTRY(three_slot_worker_wait);
@@ -80,6 +129,16 @@ const char* name(unsigned value) noexcept {
     ENTRY(session_binding); ENTRY(runtime_identity); ENTRY(session_state);
     ENTRY(gpu_history); ENTRY(gpu_synthesis); ENTRY(gpu_timing_error);
     ENTRY(luke_release); ENTRY(luke_filter); ENTRY(luke_cycle_wait);
+    ENTRY(luke_inline_clock); ENTRY(luke_physical_submit);
+    ENTRY(luke_publication_fence); ENTRY(luke_publication_images);
+    ENTRY(luke_publication_slots); ENTRY(luke_input_guide); ENTRY(luke_input_camera);
+    ENTRY(luke_locate_context); ENTRY(luke_locate_pose);
+    ENTRY(luke_inline_view); ENTRY(luke_inline_pose_bits); ENTRY(presenter_clock_capability);
+    ENTRY(luke_space_created); ENTRY(luke_space_locate);
+    ENTRY(luke_space_time); ENTRY(luke_render_camera);
+    ENTRY(luke_temporal_pair); ENTRY(luke_temporal_pose);
+    ENTRY(generation_prepare);
+    ENTRY(composition_layer); ENTRY(composition_publish);
 #undef ENTRY
     default: return "unknown";
     }
@@ -97,9 +156,10 @@ struct Mapping {
 }
 struct RamTimingCapture::Impl {
     Mapping mapping;
+    bool pose_profile{};
     BridgeFlightToken write(char phase, BridgeFlightOperation op, BridgeFlightToken token,
         std::int64_t result, std::uint64_t a, std::uint64_t b, std::uint64_t c) noexcept {
-        if (!selected(op)) return {};
+        if (!(pose_profile ? selected_pose(op, a) : selected_generic(op))) return {};
         auto* s = mapping.data;
         if (s->paused.load() != 0) return {};
         struct Cache { Shared* owner{}; std::int64_t epoch{}; Lane* lane{}; };
@@ -133,10 +193,11 @@ struct RamTimingCapture::Impl {
 };
 RamTimingCapture::RamTimingCapture() = default;
 RamTimingCapture::~RamTimingCapture() = default;
-bool RamTimingCapture::initialize() noexcept {
+bool RamTimingCapture::initialize(bool pose_profile) noexcept {
     try {
         if (impl_) return true;
         auto p = std::make_unique<Impl>();
+        p->pose_profile = pose_profile;
         p->mapping.handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
             0, static_cast<DWORD>(sizeof(Shared)), mapping_name(GetCurrentProcessId()).c_str());
         if (!p->mapping.handle || GetLastError() == ERROR_ALREADY_EXISTS) return false;
@@ -173,7 +234,7 @@ bool pause_ram_timing(unsigned long pid, bool paused) noexcept {
     } catch (...) { return false; }
 }
 bool save_ram_timing(unsigned long pid, const std::filesystem::path& directory,
-    std::filesystem::path* saved, std::wstring* error) {
+    std::filesystem::path* saved, std::wstring* error, unsigned window_seconds) {
     Mapping m;
     if (!m.open(pid)) return false;
     auto& s = *m.data;
@@ -192,7 +253,8 @@ bool save_ram_timing(unsigned long pid, const std::filesystem::path& directory,
         }
         Sleep(1); // Tray only; producers never wait for this consumer.
     }
-    const auto cutoff = trigger.QuadPart - 15 * s.frequency;
+    const auto cutoff = trigger.QuadPart -
+        static_cast<std::int64_t>(window_seconds) * s.frequency;
     std::vector<Record> records;
     std::array<std::uint64_t, kLanes> totals{};
     std::array<std::int64_t, kLanes> oldest{};
@@ -208,21 +270,24 @@ bool save_ram_timing(unsigned long pid, const std::filesystem::path& directory,
     // Resume before sorting/formatting/disk I/O. Those costs are NOT in the saved window.
     s.paused.store(prior);
     resume.active = false;
-    std::sort(records.begin(), records.end(), [](auto& a, auto& b) { return a.qpc < b.qpc; });
+    // Preserve actual per-lane recording order when adjacent QPC ticks tie.
+    std::stable_sort(records.begin(), records.end(), [](auto& a, auto& b) { return a.qpc < b.qpc; });
     std::filesystem::create_directories(directory);
     SYSTEMTIME t{}; GetLocalTime(&t);
     wchar_t filename[180]{};
-    swprintf_s(filename, L"ofxr-timing-v222-%04u%02u%02u-%02u%02u%02u-%03u-pid%lu-%lld.csv",
+    swprintf_s(filename, L"ofxr-timing-v225-%04u%02u%02u-%02u%02u%02u-%03u-pid%lu-%lld.csv",
         t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,t.wMilliseconds,pid,trigger.QuadPart);
     const auto path = directory / filename;
     std::ofstream out(path, std::ios::binary);
-    out << "# schema=222 window_seconds=15 pid=" << pid << " qpc_frequency=" << s.frequency
+    out << "# schema=" << kSchema << " window_seconds=" << window_seconds << " pid=" << pid << " qpc_frequency=" << s.frequency
         << " trigger_qpc=" << trigger.QuadPart << " paused_before=" << prior
-        << " unmapped_threads=" << s.unmapped_threads.load() << "\n";
+        << " unmapped_threads=" << s.unmapped_threads.load()
+        << " lane_count=" << kLanes << "\n";
     // ASCII path sufficient as context; full executable can contain non-ASCII.
     out << "# executable=" << std::filesystem::path(s.executable).generic_string() << "\n";
     for (unsigned i=0;i<kLanes;++i) if(totals[i])
-        out << "# lane=" << i << " total_events=" << totals[i] << " capacity=" << kCapacity
+        out << "# lane=" << i << " thread=" << s.lanes[i].owner.load()
+            << " total_events=" << totals[i] << " capacity=" << kCapacity
             << " oldest_retained_qpc=" << oldest[i]
             << " truncated_window=" << (totals[i]>kCapacity && oldest[i]>cutoff ? 1 : 0) << "\n";
     out << "qpc,thread,sequence,phase,operation,result,a,b,c\n";
@@ -249,6 +314,6 @@ std::wstring command_ram_timing(const std::filesystem::path& directory, bool sav
     CloseHandle(snapshot);
     return (count ? std::to_wstring(count) + (save ? L" capture(s) saved: " + directory.wstring()
         : paused ? L" RAM capture(s) paused" : L" RAM capture(s) resumed")
-        : L"No active V222 RAM capture found.") + (failures.empty()? L"" : L"\n"+failures);
+        : L"No active V225 RAM capture found.") + (failures.empty()? L"" : L"\n"+failures);
 }
 } // namespace xrfg

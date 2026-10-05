@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include "xrfg/d3d12_frame_synthesizer.hpp"
+#include "../src/d3d12/d3d12_fsr_frame_generator.hpp"
 
 #include <windows.h>
 #include <d3d12.h>
@@ -369,6 +370,38 @@ private:
             IID_PPV_ARGS(texture.GetAddressOf())),
         "ID3D12Device::CreateCommittedResource(single-slice texture)");
     return texture;
+}
+
+void test_fsr_generated_array_follows_color_extent(
+    D3D12WarpFixture& fixture) {
+    auto color = create_single_slice_texture(fixture, 11, 10);
+    auto depth = create_single_slice_texture(fixture, 6, 5);
+    auto motion = create_single_slice_texture(fixture, 6, 5);
+    xrfg::D3D12FsrEyeInput input{};
+    input.color = color.Get();
+    input.color_rect = {0, 0, 11, 10};
+    input.depth = depth.Get();
+    input.depth_rect = {0, 0, 6, 5};
+    input.motion_vectors = motion.Get();
+    input.motion_rect = {0, 0, 6, 5};
+
+    D3D12_RESOURCE_DESC destination = color->GetDesc();
+    destination.Width = 9;
+    destination.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_RESOURCE_DESC generated{};
+    require(
+        xrfg::fsr_generated_array_description(
+            destination, std::span<const xrfg::D3D12FsrEyeInput>(&input, 1),
+            &generated),
+        "FSR generated-array description rejected a valid larger colour");
+    require(
+        generated.Width == 11 && generated.Height == 10,
+        "FSR generated array retained the smaller OpenXR destination extent");
+    require(
+        generated.DepthOrArraySize == destination.DepthOrArraySize &&
+            generated.Format == destination.Format &&
+            generated.Flags == D3D12_RESOURCE_FLAG_NONE,
+        "FSR generated array changed its slice, format, or flags contract");
 }
 
 void clear_double_wide_pattern(
@@ -1473,6 +1506,416 @@ void require_private_resource_shape(
     require(
         (flags & kExternallyVisibleHeapFlags) == D3D12_HEAP_FLAG_NONE,
         "history texture is shared, cross-adapter, or hardware-protected");
+}
+
+// WARP returns a per-adapter device singleton, so an actual second canonical
+// WARP device is not a portable fixture. This UNUSED metadata resource forwards
+// its real descriptor/COM lifetime but deliberately cannot expose a device.
+// It is never copied, submitted, or consumed as AFW color (snapshot_output=false).
+class UnusedColorMetadataProxy final : public ID3D12Resource {
+public:
+    explicit UnusedColorMetadataProxy(ID3D12Resource* resource) : resource_(resource) {}
+    LONG device_queries() noexcept { return InterlockedCompareExchange(&device_queries_, 0, 0); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(ID3D12Object) ||
+            iid == __uuidof(ID3D12DeviceChild) || iid == __uuidof(ID3D12Pageable) || iid == __uuidof(ID3D12Resource)) {
+            *object = static_cast<ID3D12Resource*>(this); AddRef(); return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&references_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const auto left = InterlockedDecrement(&references_);
+        if (!left) delete this;
+        return static_cast<ULONG>(left);
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override {
+        return resource_->GetPrivateData(guid, size, data);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override {
+        return resource_->SetPrivateData(guid, size, data);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* data) override {
+        return resource_->SetPrivateDataInterface(guid, data);
+    }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override { return resource_->SetName(name); }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void** device) override {
+        InterlockedIncrement(&device_queries_);
+        if (!device) return E_POINTER;
+        *device = nullptr; return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* range, void** data) override {
+        return resource_->Map(subresource, range, data);
+    }
+    void STDMETHODCALLTYPE Unmap(UINT subresource, const D3D12_RANGE* range) override { resource_->Unmap(subresource, range); }
+    D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override { return resource_->GetDesc(); }
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return resource_->GetGPUVirtualAddress(); }
+    HRESULT STDMETHODCALLTYPE WriteToSubresource(UINT subresource, const D3D12_BOX* box, const void* data,
+        UINT row_pitch, UINT depth_pitch) override {
+        return resource_->WriteToSubresource(subresource, box, data, row_pitch, depth_pitch);
+    }
+    HRESULT STDMETHODCALLTYPE ReadFromSubresource(void* data, UINT row_pitch, UINT depth_pitch,
+        UINT subresource, const D3D12_BOX* box) override {
+        return resource_->ReadFromSubresource(data, row_pitch, depth_pitch, subresource, box);
+    }
+    HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES* properties, D3D12_HEAP_FLAGS* flags) override {
+        return resource_->GetHeapProperties(properties, flags);
+    }
+private:
+    ComPtr<ID3D12Resource> resource_;
+    volatile LONG references_{1}, device_queries_{};
+};
+
+// Real WARP operations are forwarded; only the reported COM device identity
+// differs. Same adapter is intentionally NOT proof of snapshot ownership.
+class ReportedDeviceAlias final : public ID3D12Device {
+public:
+    explicit ReportedDeviceAlias(ID3D12Device* native) : native_(native) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (iid != __uuidof(IUnknown) && iid != __uuidof(ID3D12Object) && iid != __uuidof(ID3D12Device))
+            return E_NOINTERFACE;
+        *object = static_cast<ID3D12Device*>(this); AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&references_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const auto left = InterlockedDecrement(&references_); if (!left) delete this;
+        return static_cast<ULONG>(left);
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override { return native_->GetPrivateData(guid, size, data); }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override { return native_->SetPrivateData(guid, size, data); }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* data) override { return native_->SetPrivateDataInterface(guid, data); }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override { return native_->SetName(name); }
+    UINT STDMETHODCALLTYPE GetNodeCount() override { return native_->GetNodeCount(); }
+    HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* d, REFIID i, void** p) override { return native_->CreateCommandQueue(d, i, p); }
+    HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE t, REFIID i, void** p) override { return native_->CreateCommandAllocator(t, i, p); }
+    HRESULT STDMETHODCALLTYPE CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID i, void** p) override { return native_->CreateGraphicsPipelineState(d, i, p); }
+    HRESULT STDMETHODCALLTYPE CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, REFIID i, void** p) override { return native_->CreateComputePipelineState(d, i, p); }
+    HRESULT STDMETHODCALLTYPE CreateCommandList(UINT n, D3D12_COMMAND_LIST_TYPE t, ID3D12CommandAllocator* a, ID3D12PipelineState* s, REFIID i, void** p) override { return native_->CreateCommandList(n, t, a, s, i, p); }
+    HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE f, void* d, UINT n) override { return native_->CheckFeatureSupport(f, d, n); }
+    HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* d, REFIID i, void** p) override { return native_->CreateDescriptorHeap(d, i, p); }
+    UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE t) override { return native_->GetDescriptorHandleIncrementSize(t); }
+    HRESULT STDMETHODCALLTYPE CreateRootSignature(UINT n, const void* d, SIZE_T s, REFIID i, void** p) override { return native_->CreateRootSignature(n, d, s, i, p); }
+    void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) override { native_->CreateConstantBufferView(d, h); }
+    void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) override { native_->CreateShaderResourceView(r, d, h); }
+    void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource* r, ID3D12Resource* c, const D3D12_UNORDERED_ACCESS_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) override { native_->CreateUnorderedAccessView(r, c, d, h); }
+    void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource* r, const D3D12_RENDER_TARGET_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) override { native_->CreateRenderTargetView(r, d, h); }
+    void STDMETHODCALLTYPE CreateDepthStencilView(ID3D12Resource* r, const D3D12_DEPTH_STENCIL_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) override { native_->CreateDepthStencilView(r, d, h); }
+    void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) override { native_->CreateSampler(d, h); }
+    void STDMETHODCALLTYPE CopyDescriptors(UINT nd, const D3D12_CPU_DESCRIPTOR_HANDLE* d, const UINT* ds, UINT ns, const D3D12_CPU_DESCRIPTOR_HANDLE* s, const UINT* ss, D3D12_DESCRIPTOR_HEAP_TYPE t) override { native_->CopyDescriptors(nd, d, ds, ns, s, ss, t); }
+    void STDMETHODCALLTYPE CopyDescriptorsSimple(UINT n, D3D12_CPU_DESCRIPTOR_HANDLE d, D3D12_CPU_DESCRIPTOR_HANDLE s, D3D12_DESCRIPTOR_HEAP_TYPE t) override { native_->CopyDescriptorsSimple(n, d, s, t); }
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo(UINT m, UINT n, const D3D12_RESOURCE_DESC* d) override { return native_->GetResourceAllocationInfo(m, n, d); }
+    D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE GetCustomHeapProperties(UINT n, D3D12_HEAP_TYPE t) override { return native_->GetCustomHeapProperties(n, t); }
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource(const D3D12_HEAP_PROPERTIES* h, D3D12_HEAP_FLAGS f, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES s, const D3D12_CLEAR_VALUE* c, REFIID i, void** p) override { return native_->CreateCommittedResource(h, f, d, s, c, i, p); }
+    HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC* d, REFIID i, void** p) override { return native_->CreateHeap(d, i, p); }
+    HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap* h, UINT64 o, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES s, const D3D12_CLEAR_VALUE* c, REFIID i, void** p) override { return native_->CreatePlacedResource(h, o, d, s, c, i, p); }
+    HRESULT STDMETHODCALLTYPE CreateReservedResource(const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES s, const D3D12_CLEAR_VALUE* c, REFIID i, void** p) override { return native_->CreateReservedResource(d, s, c, i, p); }
+    HRESULT STDMETHODCALLTYPE CreateSharedHandle(ID3D12DeviceChild* o, const SECURITY_ATTRIBUTES* a, DWORD d, LPCWSTR n, HANDLE* h) override { return native_->CreateSharedHandle(o, a, d, n, h); }
+    HRESULT STDMETHODCALLTYPE OpenSharedHandle(HANDLE h, REFIID i, void** p) override { return native_->OpenSharedHandle(h, i, p); }
+    HRESULT STDMETHODCALLTYPE OpenSharedHandleByName(LPCWSTR n, DWORD d, HANDLE* h) override { return native_->OpenSharedHandleByName(n, d, h); }
+    HRESULT STDMETHODCALLTYPE MakeResident(UINT n, ID3D12Pageable* const* p) override { return native_->MakeResident(n, p); }
+    HRESULT STDMETHODCALLTYPE Evict(UINT n, ID3D12Pageable* const* p) override { return native_->Evict(n, p); }
+    HRESULT STDMETHODCALLTYPE CreateFence(UINT64 v, D3D12_FENCE_FLAGS f, REFIID i, void** p) override { return native_->CreateFence(v, f, i, p); }
+    HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override { return native_->GetDeviceRemovedReason(); }
+    void STDMETHODCALLTYPE GetCopyableFootprints(const D3D12_RESOURCE_DESC* d, UINT f, UINT n, UINT64 b, D3D12_PLACED_SUBRESOURCE_FOOTPRINT* l, UINT* r, UINT64* s, UINT64* t) override { native_->GetCopyableFootprints(d, f, n, b, l, r, s, t); }
+    HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC* d, REFIID i, void** p) override { return native_->CreateQueryHeap(d, i, p); }
+    HRESULT STDMETHODCALLTYPE SetStablePowerState(BOOL e) override { return native_->SetStablePowerState(e); }
+    HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* d, ID3D12RootSignature* s, REFIID i, void** p) override { return native_->CreateCommandSignature(d, s, i, p); }
+    void STDMETHODCALLTYPE GetResourceTiling(ID3D12Resource* r, UINT* n, D3D12_PACKED_MIP_INFO* m, D3D12_TILE_SHAPE* s, UINT* t, UINT f, D3D12_SUBRESOURCE_TILING* d) override { native_->GetResourceTiling(r, n, m, s, t, f, d); }
+    LUID STDMETHODCALLTYPE GetAdapterLuid() override { return native_->GetAdapterLuid(); }
+private:
+    ComPtr<ID3D12Device> native_;
+    volatile LONG references_{1};
+};
+
+class QueueWithReportedDeviceAlias final : public ID3D12CommandQueue {
+public:
+    QueueWithReportedDeviceAlias(ID3D12CommandQueue* native, ID3D12Device* reported)
+        : native_(native), reported_(reported) {}
+    LONG device_queries() noexcept { return InterlockedCompareExchange(&device_queries_, 0, 0); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (iid != __uuidof(IUnknown) && iid != __uuidof(ID3D12Object) &&
+            iid != __uuidof(ID3D12DeviceChild) && iid != __uuidof(ID3D12Pageable) &&
+            iid != __uuidof(ID3D12CommandQueue)) return E_NOINTERFACE;
+        *object = static_cast<ID3D12CommandQueue*>(this); AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&references_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const auto left = InterlockedDecrement(&references_); if (!left) delete this;
+        return static_cast<ULONG>(left);
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override { return native_->GetPrivateData(guid, size, data); }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override { return native_->SetPrivateData(guid, size, data); }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* data) override { return native_->SetPrivateDataInterface(guid, data); }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override { return native_->SetName(name); }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID iid, void** device) override {
+        InterlockedIncrement(&device_queries_); return reported_->QueryInterface(iid, device);
+    }
+    void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource* r, UINT n, const D3D12_TILED_RESOURCE_COORDINATE* c,
+        const D3D12_TILE_REGION_SIZE* s, ID3D12Heap* h, UINT nr, const D3D12_TILE_RANGE_FLAGS* f,
+        const UINT* o, const UINT* t, D3D12_TILE_MAPPING_FLAGS flags) override { native_->UpdateTileMappings(r, n, c, s, h, nr, f, o, t, flags); }
+    void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource* d, const D3D12_TILED_RESOURCE_COORDINATE* dc,
+        ID3D12Resource* s, const D3D12_TILED_RESOURCE_COORDINATE* sc, const D3D12_TILE_REGION_SIZE* z,
+        D3D12_TILE_MAPPING_FLAGS f) override { native_->CopyTileMappings(d, dc, s, sc, z, f); }
+    void STDMETHODCALLTYPE ExecuteCommandLists(UINT n, ID3D12CommandList* const* l) override { native_->ExecuteCommandLists(n, l); }
+    void STDMETHODCALLTYPE SetMarker(UINT m, const void* d, UINT n) override { native_->SetMarker(m, d, n); }
+    void STDMETHODCALLTYPE BeginEvent(UINT m, const void* d, UINT n) override { native_->BeginEvent(m, d, n); }
+    void STDMETHODCALLTYPE EndEvent() override { native_->EndEvent(); }
+    HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* f, UINT64 v) override { return native_->Signal(f, v); }
+    HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* f, UINT64 v) override { return native_->Wait(f, v); }
+    HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* f) override { return native_->GetTimestampFrequency(f); }
+    HRESULT STDMETHODCALLTYPE GetClockCalibration(UINT64* g, UINT64* c) override { return native_->GetClockCalibration(g, c); }
+    D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override { return native_->GetDesc(); }
+private:
+    ComPtr<ID3D12CommandQueue> native_;
+    ComPtr<ID3D12Device> reported_;
+    volatile LONG references_{1}, device_queries_{};
+};
+
+void test_protected_guide_snapshots(D3D12WarpFixture& fixture) {
+    xrfg::configure_dlss_motion_vector_tracking(false);
+    xrfg::retire_disabled_dlss_motion_vector_resources();
+    xrfg::configure_dlss_motion_vector_tracking(true);
+    auto color = create_source_texture(fixture);
+    auto motion = create_source_texture(fixture);
+    auto depth = create_source_texture(fixture);
+    std::vector<std::shared_ptr<const xrfg::DlssMotionVectorFrame>> held;
+    std::shared_ptr<const xrfg::DlssMotionVectorFrame> published;
+    const auto publish = [&](unsigned n, bool reset = false) {
+        upload_pattern(fixture, motion.Get(), make_pattern(static_cast<std::uint8_t>(n * 13)));
+        upload_pattern(fixture, depth.Get(), make_pattern(static_cast<std::uint8_t>(n * 17)));
+        fixture.execute_and_wait([&](ID3D12GraphicsCommandList* list) {
+            xrfg::DlssMotionVectorPublication p;
+            p.stream = 90028; p.output = color.Get(); p.motion_vectors = motion.Get();
+            p.depth = depth.Get(); p.producer_queue = fixture.queue(); p.producer_command_list = list;
+            p.output_width = p.motion_width = p.depth_width = kWidth;
+            p.output_height = p.motion_height = p.depth_height = kHeight;
+            p.resource_state = p.depth_resource_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            p.protect_snapshot_lifetime = true;
+            p.reset = reset;
+            p.camera_frame_token_valid = true; p.camera_frame_token = n * 7;
+            published = xrfg::publish_dlss_motion_vectors(p);
+        });
+        const auto resolved = xrfg::resolve_dlss_motion_vectors(1, fixture.queue());
+        require(resolved && resolved->eye_count == 1 && resolved->eyes[0], "protected guide resolution");
+        return resolved->eyes[0];
+    };
+    for (unsigned n = 1; n <= 8; ++n) {
+        auto frame = publish(n);
+        require(published && published->publication == frame->publication &&
+            published->color_origin_token != 0 &&
+            published->color_origin_token == frame->color_origin_token &&
+            published->serial == n && frame->motion_retention && frame->depth_retention &&
+            frame->camera_frame_token_valid && frame->camera_frame_token == n * 7,
+            "protected guide lost provenance/lifetime");
+        for (const auto& old : held) require(old->color_origin_token < frame->color_origin_token &&
+            old->motion_vectors.Get() != frame->motion_vectors.Get() &&
+            old->depth.Get() != frame->depth.Get(), "publisher overwrote a retained snapshot");
+        held.push_back(std::move(frame));
+    }
+    const auto first_publication = held[0]->publication;
+    const auto last_origin_token = held.back()->color_origin_token;
+    {
+        const auto selected = xrfg::resolve_luke_guide_token(
+            held[3]->color_origin_token, fixture.queue(), fixture.device());
+        require(selected && selected->publication == held[3]->publication &&
+            selected->color_origin_token == held[3]->color_origin_token &&
+            selected->serial == 4 && selected->previous_serial == 2 &&
+            selected->previous_opposite_guide &&
+            selected->previous_opposite_guide->publication == held[2]->publication &&
+            selected->camera_frame_token == 28 &&
+            selected->previous_opposite_guide->camera_frame_token == 21,
+            "color origin did not resolve its exact retained guide and N-1 camera");
+        require_readback_matches(fixture, selected->motion_vectors.Get(), make_pattern(52),
+            "exact older origin MV", selected->resource_state);
+        require_readback_matches(fixture, selected->depth.Get(), make_pattern(68),
+            "exact older origin depth", selected->depth_resource_state);
+        require(!xrfg::resolve_luke_guide_token(0, fixture.queue(), fixture.device()) &&
+            !xrfg::resolve_luke_guide_token(held[7]->color_origin_token + 1, fixture.queue(), fixture.device()) &&
+            !xrfg::resolve_luke_guide_token(held[0]->color_origin_token, fixture.queue(), fixture.device()) &&
+            !xrfg::resolve_luke_guide_token(held[1]->color_origin_token, fixture.queue(), fixture.device()) &&
+            !xrfg::resolve_luke_guide_token(held[2]->color_origin_token, fixture.queue(), fixture.device()),
+            "unknown, evicted, or missing N-1 origin fell back to the stream head");
+
+        D3D12_COMMAND_QUEUE_DESC queue_description{};
+        queue_description.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ComPtr<ID3D12CommandQueue> consumer_queue;
+        require_hresult(fixture.device()->CreateCommandQueue(&queue_description,
+            IID_PPV_ARGS(&consumer_queue)), "origin consumer queue");
+        require(!xrfg::resolve_luke_guide_token(held[3]->color_origin_token, consumer_queue.Get(), fixture.device()),
+            "unsubmitted origin was admitted on another queue");
+        ID3D12CommandList* submitted[] = {
+            held[2]->producer_command_list.Get(), held[3]->producer_command_list.Get()};
+        xrfg::report_dlss_motion_vector_submission(fixture.queue(), 2, submitted);
+        const auto stamped = xrfg::resolve_luke_guide_token(
+            held[3]->color_origin_token, consumer_queue.Get(), fixture.device());
+        require(stamped && stamped->producer_fence && stamped->producer_fence_value != 0 &&
+            stamped->color_origin_token == held[3]->color_origin_token &&
+            stamped->previous_opposite_guide->color_origin_token == held[2]->color_origin_token &&
+            stamped->previous_opposite_guide->producer_fence_value != 0 &&
+            held[3]->producer_fence_value == 0 && selected->producer_fence_value == 0,
+            "submission did not stamp older retained guides immutably");
+    }
+    const auto snapshot_state = held[0]->resource_state;
+    require_readback_matches(fixture, held[0]->motion_vectors.Get(), make_pattern(13), "old MV after eight publications", snapshot_state);
+    require_readback_matches(fixture, held[0]->depth.Get(), make_pattern(17), "old depth after eight publications", snapshot_state);
+    Microsoft::WRL::ComPtr<ID3D12Fence> reader_fence;
+    require_hresult(fixture.device()->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+        IID_PPV_ARGS(&reader_fence)), "protected snapshot reader fence");
+    held[0]->motion_retention->begin_gpu_read();
+    held[0]->depth_retention->begin_gpu_read();
+    require_hresult(held[0]->motion_retention->retire_gpu_read(reader_fence.Get(), 1), "retire MV reader");
+    require_hresult(held[0]->depth_retention->retire_gpu_read(reader_fence.Get(), 1), "retire depth reader");
+    const auto first_motion = held[0]->motion_vectors;
+    const auto first_depth = held[0]->depth;
+    held[0].reset(); // no CPU frame owner; unfinished GPU read MUST still pin it
+    const auto failures = xrfg::dlss_motion_vector_statistics().snapshot_failures;
+    require(publish(9)->publication == first_publication + 7 && !published &&
+        xrfg::dlss_motion_vector_statistics().snapshot_failures == failures + 1,
+        "full pool reused a GPU-in-flight snapshot");
+    require_readback_matches(fixture, first_motion.Get(), make_pattern(13), "busy MV remains unchanged", snapshot_state);
+    require_readback_matches(fixture, first_depth.Get(), make_pattern(17), "busy depth remains unchanged", snapshot_state);
+    require_hresult(reader_fence->Signal(1), "complete protected snapshot read");
+    const auto recycled = publish(9);
+    require(published && recycled->publication == first_publication + 8 &&
+        recycled->color_origin_token > last_origin_token + 1 &&
+        recycled->motion_vectors.Get() == first_motion.Get() &&
+        recycled->depth.Get() == first_depth.Get(), "completed unowned snapshot not recycled");
+    require_readback_matches(fixture, recycled->motion_vectors.Get(), make_pattern(117), "recycled MV", snapshot_state);
+    held.clear();
+    const auto reset = publish(10, true);
+    require(reset->publication == recycled->publication + 1 && reset->serial == 1 &&
+        reset->color_origin_token > recycled->color_origin_token &&
+        !xrfg::resolve_luke_guide_token(recycled->color_origin_token, fixture.queue(), fixture.device()) &&
+        !xrfg::resolve_luke_guide_token(reset->color_origin_token, fixture.queue(), fixture.device()),
+        "reset retained an old origin or inferred its missing opposite guide");
+    const auto after_reset = publish(11);
+    const auto reset_join = xrfg::resolve_luke_guide_token(after_reset->color_origin_token, fixture.queue(), fixture.device());
+    require(reset_join && reset_join->epoch == reset->epoch &&
+        reset_join->previous_opposite_guide->publication == reset->publication,
+        "reset epoch did not join its exact consecutive origin");
+    xrfg::configure_dlss_motion_vector_tracking(false);
+    xrfg::retire_disabled_dlss_motion_vector_resources();
+    xrfg::configure_dlss_motion_vector_tracking(true);
+    const auto restarted = publish(12);
+    require(restarted->publication > after_reset->publication && restarted->serial == 1 &&
+        restarted->color_origin_token > after_reset->color_origin_token &&
+        !xrfg::resolve_luke_guide_token(after_reset->color_origin_token, fixture.queue(), fixture.device()),
+        "tracking restart reused a color-carried origin identity");
+    xrfg::retire_dlss_motion_vector_stream(90028);
+    const auto replaced_stream = publish(12);
+    require(replaced_stream->serial == 1 &&
+        replaced_stream->color_origin_token > restarted->color_origin_token &&
+        !xrfg::resolve_luke_guide_token(restarted->color_origin_token, fixture.queue(), fixture.device()),
+        "retired stream recreated a previous process token");
+    xrfg::configure_dlss_motion_vector_tracking(false);
+    xrfg::retire_disabled_dlss_motion_vector_resources();
+    {
+        xrfg::configure_dlss_motion_vector_tracking(true);
+        ComPtr<UnusedColorMetadataProxy> unused_color;
+        unused_color.Attach(new UnusedColorMetadataProxy(color.Get()));
+        std::shared_ptr<const xrfg::DlssMotionVectorFrame> exact_frame;
+        for (unsigned n = 1; n <= 2; ++n) {
+            fixture.execute_and_wait([&](ID3D12GraphicsCommandList* list) {
+                xrfg::DlssMotionVectorPublication p;
+                p.stream = 90033; p.output = unused_color.Get(); p.snapshot_output = false;
+                p.motion_vectors = motion.Get(); p.depth = depth.Get();
+                p.producer_queue = fixture.queue(); p.producer_command_list = list;
+                p.verified_producer_device = fixture.device();
+                p.output_width = p.motion_width = p.depth_width = kWidth;
+                p.output_height = p.motion_height = p.depth_height = kHeight;
+                p.resource_state = p.depth_resource_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                p.protect_snapshot_lifetime = true;
+                exact_frame = xrfg::publish_dlss_motion_vectors(p);
+            });
+            require(exact_frame != nullptr, "unused original metadata blocked protected publication");
+        }
+        require(unused_color->device_queries() == 0, "publisher queried an unsnapshotted unused color device");
+        const auto joined = xrfg::resolve_luke_guide_token(exact_frame->color_origin_token, fixture.queue(), fixture.device());
+        require(joined && joined->publication == exact_frame->publication &&
+            joined->previous_opposite_guide && joined->motion_retention && joined->depth_retention,
+            "exact AFW origin rejected unused original color device metadata");
+        require(unused_color->device_queries() == 0,
+            "exact AFW origin consulted original color instead of owned MV/depth");
+        require_readback_matches(fixture, joined->motion_vectors.Get(), make_pattern(156),
+            "owned MV with unusable original device metadata", joined->resource_state);
+        require_readback_matches(fixture, joined->depth.Get(), make_pattern(204),
+            "owned depth with unusable original device metadata", joined->depth_resource_state);
+
+        ComPtr<ReportedDeviceAlias> device_alias;
+        device_alias.Attach(new ReportedDeviceAlias(fixture.device()));
+        ComPtr<QueueWithReportedDeviceAlias> queue_alias;
+        queue_alias.Attach(new QueueWithReportedDeviceAlias(fixture.queue(), device_alias.Get()));
+        ComPtr<ID3D12Device> reported;
+        require_hresult(queue_alias->GetDevice(IID_PPV_ARGS(&reported)), "proxy queue reported device");
+        ComPtr<IUnknown> native_identity, reported_identity;
+        require_hresult(fixture.device()->QueryInterface(IID_PPV_ARGS(&native_identity)), "native device identity");
+        require_hresult(reported.As(&reported_identity), "proxy device identity");
+        const auto native_luid = fixture.device()->GetAdapterLuid();
+        const auto reported_luid = reported->GetAdapterLuid();
+        require(native_identity.Get() != reported_identity.Get() &&
+            native_luid.HighPart == reported_luid.HighPart && native_luid.LowPart == reported_luid.LowPart,
+            "reported-device regression requires distinct identity on the SAME adapter");
+        require(!xrfg::resolve_luke_guide_token(exact_frame->color_origin_token, queue_alias.Get(), fixture.device()),
+            "native consumer alias bypassed the required crossqueue submission fence");
+        ID3D12CommandList* submitted[] = {joined->previous_opposite_guide->producer_command_list.Get(),
+            joined->producer_command_list.Get()};
+        xrfg::report_dlss_motion_vector_submission(fixture.queue(), 2, submitted);
+        const auto queries_before = queue_alias->device_queries();
+        const auto alias_join = xrfg::resolve_luke_guide_token(
+            exact_frame->color_origin_token, queue_alias.Get(), fixture.device());
+        require(alias_join && alias_join->producer_fence &&
+            alias_join->publication == exact_frame->publication && alias_join->previous_opposite_guide &&
+            alias_join->motion_snapshot_device.Get() == fixture.device() &&
+            alias_join->depth_snapshot_device.Get() == fixture.device(),
+            "reported proxy identity rejected the explicit native snapshot owner");
+        require(!xrfg::resolve_luke_guide_token(exact_frame->color_origin_token, queue_alias.Get(), device_alias.Get()) &&
+            !xrfg::resolve_luke_guide_token(exact_frame->color_origin_token, queue_alias.Get(), nullptr),
+            "different SAME-adapter device identity or missing explicit owner admitted snapshots");
+        require(queue_alias->device_queries() == queries_before,
+            "exact-origin resolver queried the unreliable reported queue device");
+        require_readback_matches(fixture, alias_join->motion_vectors.Get(), make_pattern(156),
+            "native owner through reported-device alias", alias_join->resource_state);
+
+        // Optional real different-adapter consumer: no additional WARP singleton
+        // or fake device. Existing same-device crossqueue/fence tests above remain.
+        ComPtr<IDXGIFactory6> consumer_factory;
+        require_hresult(CreateDXGIFactory1(IID_PPV_ARGS(&consumer_factory)), "foreign consumer factory");
+        ComPtr<ID3D12Device> foreign_device;
+        for (UINT index = 0; !foreign_device; ++index) {
+            ComPtr<IDXGIAdapter1> adapter;
+            const HRESULT enumeration = consumer_factory->EnumAdapters1(index, &adapter);
+            if (enumeration == DXGI_ERROR_NOT_FOUND) break;
+            require_hresult(enumeration, "foreign consumer adapter");
+            DXGI_ADAPTER_DESC1 description{};
+            require_hresult(adapter->GetDesc1(&description), "foreign consumer adapter description");
+            if (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+            static_cast<void>(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
+                IID_PPV_ARGS(&foreign_device)));
+        }
+        if (foreign_device) {
+            ComPtr<IUnknown> foreign_identity, producer_identity;
+            require_hresult(foreign_device.As(&foreign_identity), "foreign consumer identity");
+            require_hresult(fixture.device()->QueryInterface(IID_PPV_ARGS(&producer_identity)), "native producer identity");
+            require(foreign_identity.Get() != producer_identity.Get(), "negative consumer device is not distinct");
+            D3D12_COMMAND_QUEUE_DESC description{}; description.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            ComPtr<ID3D12CommandQueue> foreign_queue;
+            require_hresult(foreign_device->CreateCommandQueue(&description, IID_PPV_ARGS(&foreign_queue)), "foreign consumer queue");
+            require(!xrfg::resolve_luke_guide_token(exact_frame->color_origin_token, foreign_queue.Get(), foreign_device.Get()),
+                "foreign consumer device admitted native MV/depth snapshots");
+        } else {
+            std::cout << "Protected guide foreign-device negative: skipped (WARP-only host)\n";
+        }
+        require(unused_color->device_queries() == 0, "foreign consumer caused irrelevant original color device query");
+        xrfg::configure_dlss_motion_vector_tracking(false);
+        xrfg::retire_disabled_dlss_motion_vector_resources();
+    }
+    std::cout << "Protected guides: bounded exact origins, immutable submission, reset rejection, CPU/GPU pins, unused-output independence\n";
 }
 
 void test_stereo_capture_ring(D3D12WarpFixture& fixture) {
@@ -2586,6 +3029,15 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
             0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
             D3D12_RESOURCE_STATE_COMMON, false, false, command_list};
         verified_publication.verified_producer_device = fixture.device();
+        verified_publication.camera_position = {1.0F, 2.0F, 3.0F};
+        verified_publication.camera_up = {0.0F, 1.0F, 0.0F};
+        verified_publication.camera_right = {1.0F, 0.0F, 0.0F};
+        verified_publication.camera_forward = {0.0F, 0.0F, -1.0F};
+        verified_publication.camera_fov_vertical = 1.25F;
+        verified_publication.camera_data_valid = true;
+        verified_publication.output_resource_state =
+            D3D12_RESOURCE_STATE_COMMON;
+        verified_publication.snapshot_output = true;
         xrfg::publish_dlss_motion_vectors(verified_publication);
         xrfg::publish_dlss_motion_vectors({
             202, shared_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
@@ -2602,10 +3054,16 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
             resolved->eyes[1]->motion_vectors.Get() != motion.Get() &&
             resolved->eyes[0]->motion_vectors.Get() !=
                 resolved->eyes[1]->motion_vectors.Get() &&
-            resolved->eyes[0]->output.Get() == shared_output.Get() &&
+            resolved->eyes[0]->output.Get() != shared_output.Get() &&
             resolved->eyes[1]->output.Get() == shared_output.Get() &&
             resolved->eyes[0]->output_slice == 0 &&
-            resolved->eyes[1]->output_slice == 0,
+            resolved->eyes[1]->output_slice == 0 &&
+            resolved->eyes[0]->camera_data_valid &&
+            resolved->eyes[0]->camera_position[0] == 1.0F &&
+            resolved->eyes[0]->camera_position[1] == 2.0F &&
+            resolved->eyes[0]->camera_position[2] == 3.0F &&
+            resolved->eyes[0]->camera_forward[2] == -1.0F &&
+            resolved->eyes[0]->camera_fov_vertical == 1.25F,
         "two DLSS streams were not associated with the XR stereo image");
     const auto double_wide = xrfg::resolve_dlss_motion_vectors(
         xr_double_wide.Get(), fixture.queue());
@@ -2618,6 +3076,8 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
         left_output.Get(), fixture.queue());
     require(mono && mono->eye_count == 1 && mono->eyes[0],
         "ordinary mono output was changed by double-wide stream detection");
+    require(resolved->eyes[0]->output.Get() != left_output.Get(),
+        "diagnostic DLSS output was retained by alias instead of snapshot");
 
     // Publish in the opposite order. Eye assignment must remain tied to the
     // stable first-seen stream order, not to this frame's evaluation order.
@@ -2637,13 +3097,13 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
             reordered->eyes[1]->stream == 202 &&
             reordered->eyes[0]->serial == 2 &&
             reordered->eyes[1]->serial == 2 &&
-            reordered->eyes[0]->output.Get() == resolved->eyes[0]->output.Get() &&
+            reordered->eyes[0]->output.Get() == shared_output.Get() &&
             reordered->eyes[1]->output.Get() == resolved->eyes[1]->output.Get() &&
             reordered->eyes[0]->output.Get() == reordered->eyes[1]->output.Get(),
         "DLSS stream pairing changed eye assignment with evaluation order");
 
     const auto tracked = xrfg::dlss_motion_vector_statistics();
-    require(tracked.published == 4 && tracked.snapshot_copies == 4 &&
+    require(tracked.published == 4 && tracked.snapshot_copies == 5 &&
             tracked.snapshot_failures == 0 && tracked.matched == 4 &&
             tracked.resolve_missing_streams == 0 &&
             tracked.resolve_stale_pairs == 0,
@@ -2651,7 +3111,8 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
     xrfg::report_dlss_motion_vector_use();
     const auto used = xrfg::dlss_motion_vector_statistics();
     require(used.status == xrfg::DlssMotionVectorStatus::used && used.used == 1 &&
-            used.last_used_publication == used.published,
+            used.last_used_publication == std::max(
+                reordered->eyes[0]->publication, reordered->eyes[1]->publication),
         "DLSS stream diagnostics did not retain the last successful use");
     fixture.execute_and_wait([&](ID3D12GraphicsCommandList* command_list) {
         xrfg::publish_dlss_motion_vectors({
@@ -2709,11 +3170,12 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
         });
     };
     publish_alternating_eye(left_output.Get());
-    require(!xrfg::resolve_dlss_motion_vectors(xr_output.Get(), fixture.queue()),
+    require(!xrfg::resolve_dlss_motion_vectors(
+                std::uint32_t{2}, fixture.queue()),
         "single DLSS stream resolved before the second eye arrived");
     publish_alternating_eye(right_output.Get());
     const auto alternating_ab = xrfg::resolve_dlss_motion_vectors(
-        xr_output.Get(), fixture.queue());
+        std::uint32_t{2}, fixture.queue());
     require(alternating_ab && alternating_ab->eyes[0] && alternating_ab->eyes[1] &&
             alternating_ab->eyes[0]->stream == 303 &&
             alternating_ab->eyes[1]->stream == 303 &&
@@ -2723,11 +3185,12 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
             alternating_ab->eyes[1]->previous_serial == 0,
         "single alternating DLSS stream did not form its first stereo pair");
     publish_alternating_eye(left_output.Get());
-    require(!xrfg::resolve_dlss_motion_vectors(xr_output.Get(), fixture.queue()),
+    require(!xrfg::resolve_dlss_motion_vectors(
+                std::uint32_t{2}, fixture.queue()),
         "single alternating DLSS stream exposed a half-updated stereo pair");
     publish_alternating_eye(right_output.Get());
     const auto alternating_cd = xrfg::resolve_dlss_motion_vectors(
-        xr_output.Get(), fixture.queue());
+        std::uint32_t{2}, fixture.queue());
     require(alternating_cd && alternating_cd->eyes[0] && alternating_cd->eyes[1] &&
             alternating_cd->eyes[0]->serial == 3 &&
             alternating_cd->eyes[1]->serial == 4 &&
@@ -2739,6 +3202,77 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
     xrfg::retire_dlss_motion_vector_stream(101);
     xrfg::retire_dlss_motion_vector_stream(202);
     xrfg::retire_dlss_motion_vector_stream(303);
+    xrfg::retire_dlss_motion_vector_stream(404);
+}
+
+void test_dlss_motion_vector_submission_handoff(D3D12WarpFixture& fixture) {
+    xrfg::configure_dlss_motion_vector_tracking(true);
+    constexpr UINT width = 64;
+    constexpr UINT height = 32;
+    const auto create_texture = [&](UINT texture_width, UINT texture_height) {
+        D3D12_RESOURCE_DESC description =
+            stereo_texture_description(texture_width, texture_height);
+        description.DepthOrArraySize = 1;
+        description.Flags = D3D12_RESOURCE_FLAG_NONE;
+        const D3D12_HEAP_PROPERTIES properties =
+            heap_properties(D3D12_HEAP_TYPE_DEFAULT);
+        ComPtr<ID3D12Resource> texture;
+        require_hresult(fixture.device()->CreateCommittedResource(
+            &properties, D3D12_HEAP_FLAG_NONE, &description,
+            D3D12_RESOURCE_STATE_COMMON, nullptr,
+            IID_PPV_ARGS(texture.GetAddressOf())),
+            "create DLSS submission-handoff texture");
+        return texture;
+    };
+
+    D3D12_COMMAND_QUEUE_DESC queue_description{};
+    queue_description.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ComPtr<ID3D12CommandQueue> producer_queue;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> command_list;
+    require_hresult(fixture.device()->CreateCommandQueue(
+        &queue_description, IID_PPV_ARGS(producer_queue.GetAddressOf())),
+        "create distinct DLSS producer queue");
+    require_hresult(fixture.device()->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        IID_PPV_ARGS(allocator.GetAddressOf())),
+        "create DLSS producer allocator");
+    require_hresult(fixture.device()->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+        IID_PPV_ARGS(command_list.GetAddressOf())),
+        "create DLSS producer command list");
+
+    const auto output = create_texture(width, height);
+    const auto motion = create_texture(width / 2, height / 2);
+    const auto xr_output = create_texture(width, height);
+    xrfg::DlssMotionVectorPublication publication{
+        404, output.Get(), motion.Get(), producer_queue.Get(), 0, 0,
+        width, height, 0, 0, width / 2, height / 2,
+        1.0F, 1.0F, 0.0F, 0.0F, D3D12_RESOURCE_STATE_COMMON,
+        false, false, command_list.Get()};
+    publication.verified_producer_device = fixture.device();
+    xrfg::publish_dlss_motion_vectors(publication);
+    require(!xrfg::resolve_dlss_motion_vectors(
+                xr_output.Get(), fixture.queue()),
+        "unsubmitted DLSS snapshots crossed queues without synchronization");
+
+    require_hresult(command_list->Close(), "close DLSS producer command list");
+    ID3D12CommandList* submitted[] = {command_list.Get()};
+    producer_queue->ExecuteCommandLists(1, submitted);
+    xrfg::report_dlss_motion_vector_submission(
+        producer_queue.Get(), 1, submitted);
+
+    const auto resolved = xrfg::resolve_dlss_motion_vectors(
+        xr_output.Get(), fixture.queue());
+    require(resolved && resolved->eye_count == 1 && resolved->eyes[0] &&
+            resolved->eyes[0]->stream == 404 &&
+            resolved->eyes[0]->producer_fence &&
+            resolved->eyes[0]->producer_fence_value != 0,
+        "submitted DLSS snapshots did not cross queues through the fence handoff");
+    fixture.execute_and_wait([](ID3D12GraphicsCommandList*) {});
+
+    xrfg::configure_dlss_motion_vector_tracking(false);
+    xrfg::retire_disabled_dlss_motion_vector_resources();
     xrfg::retire_dlss_motion_vector_stream(404);
 }
 
@@ -3448,7 +3982,7 @@ void test_srgb_synthesis_preserves_brightness(
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     const bool trace_test = std::getenv("XRFG_TEST_GPU_TRACE") != nullptr;
     const auto trace_dir = std::filesystem::temp_directory_path() /
         ("xrfg-v072-gpu-" + std::to_string(GetCurrentProcessId()));
@@ -3459,6 +3993,12 @@ int main() {
         xrfg::bridge_flight_logger().initialize(trace_dir);
     }
     try {
+        if (argc > 1 && std::string_view(argv[1]) == "protected-guides") {
+            D3D12WarpFixture fixture;
+            test_protected_guide_snapshots(fixture);
+            fixture.require_no_debug_errors();
+            return 0;
+        }
         if (GetEnvironmentVariableA("XRFG_TEST_NVIDIA_QUALITY", nullptr, 0)) {
             run_nvidia_fast_controls();
             return 0;
@@ -3466,6 +4006,7 @@ int main() {
         D3D12WarpFixture fixture;
         test_cinema_color_contract(fixture);
         test_srgb_synthesis_preserves_brightness(fixture);
+        test_fsr_generated_array_follows_color_extent(fixture);
         test_stereo_capture_ring(fixture);
         test_capture_is_async_and_consumer_fence_blocks_reuse(fixture);
         test_depth_capture_path(fixture);
@@ -3474,6 +4015,7 @@ int main() {
         test_double_wide_single_slice_views(fixture);
         test_stereo_motion_synthesis_beats_same_pixel_blend(fixture);
         test_dlss_motion_vector_stereo_stream_pairing(fixture);
+        test_dlss_motion_vector_submission_handoff(fixture);
         test_dlss_motion_vector_gpu_ingress(fixture);
         test_rotation_aware_synthesis_beats_uncompensated_flow(fixture);
         fixture.require_no_debug_errors();

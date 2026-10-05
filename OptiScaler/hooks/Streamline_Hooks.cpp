@@ -1,6 +1,7 @@
 #include <pch.h>
 
 #include "Streamline_Hooks.h"
+#include "Streamline_NativeInterface.h"
 
 #include <Util.h>
 #include <Config.h>
@@ -10,6 +11,8 @@
 #include <hooks/Reflex_Hooks.h>
 #include <menu/menu_overlay_base.h>
 #include <framegen/nvngx/Nvngx_FG.h>
+#include <inputs/NVNGX_DLSS.h>
+#include <ofxr/ofxr_bridge_client.hpp>
 #include <proxies/KernelBase_Proxy.h>
 #include <imgui/ImGuiNotify.hpp>
 
@@ -426,8 +429,7 @@ sl::Result StreamlineHooks::hkslSetTag(const sl::ViewportHandle& viewport, const
         }
     }
 
-    auto result = o_slSetTag(viewport, tags, numTags, cmdBuffer);
-    return result;
+    return o_slSetTag(viewport, tags, numTags, cmdBuffer);
 }
 
 sl::Result StreamlineHooks::hkslSetTagForFrame(const sl::FrameToken& frame, const sl::ViewportHandle& viewport,
@@ -506,8 +508,7 @@ sl::Result StreamlineHooks::hkslSetTagForFrame(const sl::FrameToken& frame, cons
         }
     }
 
-    auto result = o_slSetTagForFrame(frame, viewport, resources, numResources, cmdBuffer);
-    return result;
+    return o_slSetTagForFrame(frame, viewport, resources, numResources, cmdBuffer);
 }
 
 sl::Result StreamlineHooks::hkslEvaluateFeature(sl::Feature feature, const sl::FrameToken& frame,
@@ -539,7 +540,10 @@ sl::Result StreamlineHooks::hkslEvaluateFeature(sl::Feature feature, const sl::F
         }
     }
 
-    auto result = o_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+    ofxr_bridge::begin_streamline_evaluation(static_cast<uint32_t>(frame));
+    const sl::Result result =
+        o_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+    ofxr_bridge::end_streamline_evaluation();
     return result;
 }
 
@@ -558,14 +562,17 @@ sl::Result StreamlineHooks::hkslGetNativeInterface(void* proxyInterface, void** 
     return result;
 }
 
-bool StreamlineHooks::getNativeInterface(void* proxyInterface, void** baseInterface)
+bool StreamlineHooks::getBorrowedNativeInterface(void* proxyInterface, void** baseInterface,
+                                               HRESULT* queryResult)
 {
-    if (proxyInterface == nullptr || baseInterface == nullptr || o_slGetNativeInterface == nullptr)
-        return false;
-
+    if (queryResult) *queryResult = E_POINTER;
+    if (!baseInterface) return false;
     *baseInterface = nullptr;
-    return o_slGetNativeInterface(proxyInterface, baseInterface) == sl::Result::eOk &&
-           *baseInterface != nullptr;
+    IUnknown* native = nullptr;
+    if (!streamline_native::get_borrowed(static_cast<IUnknown*>(proxyInterface), &native, queryResult))
+        return false;
+    *baseInterface = native;
+    return true;
 }
 
 sl::Result StreamlineHooks::hkslSetD3DDevice(void* d3dDevice)
@@ -1056,6 +1063,17 @@ sl::Result StreamlineHooks::hkslSetConstants(const sl::Constants& values, const 
 {
     std::scoped_lock lock(setConstantsMutex);
     LOG_TRACE("called with frameIndex: {}, viewport: {}", (unsigned int) frame, (unsigned int) viewport);
+
+    ofxr_bridge::cache_streamline_camera(
+        static_cast<uint32_t>(frame),
+        reinterpret_cast<const float*>(&values.cameraViewToClip),
+        reinterpret_cast<const float*>(&values.clipToCameraView),
+        reinterpret_cast<const float*>(&values.cameraPos),
+        reinterpret_cast<const float*>(&values.cameraUp),
+        reinterpret_cast<const float*>(&values.cameraRight),
+        reinterpret_cast<const float*>(&values.cameraFwd),
+        values.cameraNear, values.cameraFar, values.cameraFOV,
+        values.depthInverted == sl::Boolean::eTrue);
 
     State::Instance().slFGInputs.setConstants(values, (uint32_t) frame);
 
@@ -1745,17 +1763,18 @@ void StreamlineHooks::updateDlssgOptions()
 void StreamlineHooks::unhookInterposer()
 {
     LOG_FUNC();
+    std::scoped_lock hookLock(interposerHookMutex);
 
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
 
-    if (o_slSetTag)
+    if (streamlineResourceHooksAttached && o_slSetTag)
         DetourDetach(&(PVOID&) o_slSetTag, hkslSetTag);
 
-    if (o_slSetTagForFrame)
+    if (streamlineResourceHooksAttached && o_slSetTagForFrame)
         DetourDetach(&(PVOID&) o_slSetTagForFrame, hkslSetTagForFrame);
 
-    if (o_slSetConstants)
+    if (streamlineConstantsHookAttached && o_slSetConstants)
         DetourDetach(&(PVOID&) o_slSetConstants, hkslSetConstants);
 
     if (o_slEvaluateFeature)
@@ -1797,6 +1816,8 @@ void StreamlineHooks::unhookInterposer()
         o_slSetTag_sl1 = nullptr;
         o_slSetConstants_interposer_sl1 = nullptr;
         o_slEvaluateFeature_sl1 = nullptr;
+        streamlineResourceHooksAttached = false;
+        streamlineConstantsHookAttached = false;
         o_logCallback = nullptr;
         o_logCallback_sl1 = nullptr;
     }
@@ -1812,6 +1833,8 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
         LOG_WARN("Streamline module in NULL");
         return;
     }
+
+    std::scoped_lock hookLock(interposerHookMutex);
 
     // Interposer needs this or it might end in an infinite loop calling itself
     static HMODULE last_slInterposer = nullptr;
@@ -1889,8 +1912,10 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
                 if (o_slEvaluateFeature != nullptr)
                     DetourAttach(&(PVOID&) o_slEvaluateFeature, hkslEvaluateFeature);
 
-                if (State::Instance().activeFgInput == FGInput::NvngxFG ||
-                    State::Instance().activeFgInput == FGInput::DLSSG)
+                const bool attachResourceHooks =
+                    State::Instance().activeFgInput == FGInput::NvngxFG ||
+                    State::Instance().activeFgInput == FGInput::DLSSG;
+                if (attachResourceHooks)
                 {
                     if (o_slSetTag != nullptr)
                         DetourAttach(&(PVOID&) o_slSetTag, hkslSetTag);
@@ -1898,9 +1923,13 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
                     if (o_slSetTagForFrame != nullptr)
                         DetourAttach(&(PVOID&) o_slSetTagForFrame, hkslSetTagForFrame);
 
-                    if (o_slSetConstants != nullptr)
-                        DetourAttach(&(PVOID&) o_slSetConstants, hkslSetConstants);
                 }
+
+                // The exact Streamline camera is also consumed by Luke AFW
+                // while Luke's own legacy AER remains the active FG owner.
+                // Capture constants independently of OptiScaler FG input.
+                if (o_slSetConstants != nullptr)
+                    DetourAttach(&(PVOID&) o_slSetConstants, hkslSetConstants);
 
                 if (State::Instance().activeFgInput == FGInput::DLSSG)
                 {
@@ -1946,6 +1975,13 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
                     o_slGetFeatureRequirements = nullptr;
                     o_slGetFeatureVersion = nullptr;
                     o_slGetFeatureFunction = nullptr;
+                    streamlineConstantsHookAttached = false;
+                }
+                else
+                {
+                    streamlineResourceHooksAttached = attachResourceHooks;
+                    streamlineConstantsHookAttached =
+                        o_slSetConstants != nullptr;
                 }
             }
         }

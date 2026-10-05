@@ -1,4 +1,5 @@
 #include "xrfg/d3d11_d3d12_interop.hpp"
+#include "xrfg/bridge_flight_logger.hpp"
 
 #include <windows.h>
 #include <dxgi1_2.h>
@@ -260,6 +261,7 @@ struct D3D11D3D12SwapchainInterop::Impl {
     std::uint64_t last_fence_value{};
     std::uint64_t last_d3d12_access_value{};
     std::uint64_t last_d3d11_access_value{};
+    D3D11PublicationSnapshot last_publication{};
     bool enabled{};
 
     ~Impl() {
@@ -742,6 +744,10 @@ struct D3D11D3D12SwapchainInterop::Impl {
         d3d11_context4->Flush1(D3D11_CONTEXT_TYPE_ALL, nullptr);
         last_d3d11_access_value = complete_value;
         last_fence_value = complete_value;
+        last_publication = {
+            static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(d3d12_fence.Get())),
+            ready_value, complete_value, 0, current_destination_index,
+            synthetic_destination_index.value_or(UINT32_MAX)};
         return S_OK;
     }
 
@@ -882,18 +888,77 @@ HRESULT D3D11D3D12SwapchainInterop::prepare_synthesis() noexcept {
     }
 }
 
-HRESULT D3D11D3D12SwapchainInterop::publish(
-    std::uint32_t current_destination_index,
-    std::optional<std::uint32_t> synthetic_destination_index) noexcept {
+HRESULT D3D11D3D12SwapchainInterop::capture_published_current(
+    const D3D11PublicationReceipt& receipt) noexcept {
     try {
         std::scoped_lock lock(mutex_);
-        return impl_ == nullptr
-            ? E_UNEXPECTED
-            : impl_->publish(
-                  current_destination_index,
-                  synthetic_destination_index);
+        if (!impl_ || !impl_->enabled || !receipt.fence ||
+            receipt.fence.Get() != impl_->d3d12_fence.Get() || !receipt.copy_complete_value ||
+            receipt.current_destination_index >= impl_->current_destination_images.size())
+            return E_INVALIDARG;
+        const auto index = receipt.current_destination_index;
+        HRESULT result = impl_->d3d11_context4->Wait(impl_->d3d11_fence.Get(),
+            receipt.copy_complete_value);
+        if (FAILED(result)) return result;
+        copy_mip_zero(impl_->d3d11_context.Get(),
+            impl_->shared_current_destinations[index].d3d11.Get(),
+            impl_->current_destination_images[index].Get(),
+            impl_->source_description.ArraySize,
+            [&]() noexcept { D3D11_TEXTURE2D_DESC d{};
+                impl_->current_destination_images[index]->GetDesc(&d); return d.MipLevels; }(),
+            [&]() noexcept { D3D11_TEXTURE2D_DESC d{};
+                impl_->shared_current_destinations[index].d3d11->GetDesc(&d); return d.MipLevels; }());
+        std::uint64_t ready{};
+        result = impl_->allocate_fence_value(&ready);
+        if (FAILED(result)) return result;
+        result = impl_->d3d11_context4->Signal(impl_->d3d11_fence.Get(), ready);
+        if (FAILED(result)) return result;
+        impl_->d3d11_context4->Flush1(D3D11_CONTEXT_TYPE_ALL, nullptr);
+        impl_->last_d3d11_access_value = ready;
+        impl_->last_fence_value = ready;
+        return impl_->d3d12_queue->Wait(impl_->d3d12_fence.Get(), ready);
+    } catch (...) { return E_FAIL; }
+}
+
+HRESULT D3D11D3D12SwapchainInterop::publish(
+    std::uint32_t current_destination_index,
+    std::optional<std::uint32_t> synthetic_destination_index,
+    D3D11PublicationReceipt* receipt) noexcept {
+    if (receipt) *receipt = {};
+    try {
+        std::scoped_lock lock(mutex_);
+        if (!impl_) return E_UNEXPECTED;
+        const HRESULT result = impl_->publish(
+            current_destination_index, synthetic_destination_index);
+        if (SUCCEEDED(result) && receipt) {
+            receipt->fence = impl_->d3d12_fence;
+            receipt->copy_complete_value = impl_->last_publication.copy_complete_value;
+            receipt->current_destination_index = current_destination_index;
+        }
+        return result;
     } catch (...) {
         return E_FAIL;
+    }
+}
+
+HRESULT wait_for_d3d11_publication(const D3D11PublicationReceipt& receipt) noexcept {
+    if (!receipt.fence || receipt.copy_complete_value == 0) return E_INVALIDARG;
+    UniqueHandle completion;
+    for (;;) {
+        const auto completed = receipt.fence->GetCompletedValue();
+        if (completed == std::numeric_limits<std::uint64_t>::max()) return E_FAIL;
+        if (completed >= receipt.copy_complete_value) return S_OK;
+        if (!completion.value) {
+            completion.value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!completion.value) return HRESULT_FROM_WIN32(GetLastError());
+        }
+        const HRESULT result = receipt.fence->SetEventOnCompletion(
+            receipt.copy_complete_value, completion.value);
+        if (FAILED(result)) return result;
+        if (WaitForSingleObject(completion.value, INFINITE) != WAIT_OBJECT_0) {
+            const auto error = GetLastError();
+            return HRESULT_FROM_WIN32(error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error);
+        }
     }
 }
 
@@ -904,6 +969,18 @@ HRESULT D3D11D3D12SwapchainInterop::wait_for_idle() noexcept {
         return impl_ == nullptr ? S_OK : impl_->wait_for_idle();
     } catch (...) {
         return E_FAIL;
+    }
+}
+
+D3D11PublicationSnapshot D3D11D3D12SwapchainInterop::publication_snapshot() const noexcept {
+    try {
+        std::scoped_lock lock(mutex_);
+        if (impl_ == nullptr || impl_->d3d12_fence == nullptr) return {};
+        auto snapshot = impl_->last_publication;
+        snapshot.completed_value = impl_->d3d12_fence->GetCompletedValue();
+        return snapshot;
+    } catch (...) {
+        return {};
     }
 }
 

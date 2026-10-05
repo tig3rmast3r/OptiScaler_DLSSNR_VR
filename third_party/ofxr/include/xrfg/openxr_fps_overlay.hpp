@@ -22,6 +22,7 @@ public:
     // Called on the application's end-frame thread, not the presenter thread.
     // Uploads at most 4 Hz; no explicit GPU fence wait, image-wait timeout zero.
     void application_frame(const XrFrameEndInfo* info) noexcept;
+    void set_afw_active(bool active) noexcept;
     [[nodiscard]] XrResult end_frame(const XrFrameEndInfo* info, bool synthetic);
     void reset_metrics() noexcept;
     // Terminal for this session. Keep resources alive until normal teardown;

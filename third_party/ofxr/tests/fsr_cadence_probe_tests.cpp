@@ -27,7 +27,7 @@ int main() {
         };
         {
             xrfg::FsrCadenceProbe disabled(root);
-            check(!disabled.marker_enabled(false) && disabled.marker_enabled(true), "legacy marker inheritance");
+            check(!disabled.marker_enabled(), "logging must not enable image markers");
             disabled.generated(false); disabled.pair(true, 1, 2, 0, 2); disabled.flush();
             check(log_count() == 0, "disabled probe wrote a file");
         }
@@ -36,7 +36,7 @@ int main() {
         }
         {
             xrfg::FsrCadenceProbe enabled(root);
-            check(enabled.marker_enabled(false), "light probe must support marker with full logging off");
+            check(!enabled.marker_enabled(), "cadence logging must not enable image markers");
             enabled.generated(true); enabled.bypass(5);
             enabled.pair(true, 5'000'000, 11'111'100, 1'000'000, 11'111'100);
             check(log_count() == 0, "probe wrote to disk on frame path");
@@ -46,7 +46,9 @@ int main() {
         {
             std::ofstream file(ini); file << "[diagnostics]\ncadence_logging_enabled=1\nsynthetic_marker_enabled=0\n";
         }
-        { xrfg::FsrCadenceProbe without_marker(root); check(!without_marker.marker_enabled(true), "explicit marker-off ignored"); }
+        { xrfg::FsrCadenceProbe without_marker(root); check(!without_marker.marker_enabled(), "explicit marker-off ignored"); }
+        { std::ofstream file(ini); file << "[diagnostics]\nsynthetic_marker_enabled=1\n"; }
+        { xrfg::FsrCadenceProbe marker(root); check(marker.marker_enabled(), "explicit marker-on ignored"); }
         for (const auto& file : std::filesystem::directory_iterator(root)) std::filesystem::remove(file.path());
         std::filesystem::remove(root);
         std::cout << "FSR cadence: counters, independent marker, no frame-path I/O, flush and disabled mode passed\n";

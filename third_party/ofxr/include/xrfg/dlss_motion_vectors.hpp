@@ -2,6 +2,7 @@
 
 #include <d3d12.h>
 #include <wrl/client.h>
+#include "dlss_snapshot_retention.hpp"
 
 #include <cstdint>
 #include <array>
@@ -45,10 +46,31 @@ struct DlssMotionVectorPublication {
     float camera_far{1000.0F};
     bool depth_inverted{};
     bool depth_infinite{};
+    std::array<float, 3> camera_position{};
+    std::array<float, 3> camera_up{};
+    std::array<float, 3> camera_right{};
+    std::array<float, 3> camera_forward{};
+    float camera_fov_vertical{};
+    bool camera_data_valid{};
+    std::array<float, 16> camera_view_to_clip{};
+    std::array<float, 16> camera_clip_to_view{};
+    bool camera_matrices_valid{};
+    D3D12_RESOURCE_STATES output_resource_state{
+        D3D12_RESOURCE_STATE_COMMON};
+    bool snapshot_output{};
+    // F10-only pre-DLSS colour audit. Never retained by the guide history.
+    ID3D12Resource* input_color{};
+    std::uint32_t input_color_x{}, input_color_y{};
+    std::uint32_t input_color_width{}, input_color_height{};
+    D3D12_RESOURCE_STATES input_color_resource_state{
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
     // An in-process producer may supply the native D3D12 device after it has
     // unwrapped and identity-checked every object in the publication. This is
     // intentionally absent from the external provider ABI.
     ID3D12Device* verified_producer_device{};
+    bool protect_snapshot_lifetime{};
+    std::uint32_t camera_frame_token{};
+    bool camera_frame_token_valid{};
 };
 
 struct DlssMotionVectorFrame {
@@ -57,9 +79,17 @@ struct DlssMotionVectorFrame {
     std::uint64_t serial{};
     std::uint64_t previous_serial{};
     std::uint64_t publication{};
+    // Process-monotonic key carried by protected Luke SR color. Zero is invalid;
+    // it is never a truncated publication and never recycled by a stream reset.
+    std::uint32_t color_origin_token{};
     Microsoft::WRL::ComPtr<ID3D12Resource> output;
     Microsoft::WRL::ComPtr<ID3D12Resource> motion_vectors;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> producer_queue;
+    Microsoft::WRL::ComPtr<ID3D12Device> verified_producer_device;
+    // Device interfaces actually used to allocate these owned snapshots.
+    // Receipts come from the resource slot, not current producer metadata.
+    Microsoft::WRL::ComPtr<ID3D12Device> motion_snapshot_device;
+    Microsoft::WRL::ComPtr<ID3D12Device> depth_snapshot_device;
     std::uint32_t output_x{};
     std::uint32_t output_y{};
     std::uint32_t output_width{};
@@ -92,6 +122,31 @@ struct DlssMotionVectorFrame {
     float camera_far{1000.0F};
     bool depth_inverted{};
     bool depth_infinite{};
+    std::array<float, 3> camera_position{};
+    std::array<float, 3> camera_up{};
+    std::array<float, 3> camera_right{};
+    std::array<float, 3> camera_forward{};
+    float camera_fov_vertical{};
+    bool camera_data_valid{};
+    std::array<float, 16> camera_view_to_clip{};
+    std::array<float, 16> camera_clip_to_view{};
+    bool camera_matrices_valid{};
+    // The snapshots are recorded into the producer command list.  The real
+    // submission callback replaces the provisional queue with the queue that
+    // actually executed that list and attaches a fence signalled immediately
+    // after it.  This makes guide ownership safe across distinct D3D12 queues.
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> producer_command_list;
+    Microsoft::WRL::ComPtr<ID3D12Fence> producer_fence;
+    Microsoft::WRL::ComPtr<ID3D12Device> producer_fence_device;
+    std::uint64_t producer_fence_value{};
+    // Exact immediately preceding opposite-eye publication. AFW uses its
+    // camera to restore the earlier half of the same-eye temporal interval;
+    // its contaminated motion field is not sampled.
+    std::shared_ptr<const DlssMotionVectorFrame> previous_opposite_guide;
+    std::shared_ptr<DlssSnapshotRetention> motion_retention;
+    std::shared_ptr<DlssSnapshotRetention> depth_retention;
+    std::uint32_t camera_frame_token{};
+    bool camera_frame_token_valid{};
 };
 
 constexpr std::uint32_t kDlssMotionVectorEyeCount = 2;
@@ -131,16 +186,40 @@ struct DlssMotionVectorStatistics {
     DlssMotionVectorStatus status{DlssMotionVectorStatus::waiting_for_dlss};
 };
 
-void publish_dlss_motion_vectors(
+// Returns this exact immutable publication, never a later stream head. The
+// native Luke producer carries its process-monotonic token through rendered color.
+std::shared_ptr<const DlssMotionVectorFrame> publish_dlss_motion_vectors(
     const DlssMotionVectorPublication& publication) noexcept;
 void configure_dlss_motion_vector_tracking(bool enabled) noexcept;
 // Call only after all queue work that may reference published snapshots has
 // completed. A live disable intentionally retains them until this safe point.
 void retire_disabled_dlss_motion_vector_resources() noexcept;
 void retire_dlss_motion_vector_stream(std::uint64_t stream) noexcept;
+void report_dlss_motion_vector_submission(
+    ID3D12CommandQueue* queue,
+    std::uint32_t command_list_count,
+    ID3D12CommandList* const* command_lists) noexcept;
 std::shared_ptr<const DlssMotionVectorSet> resolve_dlss_motion_vectors(
     ID3D12Resource* output,
     ID3D12CommandQueue* consumer_queue) noexcept;
+// Resolves by logical projection-view count when the OpenXR swapchain is
+// D3D11 and therefore has no D3D12 image from which to derive array size.
+std::shared_ptr<const DlssMotionVectorSet> resolve_dlss_motion_vectors(
+    std::uint32_t logical_eye_count,
+    ID3D12CommandQueue* consumer_queue) noexcept;
+// Luke/AER's one NGX stream alternates physical-eye publications. Return the
+// consecutive owned snapshots in publication order, without the legacy
+// even-serial closing rule. Selection does not depend on OFXR activation.
+std::shared_ptr<const DlssMotionVectorSet> resolve_luke_alternating_guides(
+    ID3D12CommandQueue* consumer_queue) noexcept;
+// Resolves only the token recovered from Luke's actual source color, using the
+// immutable retained guide's full publication/stream/epoch metadata.
+// The returned frame pins its exact immediately preceding opposite-eye guide.
+// Unknown, evicted, or reset-epoch keys never fall back to the newest guide.
+std::shared_ptr<const DlssMotionVectorFrame> resolve_luke_guide_token(
+    std::uint32_t color_origin_token,
+    ID3D12CommandQueue* consumer_queue,
+    ID3D12Device* canonical_consumer_device) noexcept;
 void report_dlss_motion_vector_status(DlssMotionVectorStatus status) noexcept;
 void report_dlss_motion_vector_use() noexcept;
 DlssMotionVectorStatistics dlss_motion_vector_statistics() noexcept;

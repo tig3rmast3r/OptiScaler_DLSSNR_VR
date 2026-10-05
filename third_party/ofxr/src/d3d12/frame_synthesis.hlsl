@@ -195,6 +195,31 @@ float4 bilinear_previous_source(float2 coordinate, uint slice) {
     return lerp(top, bottom, fraction.y);
 }
 
+float4 bilinear_previous_source_extent(
+    float2 coordinate,
+    uint slice,
+    uint2 extent) {
+    extent = max(extent, uint2(1U, 1U));
+    float2 bounded = clamp(
+        coordinate,
+        float2(0.0, 0.0),
+        float2(extent - 1U));
+    int2 top_left = int2(floor(bounded));
+    int2 bottom_right = min(
+        top_left + int2(1, 1),
+        int2(extent) - int2(1, 1));
+    float2 fraction = bounded - float2(top_left);
+    float4 top = lerp(
+        PreviousFrame.Load(int4(top_left, int(slice), 0)),
+        PreviousFrame.Load(int4(bottom_right.x, top_left.y, int(slice), 0)),
+        fraction.x);
+    float4 bottom = lerp(
+        PreviousFrame.Load(int4(top_left.x, bottom_right.y, int(slice), 0)),
+        PreviousFrame.Load(int4(bottom_right, int(slice), 0)),
+        fraction.x);
+    return lerp(top, bottom, fraction.y);
+}
+
 float4 bilinear_current_source(float2 coordinate, uint slice) {
     float2 bounded = clamp(
         coordinate,
@@ -252,6 +277,26 @@ CameraSample sample_previous_target(
         PreviousMappings[view_index]);
     if (mapped.valid > 0.5) {
         output.color = bilinear_previous_source(mapped.coordinate, slice);
+        output.valid = 1.0;
+    }
+    return output;
+}
+
+CameraSample sample_previous_target_extent(
+    float2 target_coordinate,
+    uint slice,
+    uint view_index,
+    uint2 source_extent) {
+    CameraSample output;
+    output.color = float4(0.0, 0.0, 0.0, 1.0);
+    output.valid = 0.0;
+    output.padding = float3(0.0, 0.0, 0.0);
+    MappedCoordinate mapped = map_target_to_source(
+        target_coordinate,
+        PreviousMappings[view_index]);
+    if (mapped.valid > 0.5) {
+        output.color = bilinear_previous_source_extent(
+            mapped.coordinate, slice, source_extent);
         output.valid = 1.0;
     }
     return output;

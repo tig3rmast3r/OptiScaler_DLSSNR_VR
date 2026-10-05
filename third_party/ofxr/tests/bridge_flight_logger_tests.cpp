@@ -94,6 +94,7 @@ void concurrent_records(const fs::path& directory, bool wrap, bool flush) {
     require(contents.find("op=logger result=0") != std::string::npos,
         "shutdown event missing after concurrent writes");
     std::unordered_set<unsigned long long> sequences, identities;
+    unsigned long long reported_drops{}, drop_records{};
     std::istringstream lines(contents);
     std::string line;
     while (std::getline(lines, line)) {
@@ -110,6 +111,10 @@ void concurrent_records(const fs::path& directory, bool wrap, bool flush) {
         require(fields == 10 && line.substr(consumed) == "\r",
             "torn, overlapping or malformed concurrent log record");
         require(sequences.insert(seq).second, "duplicated record sequence");
+        if (std::string(operation) == "logger" && result == -1) {
+            reported_drops += a;
+            ++drop_records;
+        }
         if (std::string(operation) == "synthesis_pair") {
             require(result == 123 && phase == 'I' && duration == 0 &&
                 a < threads && b < iterations && c == a * iterations + b,
@@ -118,9 +123,9 @@ void concurrent_records(const fs::path& directory, bool wrap, bool flush) {
         }
     }
     require(!identities.empty(), "concurrent log lost all worker records");
-    if (!wrap) require(identities.size() == threads * iterations &&
-        sequences.size() == threads * iterations + 3,
-        "non-wrapping logger lost records");
+    if (!wrap) require(identities.size() + reported_drops == threads * iterations &&
+        sequences.size() + reported_drops == threads * iterations + 3 + drop_records,
+        "non-wrapping logger lost records without reporting bounded queue pressure");
     if (wrap) require(identities.size() < threads * iterations,
         "wrap fixture did not exercise truncation");
 }
@@ -132,6 +137,7 @@ int main(int argc, char** argv) {
         xrfg::BridgeFlightLogger child;
         child.initialize(argv[1]);
         child.event(xrfg::BridgeFlightOperation::application_wait_frame, 6, 11, 22, 33);
+        child.flush(); // Forced termination has no normal logger teardown.
         TerminateProcess(GetCurrentProcess(), 73);
         return 1;
     }
@@ -181,6 +187,7 @@ int main(int argc, char** argv) {
         xrfg::BridgeFlightLogger enabled;
         enabled.initialize(enabled_directory);
         require(enabled.enabled(), "enabled INI did not start bridge logging");
+        require(!enabled.gpu_instrumentation_enabled(), "normal logging enabled GPU instrumentation");
         const fs::path log_path = enabled.log_path();
         require(!log_path.empty() && log_path.parent_path() == enabled_directory,
             "bridge log was not created beside the DLL configuration");
@@ -244,6 +251,14 @@ int main(int argc, char** argv) {
             1010,
             77);
         enabled.shutdown();
+        const auto gpu_directory = temporary.path / "gpu";
+        fs::create_directories(gpu_directory);
+        write(gpu_directory / "ofxr_bridge.ini",
+            "[diagnostics]\r\nlogging_enabled=0\r\ngpu_instrumentation_enabled=1\r\n");
+        xrfg::BridgeFlightLogger gpu;
+        gpu.initialize(gpu_directory);
+        require(!gpu.enabled() && gpu.gpu_instrumentation_enabled(),
+            "explicit GPU instrumentation must be independent of normal logging");
 
         const std::string log = read(log_path);
         require(log.find("phase=B op=app_wait_frame") != std::string::npos,

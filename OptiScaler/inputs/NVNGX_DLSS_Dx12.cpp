@@ -25,11 +25,12 @@
 #include <dxgi1_4.h>
 #include <atomic>
 #include <cmath>
-#include <shared_mutex>
-#include "detours/detours.h"
 #include <ankerl/unordered_dense.h>
 #include <misc/IdentifyGpu.h>
 #include "../ofxr/ofxr_bridge_client.hpp"
+#include "../../third_party/ofxr/include/xrfg/dlss_motion_vectors.hpp"
+#include "../../third_party/ofxr/include/xrfg/luke_color_origin.hpp"
+#include "../../third_party/ofxr/include/xrfg/bridge_flight_logger.hpp"
 
 static ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx12>> Dx12Contexts;
 static std::unordered_map<unsigned int, NVSDK_NGX_Feature> HandleToFeature;
@@ -40,11 +41,33 @@ static bool shutdown = false;
 static bool _skipInit = false;
 static wchar_t const** paths;
 
+namespace
+{
+HMODULE FindRealVrModule()
+{
+    const auto hasMarker = [](HMODULE module) {
+        return module != nullptr && GetProcAddress(module, "RealVRVersion") != nullptr;
+    };
+
+    // Prefer the ordinary basename lookup, but do not rely on it: Luke Ross'
+    // proxy and the system DXGI can both be present in this process.
+    HMODULE candidate = GetModuleHandleW(L"dxgi.dll");
+    if (hasMarker(candidate))
+        return candidate;
+
+    const auto& optiPath = Config::Instance()->MainDllPath.value();
+    const std::filesystem::path localDxgi =
+        std::filesystem::path(optiPath).parent_path() / L"dxgi.dll";
+    candidate = GetModuleHandleW(localDxgi.c_str());
+    return hasMarker(candidate) ? candidate : nullptr;
+}
+}
+
 template <typename Interface>
 static Interface* ResolveStreamlineNativeInterface(Interface* object)
 {
     void* native = nullptr;
-    if (object != nullptr && StreamlineHooks::getNativeInterface(object, &native))
+    if (object != nullptr && StreamlineHooks::getBorrowedNativeInterface(object, &native))
         return static_cast<Interface*>(native);
     return object;
 }
@@ -93,6 +116,8 @@ static bool SameAdapter(ID3D12Device* left, ID3D12Device* right)
         leftLuid.LowPart == rightLuid.LowPart;
 }
 
+static void MaybeLogOfxrGuideStatistics();
+
 static const char* OfxrGuideStatusName(std::uint32_t status)
 {
     switch (status)
@@ -120,9 +145,12 @@ static void MaybeLogOfxrGuideStatistics()
         return;
     LOG_INFO(
         "OFXR DLSS guides: status={} published={} depth={} snapshots={} failures={} "
-        "matched={} used={} fsr_attempts={} fsr_used={} fsr_failures={} fsr_status={}",
+        "resolve={} missing={} stale={} queue_mismatch={} invalid={} matched={} used={} "
+        "fsr_attempts={} fsr_used={} fsr_failures={} fsr_status={}",
         OfxrGuideStatusName(s.status), s.published, s.depth_publications,
-        s.snapshot_copies, s.snapshot_failures, s.matched, s.used,
+        s.snapshot_copies, s.snapshot_failures, s.resolve_calls,
+        s.resolve_missing_streams, s.resolve_stale_pairs,
+        s.resolve_queue_mismatches, s.invalid_rejections, s.matched, s.used,
         s.fsr_attempts, s.fsr_used, s.fsr_failures, s.fsr_status);
 }
 
@@ -170,24 +198,25 @@ static NVSDK_NGX_Feature ResolveEvaluatedFeature(
 }
 
 static void PublishOfxrDlssGuides(
-    NVSDK_NGX_Result evaluationResult,
-    NVSDK_NGX_Feature evaluatedFeature,
     unsigned int handleId,
     ID3D12GraphicsCommandList* commandList,
     NVSDK_NGX_Parameter* parameters,
     IFeature_Dx12* optiFeature)
 {
+    // This is called at the actual native NGX EvaluateFeature ingress, after
+    // OptiScaler's DLSS parameter processing and before the DLSS DLL runs.
+    // Motion/depth are NGX inputs, never post-DLSS corrected outputs.
     const auto control = ofxr_bridge::snapshot();
     const bool enabled = control.desired.motion_vectors == 1 ||
         control.desired.frame_generation == 1;
     ofxr_bridge::configure_dlss_guides(enabled);
-    if (!enabled || evaluationResult != NVSDK_NGX_Result_Success ||
-        evaluatedFeature != NVSDK_NGX_Feature_SuperSampling)
+    if (!enabled)
         return;
 
     ID3D12Resource* output = nullptr;
     ID3D12Resource* motion = nullptr;
     ID3D12Resource* depth = nullptr;
+    ID3D12Resource* inputColor = nullptr;
     auto* queue = State::Instance().currentCommandQueue;
     if (parameters->Get(NVSDK_NGX_Parameter_Output, &output) !=
             NVSDK_NGX_Result_Success ||
@@ -198,16 +227,19 @@ static void PublishOfxrDlssGuides(
         return;
 
     parameters->Get(NVSDK_NGX_Parameter_Depth, &depth);
+    parameters->Get(NVSDK_NGX_Parameter_Color, &inputColor);
 
     output = ResolveStreamlineNativeInterface(output);
     motion = ResolveStreamlineNativeInterface(motion);
     queue = ResolveStreamlineNativeInterface(queue);
     commandList = ResolveStreamlineNativeInterface(commandList);
     depth = ResolveStreamlineNativeInterface(depth);
+    inputColor = ResolveStreamlineNativeInterface(inputColor);
 
     const auto outputDevice = ResolveStreamlineNativeDevice(output);
     const auto motionDevice = ResolveStreamlineNativeDevice(motion);
     const auto depthDevice = ResolveStreamlineNativeDevice(depth);
+    const auto inputColorDevice = ResolveStreamlineNativeDevice(inputColor);
     const auto commandDevice = ResolveStreamlineNativeDevice(commandList);
     const auto queueDevice = ResolveStreamlineNativeDevice(queue);
     const bool devicesMatch = outputDevice && motionDevice && commandDevice &&
@@ -225,12 +257,16 @@ static void PublishOfxrDlssGuides(
         return;
     }
 
+    ofxr_bridge::ensure_d3d12_submission_hook(commandDevice.Get());
+
     const auto outputDesc = output->GetDesc();
     const auto motionDesc = motion->GetDesc();
     unsigned int outputX = 0;
     unsigned int outputY = 0;
     unsigned int depthX = 0;
     unsigned int depthY = 0;
+    unsigned int inputColorX = 0;
+    unsigned int inputColorY = 0;
     unsigned int displayWidth = optiFeature ? optiFeature->DisplayWidth() : 0;
     unsigned int displayHeight = optiFeature ? optiFeature->DisplayHeight() : 0;
     unsigned int renderWidth = optiFeature ? optiFeature->RenderWidth() : 0;
@@ -249,6 +285,10 @@ static void PublishOfxrDlssGuides(
     parameters->Get(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, &outputY);
     parameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &depthX);
     parameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, &depthY);
+    parameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X,
+        &inputColorX);
+    parameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y,
+        &inputColorY);
     if (displayWidth == 0) parameters->Get(NVSDK_NGX_Parameter_OutWidth, &displayWidth);
     if (displayHeight == 0) parameters->Get(NVSDK_NGX_Parameter_OutHeight, &displayHeight);
     parameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &renderWidth);
@@ -268,10 +308,10 @@ static void PublishOfxrDlssGuides(
         outputDesc.Width - std::min<UINT64>(outputX, outputDesc.Width));
     const unsigned int availableOutputHeight = outputDesc.Height -
         std::min<unsigned int>(outputY, outputDesc.Height);
-    if (displayWidth == 0) displayWidth = availableOutputWidth;
-    if (displayHeight == 0) displayHeight = availableOutputHeight;
     if (renderWidth == 0) renderWidth = static_cast<unsigned int>(motionDesc.Width);
     if (renderHeight == 0) renderHeight = motionDesc.Height;
+    if (displayWidth == 0) displayWidth = availableOutputWidth;
+    if (displayHeight == 0) displayHeight = availableOutputHeight;
 
     const bool lowResolutionMotion = optiFeature
         ? optiFeature->LowResMV()
@@ -287,6 +327,9 @@ static void PublishOfxrDlssGuides(
         : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const auto depthState = Config::Instance()->DepthResourceBarrier.has_value()
         ? static_cast<D3D12_RESOURCE_STATES>(Config::Instance()->DepthResourceBarrier.value())
+        : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const auto inputColorState = Config::Instance()->ColorResourceBarrier.has_value()
+        ? static_cast<D3D12_RESOURCE_STATES>(Config::Instance()->ColorResourceBarrier.value())
         : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
     unsigned int depthWidth = 0;
@@ -310,6 +353,9 @@ static void PublishOfxrDlssGuides(
     const bool depthInverted = optiFeature
         ? optiFeature->DepthInverted()
         : (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
+
+
+    if (!enabled) return;
 
     OFXR_DlssGuidePublicationV2 publication{};
     publication.stream = handleId;
@@ -348,9 +394,50 @@ static void PublishOfxrDlssGuides(
     publication.camera_far = cameraFar;
     publication.depth_inverted = depthInverted ? 1 : 0;
     publication.depth_infinite = depthInfinite ? 1 : 0;
+    publication.output_resource_state = static_cast<std::uint32_t>(D3D12_RESOURCE_STATE_COMMON);
+    publication.snapshot_output = 0;
+    if (inputColor != nullptr && inputColorDevice &&
+        SameAdapter(inputColorDevice.Get(), commandDevice.Get()))
+    {
+        const auto inputColorDesc = inputColor->GetDesc();
+        if (inputColorX < inputColorDesc.Width &&
+            inputColorY < inputColorDesc.Height)
+        {
+            publication.input_color = inputColor;
+            publication.input_color_x = inputColorX;
+            publication.input_color_y = inputColorY;
+            publication.input_color_width = std::min<unsigned int>(renderWidth,
+                static_cast<unsigned int>(inputColorDesc.Width - inputColorX));
+            publication.input_color_height = std::min<unsigned int>(renderHeight,
+                inputColorDesc.Height - inputColorY);
+            publication.input_color_resource_state =
+                static_cast<std::uint32_t>(inputColorState);
+        }
+    }
     publication.verified_native_device = commandDevice.Get();
-    (void)ofxr_bridge::publish_dlss_guides(publication, commandDevice.Get());
+    const bool exactCamera =
+        ofxr_bridge::apply_streamline_camera(publication);
+    static std::atomic_bool exactCameraLogged { false };
+    if (exactCamera && ofxr_bridge::logging_setting() &&
+        !exactCameraLogged.exchange(true, std::memory_order_relaxed))
+        LOG_INFO("V23173 OFXR guides are using the exact Streamline camera contract");
+    const bool published = ofxr_bridge::publish_dlss_guides(
+        publication, commandDevice.Get());
+    (void)published;
     MaybeLogOfxrGuideStatistics();
+}
+
+void LukeRossDlssIngress::PublishD3D12Guide(
+    unsigned int handleId, ID3D12GraphicsCommandList* commandList,
+    NVSDK_NGX_Parameter* parameters, IFeature_Dx12* optiFeature)
+{
+    PublishOfxrDlssGuides(handleId, commandList, parameters, optiFeature);
+}
+
+
+bool LukeRossDlssIngress::Detected() noexcept
+{
+    return FindRealVrModule() != nullptr;
 }
 
 class ScopedInitDx12
@@ -1399,10 +1486,6 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
             DlssNr::EvaluateAfterUpscale(handleId, InCmdList, InParameters);
     }
 
-    PublishOfxrDlssGuides(
-        evalSuccess ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail,
-        HandleToFeature[handleId], handleId, InCmdList, InParameters, feature);
-
     if (!evalSuccess)
     {
         LOG_ERROR("Feature evaluation failed for '{}'", feature->Name());
@@ -1422,7 +1505,7 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
  * @brief Per-frame feature execution. Runs a feature (upscaler, framegen, etc.) on a given command list using a
  * preexisting feature instance referenced by a unique handle.
  */
-NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* InCmdList,
+static NVSDK_NGX_Result EvaluateFeatureImplementationDx12(ID3D12GraphicsCommandList* InCmdList,
                                                                const NVSDK_NGX_Handle* InFeatureHandle,
                                                                NVSDK_NGX_Parameter* InParameters,
                                                                PFN_NVSDK_NGX_ProgressCallback InCallback)
@@ -1495,6 +1578,11 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
                 cfg.DlssNrRunBeforeSr.value_or_default())
                 DlssNr::EvaluateBeforeUpscale(handleId, InCmdList, InParameters);
 
+            if (feature == NVSDK_NGX_Feature_SuperSampling) {
+                LukeRossDlssIngress::PublishD3D12Guide(
+                    handleId, InCmdList, InParameters, nullptr);
+            }
+
             static constexpr wchar_t kNativeSrBegin[] = L"OptiScaler V23216 native DLSS SR begin";
             static constexpr wchar_t kNativeSrComplete[] = L"OptiScaler V23216 native DLSS SR complete";
             DredMarkers::Set(InCmdList, kNativeSrBegin);
@@ -1507,9 +1595,6 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
             if (result == NVSDK_NGX_Result_Success && feature == NVSDK_NGX_Feature_SuperSampling &&
                 !cfg.DlssNrRunBeforeSr.value_or_default())
                 DlssNr::EvaluateAfterUpscale(handleId, InCmdList, InParameters);
-
-            PublishOfxrDlssGuides(
-                result, feature, handleId, InCmdList, InParameters, nullptr);
 
             return result;
         }
@@ -1535,6 +1620,96 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
     const NVSDK_NGX_Result optiResult = TryEvaluateOptiFeature(InCmdList, InFeatureHandle, InParameters, InCallback);
 
     return optiResult;
+}
+
+// ONE SR completion point, after native SR or owned SR+postprocessing+NR.
+// The immutable guide's color token comes from that evaluation's input, never latest.
+NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* InCmdList,
+                                                               const NVSDK_NGX_Handle* InFeatureHandle,
+                                                               NVSDK_NGX_Parameter* InParameters,
+                                                               PFN_NVSDK_NGX_ProgressCallback InCallback)
+{
+    static thread_local unsigned completion_depth = 0;
+    static thread_local bool nested_evaluation = false;
+    struct CompletionScope {
+        unsigned& depth;
+        bool outermost;
+        explicit CompletionScope(unsigned& value) : depth(value), outermost(value++ == 0) {}
+        ~CompletionScope() { --depth; }
+    } scope(completion_depth);
+    if (!scope.outermost) {
+        // Ordinary NR calls the raw proxy, not this export. If a provider
+        // reenters, do not clear or deliver the enclosing production's TLS ID.
+        // The enclosing completion rejects the ambiguous origin explicitly.
+        nested_evaluation = true;
+        return EvaluateFeatureImplementationDx12(InCmdList, InFeatureHandle, InParameters, InCallback);
+    }
+    nested_evaluation = false;
+    static_cast<void>(ofxr_bridge::take_luke_origin_frame());
+    const auto result = EvaluateFeatureImplementationDx12(InCmdList, InFeatureHandle, InParameters, InCallback);
+    const auto color_origin = ofxr_bridge::take_luke_origin_frame();
+    if (result == NVSDK_NGX_Result_Success && color_origin &&
+        ofxr_bridge::afw_snapshot().desired.mode != 0) {
+        HRESULT marker_result = E_UNEXPECTED;
+        constexpr unsigned kOriginNested = 1, kOriginMissingOutput = 2, kOriginMissingContext = 4,
+            kOriginDimensions = 8, kOriginResourceAdapter = 16, kOriginListIdentity = 32,
+            kOriginUnsupported = 64;
+        unsigned marker_failures = nested_evaluation ? kOriginNested : 0;
+        xrfg::LukeColorOriginRect rect{};
+        D3D12_RESOURCE_DESC final_desc{};
+        ID3D12Resource* final_output = nullptr;
+        auto* native_list = ResolveStreamlineNativeInterface(InCmdList);
+        if (InParameters && InParameters->Get(NVSDK_NGX_Parameter_Output, &final_output) == NVSDK_NGX_Result_Success && final_output) {
+            final_output = ResolveStreamlineNativeInterface(final_output);
+        }
+        if (!final_output) marker_failures |= kOriginMissingOutput;
+        const auto final_device = ResolveStreamlineNativeDevice(final_output);
+        const auto list_device = ResolveStreamlineNativeDevice(native_list);
+        const bool owned_sr = InFeatureHandle && InFeatureHandle->Id >= DLSS_MOD_ID_OFFSET;
+        if (SameCanonicalIdentity(final_output, color_origin->output.Get())) {
+            rect = {color_origin->output_x, color_origin->output_y,
+                    color_origin->output_width, color_origin->output_height};
+        } else {
+            // Evaluate params need not repeat creation-only OutWidth/OutHeight.
+            // Owned postprocessing restores the feature's DISPLAY target, not
+            // the SR/OutputScaling intermediate's TARGET allocation dimensions.
+            const auto context = InFeatureHandle ? Dx12Contexts.find(InFeatureHandle->Id) : Dx12Contexts.end();
+            if (owned_sr && context != Dx12Contexts.end() && context->second.feature) {
+                rect.x = color_origin->output_x; rect.y = color_origin->output_y;
+                rect.width = context->second.feature->DisplayWidth();
+                rect.height = context->second.feature->DisplayHeight();
+            } else marker_failures |= kOriginMissingContext;
+        }
+        if (final_output) final_desc = final_output->GetDesc();
+        if (rect.width < xrfg::kLukeOriginWidth || !rect.height || rect.height > 8192 ||
+            static_cast<UINT64>(rect.x) + rect.width > final_desc.Width ||
+            static_cast<UINT64>(rect.y) + rect.height > final_desc.Height)
+            marker_failures |= kOriginDimensions;
+        // Match the validated V23090 ingress contract: resources may expose
+        // distinct device interfaces on the same adapter; list/queue ownership
+        // is still strict native canonical identity, and allocation stays native.
+        if (!SameAdapter(final_device.Get(), color_origin->verified_producer_device.Get()))
+            marker_failures |= kOriginResourceAdapter;
+        if (!SameCanonicalIdentity(list_device.Get(), color_origin->verified_producer_device.Get()))
+            marker_failures |= kOriginListIdentity;
+        if (final_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || final_desc.SampleDesc.Count != 1 ||
+            final_desc.DepthOrArraySize != 1 || !xrfg::luke_origin_pixel_bytes(final_desc.Format))
+            marker_failures |= kOriginUnsupported;
+        if (marker_failures) {
+            marker_result = (marker_failures & kOriginNested) ? E_UNEXPECTED : E_INVALIDARG;
+        } else {
+            // Owned DLSS final shaders leave UAV; its pipeline does not
+            // honor the native passthrough OutputResourceBarrier setting.
+            const auto state = owned_sr ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                : static_cast<D3D12_RESOURCE_STATES>(Config::Instance()->OutputResourceBarrier.value_or(
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+            marker_result = xrfg::mark_luke_color_origin(native_list, final_output,
+                color_origin->color_origin_token, state, color_origin->verified_producer_device.Get(), rect);
+        }
+        xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::luke_afw_stage,
+            marker_result, 91, color_origin->publication, color_origin->camera_frame_token);
+    }
+    return result;
 }
 
 #pragma endregion

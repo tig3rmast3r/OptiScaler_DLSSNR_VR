@@ -168,7 +168,8 @@ public:
         D3D12NvidiaOpticalFlowOptions nvidia_options = {},
         bool enable_nvidia_gpu_timing = false,
         D3D12FrameGenerationMode generation_mode =
-            D3D12FrameGenerationMode::ofxr) noexcept;
+            D3D12FrameGenerationMode::ofxr,
+        bool allow_luke_guide_device_alias = false) noexcept;
 
     [[nodiscard]] HRESULT submit_prime(
         const D3D12HistoryCaptureTicket& current,

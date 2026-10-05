@@ -143,7 +143,6 @@ class StreamlineHooks
 
     static void unhookInterposer();
     static void hookInterposer(HMODULE slInterposer);
-
     static void unhookDlss();
     static void hookDlss(HMODULE slDlss);
 
@@ -170,13 +169,18 @@ class StreamlineHooks
     static bool isPclHooked();
     static bool isReflexHooked();
 
-    // Returns the underlying D3D/DXGI object when the game's Streamline interposer
-    // supplied a proxy. The returned interface is borrowed from the proxy.
-    static bool getNativeInterface(void* proxyInterface, void** baseInterface);
+    // Resolves Streamline's native-interface IID with balanced COM ownership.
+    // Native objects fall back to themselves; the caller must keep the input
+    // alive while using the returned borrowed interface. No SL API ref escapes.
+    static bool getBorrowedNativeInterface(void* proxyInterface, void** baseInterface,
+                                          HRESULT* queryResult = nullptr);
 
   private:
     inline static sl::RenderAPI renderApi = sl::RenderAPI::eCount;
     inline static std::mutex setConstantsMutex {};
+    inline static std::mutex interposerHookMutex {};
+    inline static bool streamlineResourceHooksAttached = false;
+    inline static bool streamlineConstantsHookAttached = false;
 
     // System caps
     inline static SystemCaps* systemCaps = nullptr;

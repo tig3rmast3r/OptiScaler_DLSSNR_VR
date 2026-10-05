@@ -1,6 +1,8 @@
 #include "xrfg/d3d12_history.hpp"
 #include "xrfg/bridge_flight_logger.hpp"
 #include "xrfg/d3d12_ram_timing.hpp"
+#include "xrfg/gpu_flight_diagnostics.hpp"
+#include "xrfg/two_frame_capture.hpp"
 
 #include <windows.h>
 #include <wrl/client.h>
@@ -20,7 +22,7 @@ using Microsoft::WRL::ComPtr;
 
 void dred_marker(ID3D12GraphicsCommandList* command_list, const char* label) noexcept {
     if (command_list != nullptr && label != nullptr &&
-        bridge_flight_logger().enabled()) {
+        bridge_flight_logger().gpu_instrumentation_enabled()) {
         command_list->SetMarker(1U, label, static_cast<UINT>(std::strlen(label)));
     }
 }
@@ -379,6 +381,7 @@ struct D3D12SwapchainHistory::Impl {
 
         ID3D12CommandList* command_lists[] = {command_list};
         queue->ExecuteCommandLists(1, command_lists);
+        two_frame_capture_submission(queue.Get(), 1, command_lists);
         completion_unknown = true;
 
         const std::uint64_t value = next_fence_value;
@@ -397,7 +400,8 @@ struct D3D12SwapchainHistory::Impl {
 
     [[nodiscard]] HRESULT capture(
         std::uint32_t source_index,
-        D3D12HistoryCaptureTicket* output_ticket) noexcept {
+        D3D12HistoryCaptureTicket* output_ticket,
+        const TwoFrameImageInfo* diagnostic_info) noexcept {
         if (output_ticket == nullptr) {
             return E_POINTER;
         }
@@ -463,6 +467,12 @@ struct D3D12SwapchainHistory::Impl {
         dred_marker(slot.capture_list.Get(), "OFXR history complete");
         slot.ram_gpu.mark(slot.capture_list.Get(),1);
         slot.ram_gpu.resolve(slot.capture_list.Get());
+        if (diagnostic_info != nullptr) {
+            TwoFrameImageInfo image = *diagnostic_info;
+            image.capture_serial = next_serial;
+            two_frame_capture_record_ng_x(image, device.Get(),
+                slot.capture_list.Get(), source, release_state);
+        }
 
         result = slot.capture_list->Close();
         if (FAILED(result)) {
@@ -691,7 +701,8 @@ HRESULT D3D12SwapchainHistory::initialize(
 
 HRESULT D3D12SwapchainHistory::capture(
     std::uint32_t source_index,
-    D3D12HistoryCaptureTicket* ticket) noexcept {
+    D3D12HistoryCaptureTicket* ticket,
+    const TwoFrameImageInfo* diagnostic_info) noexcept {
     try {
         std::scoped_lock lock(mutex_);
         if (impl_ == nullptr) {
@@ -700,7 +711,16 @@ HRESULT D3D12SwapchainHistory::capture(
             }
             return E_UNEXPECTED;
         }
-        return impl_->capture(source_index, ticket);
+        auto& log = bridge_flight_logger();
+        const auto token = log.begin(BridgeFlightOperation::history_capture,
+            reinterpret_cast<std::uintptr_t>(this), source_index);
+        const HRESULT result = impl_->capture(source_index, ticket,
+            diagnostic_info);
+        log.end(token, BridgeFlightOperation::history_capture, result,
+            reinterpret_cast<std::uintptr_t>(this), ticket ? ticket->serial : 0,
+            ticket ? ticket->fence_value : 0);
+        log_gpu_failure(impl_->device.Get(), result, reinterpret_cast<std::uintptr_t>(this));
+        return result;
     } catch (const std::bad_alloc&) {
         if (ticket != nullptr) {
             *ticket = {};

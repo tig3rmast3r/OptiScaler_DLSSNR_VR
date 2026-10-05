@@ -9,6 +9,8 @@
 
 namespace xrfg {
 
+struct TwoFrameImageInfo;
+
 enum class D3D12HistoryInitializationStage : std::uint32_t {
     complete = 0,
     arguments = 1,
@@ -61,7 +63,8 @@ public:
     // caller must fail open rather than overwrite it.
     [[nodiscard]] HRESULT capture(
         std::uint32_t source_index,
-        D3D12HistoryCaptureTicket* ticket) noexcept;
+        D3D12HistoryCaptureTicket* ticket,
+        const TwoFrameImageInfo* diagnostic_info = nullptr) noexcept;
 
     [[nodiscard]] HRESULT commit(const D3D12HistoryCaptureTicket& ticket) noexcept;
 

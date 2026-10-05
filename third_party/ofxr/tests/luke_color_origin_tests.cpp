@@ -1,0 +1,170 @@
+
+#include "xrfg/luke_color_origin.hpp"
+#include <dxgi1_6.h>
+#include <wrl/client.h>
+#include <array>
+#include <iostream>
+#include <stdexcept>
+#include <vector>
+#include <limits>
+
+namespace {
+using Microsoft::WRL::ComPtr;
+unsigned checks{};
+void require(bool condition, const char* message) {
+    ++checks;
+    if (!condition) throw std::runtime_error(message);
+}
+void check(HRESULT result, const char* message) { require(SUCCEEDED(result), message); }
+void stamp(std::vector<float>& row, double start, double scale, std::uint32_t token) {
+    const auto original = [&](int x) {
+        return x >= 0 && x < static_cast<int>(xrfg::kLukeOriginWidth)
+            ? (xrfg::luke_origin_white(token, static_cast<unsigned>(x)) ? 1. : 0.) : .5;
+    };
+    for (std::size_t x=0;x<row.size();++x) {
+        const double source=(x+.5-start)/scale-.5;
+        const auto a=static_cast<int>(std::floor(source));
+        row[x]=static_cast<float>(original(a)+(original(a+1)-original(a))*(source-a));
+    }
+}
+void codec_tests() {
+    require(xrfg::kLukeOriginBits==64 && xrfg::kLukeOriginWidth==256 &&
+        xrfg::kLukeOriginHeight==8, "compact one-band dimensions");
+    for (const auto token : {1u,17u,0x12345678u,0xfedcba98u,UINT32_MAX})
+        for (const double scale : {.5,.75,.9,1.,1.1,1.25,1.5,2.})
+            for (const double offset : {.0,.2,.5,.8}) {
+                std::vector<float> row(1024,.5f);
+                stamp(row,43+offset,scale,token);
+                auto decoded=xrfg::decode_luke_origin_row(row);
+                if (scale == .5 && offset == .5) {
+                    require(!decoded.token, "erased Manchester cells invented identity");
+                    continue;
+                }
+                if (decoded.token!=token || decoded.ambiguous) {
+                    std::cerr << "token=" << token << " scale=" << scale << " offset=" << offset
+                        << " decoded=" << decoded.token << " ambiguous=" << decoded.ambiguous << '\n';
+                }
+                require(decoded.token==token && !decoded.ambiguous,"resampled compact token");
+                for (auto& pixel:row) pixel=static_cast<float>(.4+pixel*(3./255));
+                decoded=xrfg::decode_luke_origin_row(row);
+                require(decoded.token==token && !decoded.ambiguous,"dimmed compact token");
+            }
+    std::vector<float> row(1024,.5f);
+    require(!xrfg::decode_luke_origin_row(row).token,"blank token invented");
+    stamp(row,32,1,0x12345678u);
+    for (unsigned x=32+27*4;x<32+28*4;++x) row[x]=1.f-row[x];
+    require(!xrfg::decode_luke_origin_row(row).token,"CRC corruption accepted");
+    row.assign(1024,.5f);
+    for (unsigned x=0;x<256;++x) row[32+x]=xrfg::luke_origin_white(1,x)?1.f:0.f;
+    for (unsigned x=0;x<256;++x) row[512+x]=xrfg::luke_origin_white(2,x)?1.f:0.f;
+    require(xrfg::decode_luke_origin_row(row).ambiguous,"conflicting tokens accepted");
+    stamp(row,32,1,0);
+    require(!xrfg::decode_luke_origin_row(row).token,"zero token accepted");
+    xrfg::LukeColorOriginLayout layout;
+    require(xrfg::compact_luke_origin_layout(3344,3344,3063,3344,layout),"Horizon crop layout");
+    require(layout.band.x==283 && layout.band.y==2 && layout.band.width==256 &&
+        layout.band.height==8 && layout.scan.width==541 && layout.scan.height==12,"derived corner crop");
+    for (unsigned crop=0;crop<=281;++crop)
+        require(layout.band.x>=crop && layout.band.x+256<=crop+3063,"either-eye crop erases marker");
+    require(xrfg::compact_luke_origin_layout(2048,1400,1700,1200,layout),"vertical crop layout");
+    for (unsigned crop=0;crop<=200;++crop)
+        require(layout.band.y>=crop && layout.band.y+8<=crop+1200,"vertical crop erases band");
+    require(!xrfg::compact_luke_origin_layout(1024,1024,400,1024,layout),"no common crop invented");
+    require(!xrfg::compact_luke_origin_layout(512,8,512,8,layout),"insufficient band margin accepted");
+    require(!xrfg::compact_luke_origin_layout(512,32,1024,32,layout),"upscaled/crop mismatch accepted");
+}
+struct Gpu {
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    Gpu() {
+        ComPtr<IDXGIFactory6> factory; ComPtr<IDXGIAdapter> adapter;
+        check(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())),"DXGI");
+        check(factory->EnumWarpAdapter(IID_PPV_ARGS(adapter.GetAddressOf())),"WARP");
+        check(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(device.GetAddressOf())),"device");
+        const D3D12_COMMAND_QUEUE_DESC desc{};
+        check(device->CreateCommandQueue(&desc,IID_PPV_ARGS(queue.GetAddressOf())),"queue");
+        check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(allocator.GetAddressOf())),"allocator");
+        check(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(list.GetAddressOf())),"list");
+    }
+    ComPtr<ID3D12Resource> texture(unsigned width,unsigned height) {
+        D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+        heap.CreationNodeMask=heap.VisibleNodeMask=1;
+        D3D12_RESOURCE_DESC desc{};desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width=width;desc.Height=height;desc.DepthOrArraySize=desc.MipLevels=desc.SampleDesc.Count=1;
+        desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        ComPtr<ID3D12Resource> result;
+        check(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,
+            nullptr,IID_PPV_ARGS(result.GetAddressOf())),"texture");
+        return result;
+    }
+    void submit() {
+        check(list->Close(),"close");ID3D12CommandList* lists[]{list.Get()};queue->ExecuteCommandLists(1,lists);
+    }
+    void reset() {check(allocator->Reset(),"reset allocator");check(list->Reset(allocator.Get(),nullptr),"reset list");}
+    void transition(ID3D12Resource* color,D3D12_RESOURCE_STATES from,D3D12_RESOURCE_STATES to) {
+        D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition={color,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,from,to};list->ResourceBarrier(1,&b);
+    }
+    void crop(ID3D12Resource* source,ID3D12Resource* destination,unsigned x,unsigned y,unsigned width,unsigned height) {
+        transition(source,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(destination,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION s{},d{};s.pResource=source;s.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        d.pResource=destination;d.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        const D3D12_BOX box{x,y,0,x+width,y+height,1};
+        list->CopyTextureRegion(&d,0,0,0,&s,&box);
+        transition(source,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+        transition(destination,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
+    }
+};
+void gpu_tests() {
+    Gpu gpu;
+    auto source=gpu.texture(1024,64),left=gpu.texture(800,64),right=gpu.texture(800,64);
+    xrfg::configure_luke_color_origin_extent(0,0);
+    require(xrfg::mark_luke_color_origin(gpu.list.Get(),source.Get(),1,D3D12_RESOURCE_STATE_COMMON,
+        gpu.device.Get())==E_PENDING,"startup fabricated unknown viewport");
+    // The first consumer supplies the true color extent; no legacy center/fullheight path.
+    std::uint32_t token{};
+    require(xrfg::read_luke_color_origin(gpu.queue.Get(),left.Get(),&token,D3D12_RESOURCE_STATE_COMMON,5000)
+        ==HRESULT_FROM_WIN32(ERROR_NOT_FOUND) && token==0,"bootstrap invented token");
+    constexpr std::uint32_t first=0x12340000u;
+    for (unsigned frame=1;frame<=75;++frame)
+        check(xrfg::mark_luke_color_origin(gpu.list.Get(),source.Get(),first+frame,
+            D3D12_RESOURCE_STATE_COMMON,gpu.device.Get()),"immutable mark after64");
+    gpu.crop(source.Get(),left.Get(),0,0,800,64);
+    gpu.crop(source.Get(),right.Get(),224,0,800,64);gpu.submit();
+    for (auto* eye : {left.Get(),right.Get()}) {
+        check(xrfg::read_luke_color_origin(gpu.queue.Get(),eye,&token,D3D12_RESOURCE_STATE_COMMON,5000),"cropped eye read");
+        require(token==first+75,"cropped eye token drift");
+    }
+    gpu.reset();
+    check(xrfg::mark_luke_color_origin(gpu.list.Get(),source.Get(),UINT32_MAX,D3D12_RESOURCE_STATE_COMMON,
+        gpu.device.Get()),"full32bit marker");
+    gpu.crop(source.Get(),left.Get(),224,0,800,64);gpu.submit();
+    check(xrfg::read_luke_color_origin(gpu.queue.Get(),left.Get(),&token,D3D12_RESOURCE_STATE_COMMON,5000),"max token read");
+    require(token==UINT32_MAX,"32bit token truncated");
+    ComPtr<ID3D12Fence> gate;
+    check(gpu.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(gate.GetAddressOf())),"gate fence");
+    check(gpu.queue->Wait(gate.Get(),1),"gate reader");
+    token=99;
+    const auto stalled=xrfg::read_luke_color_origin(gpu.queue.Get(),left.Get(),&token,D3D12_RESOURCE_STATE_COMMON,5);
+    check(gate->Signal(1),"release reader gate");
+    require(stalled==HRESULT_FROM_WIN32(WAIT_TIMEOUT) && !token,"stalled read fabricated token");
+    check(xrfg::read_luke_color_origin(gpu.queue.Get(),left.Get(),&token,D3D12_RESOURCE_STATE_COMMON,5000),"read after timeout");
+    require(token==UINT32_MAX,"readback/allocator prematurely reused");
+    // Final Output differs from the intermediate and has an explicit active rectangle.
+    gpu.reset();
+    auto final=gpu.texture(1024,64),active=gpu.texture(800,32);
+    xrfg::configure_luke_color_origin_extent(800,32);
+    check(xrfg::mark_luke_color_origin(gpu.list.Get(),final.Get(),0xfedcba98u,D3D12_RESOURCE_STATE_COMMON,
+        gpu.device.Get(),{64,16,896,32}),"final active rectangle");
+    gpu.crop(final.Get(),active.Get(),160,16,800,32);gpu.submit();
+    check(xrfg::read_luke_color_origin(gpu.queue.Get(),active.Get(),&token,D3D12_RESOURCE_STATE_COMMON,5000),"final active read");
+    require(token==0xfedcba98u,"marker attached to intermediate/incorrect active rectangle");
+}
+}
+int main() {
+    try { codec_tests();gpu_tests();std::cout<<"Compact origin: "<<checks<<" checks PASS\n";return 0; }
+    catch(const std::exception& e) {std::cerr<<"Compact origin FAIL: "<<e.what()<<"\n";return 1;}
+}

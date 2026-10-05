@@ -556,7 +556,12 @@ class ResTrack_Dx12
                                      ID3D12Resource** OutResource);
 
     static void ResourceBarrier(ID3D12GraphicsCommandList* InCommandList, ID3D12Resource* InResource,
-                                D3D12_RESOURCE_STATES InBeforeState, D3D12_RESOURCE_STATES InAfterState);
+                                 D3D12_RESOURCE_STATES InBeforeState, D3D12_RESOURCE_STATES InAfterState);
+
+  public:
+    // OFXR guide snapshots need the real queue that eventually submits the
+    // DLSS command list even when OptiScaler's HUD resource tracking is off.
+    static void EnsureCommandQueueSubmissionHook(ID3D12Device* InDevice);
 
     static SIZE_T GetGPUHandle(ID3D12Device* This, SIZE_T cpuHandle, D3D12_DESCRIPTOR_HEAP_TYPE type);
     static SIZE_T GetCPUHandle(ID3D12Device* This, SIZE_T gpuHandle, D3D12_DESCRIPTOR_HEAP_TYPE type);

@@ -145,6 +145,38 @@ enum class BridgeFlightOperation : std::uint32_t {
     fsr_context_lifecycle,
     fsr_submit_stage,
     fsr_recovery,
+    // Luke/RealVR diagnostic-only contracts. These records connect the
+    // post-ReShade colour capture to its physical OpenXR view, the DLSS guide
+    // consumed with it, and the private swapchain eventually submitted.
+    luke_guide_contract,
+    luke_projection_contract,
+    luke_output_contract,
+    // V23286: immutable application frame serial through both runtime slots.
+    luke_frame_contract,
+    luke_pose_contract,
+    // V23162: breadcrumb each PureDark AFW recording/submission boundary so a
+    // process-ending plugin or driver fault retains the last completed stage.
+    luke_afw_stage,
+    gpu_fence_snapshot,
+    gpu_device_status,
+    // V30013: append-only RAM operation IDs; no image/pose scheduling changes.
+    luke_inline_clock,       // result=XrResult, a=frame, b=XrTime, c=QPC (0 on failure)
+    luke_physical_submit,    // result=boundary*100 or boundary*100+1(return), a=frame,b=time,c=result/count
+    luke_publication_fence,  // result=boundary*100+resource*10+field(0 ready/1 copy target/2 completed)
+    luke_publication_images, // a=frame,b=application swapchain,c=currentIndex<<32|syntheticIndex
+    luke_publication_slots,  // a=frame,b=current private swapchain,c=synthetic private swapchain
+    luke_input_guide,        // result=eye,a=frame,b=publication,c=epoch
+    luke_input_camera,       // result=eye,a=frame,b=publication,c=guide camera hash
+    luke_locate_context,    // result=XrResult,a=latest wait serial,b=requested time,c=space
+    luke_locate_pose,       // result=view,a=latest wait serial,b=requested time,c=pose/FOV hash
+    luke_inline_view,       // result=boundary*100+layer*10+view,a=frame,b=space,c=private swapchain
+    luke_inline_pose_bits,  // result=viewCode*10+component,a=frame,b/c=raw float pairs
+    luke_space_created,    // result=reference type(-1 action),a=space,b=session,c=0
+    luke_space_locate,     // result=XrResult,a=sample ID,b=space,c=base space
+    luke_space_time,       // result=location flags,a=sample ID,b=requested XrTime,c=latest app wait serial
+    luke_render_camera,    // result=eye*100+matrix*10+row,a=guide publication,b/c=4 raw floats
+    luke_temporal_pair,    // result=0,a=producer fence,b=previous capture,c=current capture; result1=destinations
+    luke_temporal_pose,    // result=phase*100+view*10+pair,a=producer fence,b=capture,c=2 raw floats
 };
 
 struct BridgeFlightToken {
@@ -162,6 +194,9 @@ public:
 
     void initialize(const std::filesystem::path& module_directory) noexcept;
     void shutdown() noexcept;
+    // Explicit diagnostic/teardown use only; never called on a render path.
+    void flush() noexcept;
+    [[nodiscard]] bool gpu_instrumentation_enabled() const noexcept { return gpu_instrumentation_enabled_; }
 
     [[nodiscard]] bool enabled() const noexcept;
     [[nodiscard]] bool ram_enabled() const noexcept;
@@ -198,6 +233,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::unique_ptr<RamTimingCapture> ram_;
+    bool gpu_instrumentation_enabled_{};
 };
 
 [[nodiscard]] BridgeFlightLogger& bridge_flight_logger() noexcept;

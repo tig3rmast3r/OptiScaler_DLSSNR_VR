@@ -166,7 +166,73 @@ std::filesystem::path module_directory() noexcept {
     return std::filesystem::path(path.data()).parent_path();
 }
 
+Vec3 rotate(Quaternion q, Vec3 v) noexcept {
+    q = normalize(q);
+    const Vec3 cross_a{
+        q.y * v.z - q.z * v.y,
+        q.z * v.x - q.x * v.z,
+        q.x * v.y - q.y * v.x,
+    };
+    const Vec3 sum{
+        cross_a.x + q.w * v.x,
+        cross_a.y + q.w * v.y,
+        cross_a.z + q.w * v.z,
+    };
+    const Vec3 cross_b{
+        q.y * sum.z - q.z * sum.y,
+        q.z * sum.x - q.x * sum.z,
+        q.x * sum.y - q.y * sum.x,
+    };
+    return {v.x + 2.0F * cross_b.x,
+            v.y + 2.0F * cross_b.y,
+            v.z + 2.0F * cross_b.z};
+}
+
 }  // namespace
+
+bool fsr_generated_array_description(
+    const D3D12_RESOURCE_DESC& destination_description,
+    std::span<const D3D12FsrEyeInput> eyes,
+    D3D12_RESOURCE_DESC* generated_description) noexcept {
+    if (generated_description == nullptr || eyes.empty() ||
+        eyes.size() > kMaximumEyes ||
+        destination_description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        destination_description.DepthOrArraySize == 0) {
+        return false;
+    }
+    D3D12_RESOURCE_DESC description = destination_description;
+    description.Width = 1;
+    description.Height = 1;
+    description.Flags = D3D12_RESOURCE_FLAG_NONE;
+    for (const auto& input : eyes) {
+        if (!input.color || !input.depth || !input.motion_vectors ||
+            input.color_rect.width == 0 || input.color_rect.height == 0 ||
+            input.depth_rect.width == 0 || input.depth_rect.height == 0 ||
+            input.motion_rect.width == 0 || input.motion_rect.height == 0 ||
+            input.output_slice >= description.DepthOrArraySize) {
+            return false;
+        }
+        const std::uint64_t right =
+            static_cast<std::uint64_t>(input.color_rect.offset_x) +
+            input.color_rect.width;
+        const std::uint64_t bottom =
+            static_cast<std::uint64_t>(input.color_rect.offset_y) +
+            input.color_rect.height;
+        const auto color_description = input.color->GetDesc();
+        if (right > color_description.Width ||
+            bottom > color_description.Height ||
+            input.color_slice >= color_description.DepthOrArraySize ||
+            right > std::numeric_limits<UINT>::max() ||
+            bottom > std::numeric_limits<UINT>::max()) {
+            return false;
+        }
+        description.Width = std::max(description.Width, right);
+        description.Height = std::max(
+            description.Height, static_cast<UINT>(bottom));
+    }
+    *generated_description = description;
+    return true;
+}
 
 struct D3D12FsrFrameGenerator::Impl {
     struct Eye {
@@ -249,8 +315,10 @@ struct D3D12FsrFrameGenerator::Impl {
         return S_OK;
     }
 
-    HRESULT ensure_array() noexcept {
-        D3D12_RESOURCE_DESC description = array_description;
+    HRESULT ensure_array(std::span<const D3D12FsrEyeInput> inputs) noexcept {
+        D3D12_RESOURCE_DESC description{};
+        if (!fsr_generated_array_description(
+                array_description, inputs, &description)) return E_INVALIDARG;
         // Keep the generated image in the FSR input colour domain. Cinema
         // colour is the final XR image pulled back to the original guide plane;
         // it is display-encoded before FSR and decoded by the final panel draw.
@@ -454,12 +522,40 @@ struct D3D12FsrFrameGenerator::Impl {
         if (configure(&eye.context, &configure_description.header) !=
             FFX_API_RETURN_OK) return E_FAIL;
 
+        const Vec3 position = input.camera_data_valid
+            ? input.camera_position
+            : input.camera_pose.position;
+        const Vec3 up = input.camera_data_valid
+            ? input.camera_up
+            : rotate(input.camera_pose.orientation, {0.0F, 1.0F, 0.0F});
+        const Vec3 right = input.camera_data_valid
+            ? input.camera_right
+            : rotate(input.camera_pose.orientation, {1.0F, 0.0F, 0.0F});
+        const Vec3 forward = input.camera_data_valid
+            ? input.camera_forward
+            : rotate(input.camera_pose.orientation, {0.0F, 0.0F, -1.0F});
+        ffxDispatchDescFrameGenerationPrepareCameraInfo camera{};
+        camera.header.type =
+            FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO;
+        camera.cameraPosition[0] = position.x;
+        camera.cameraPosition[1] = position.y;
+        camera.cameraPosition[2] = position.z;
+        camera.cameraUp[0] = up.x;
+        camera.cameraUp[1] = up.y;
+        camera.cameraUp[2] = up.z;
+        camera.cameraRight[0] = right.x;
+        camera.cameraRight[1] = right.y;
+        camera.cameraRight[2] = right.z;
+        camera.cameraForward[0] = forward.x;
+        camera.cameraForward[1] = forward.y;
+        camera.cameraForward[2] = forward.z;
         ffxCreateBackendDX12Desc backend{};
         backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
         backend.device = device.Get();
+        camera.header.pNext = &backend.header;
         ffxDispatchDescFrameGenerationPrepare prepare{};
         prepare.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
-        prepare.header.pNext = &backend.header;
+        prepare.header.pNext = &camera.header;
         prepare.commandList = commands;
         prepare.frameID = frame_id;
         prepare.renderSize = {eye.render_width, eye.render_height};
@@ -546,7 +642,7 @@ HRESULT D3D12FsrFrameGenerator::dispatch(
         report_fsr_frame_generation_attempt(false);
         return result;
     }
-    result = impl_->ensure_array();
+    result = impl_->ensure_array(inputs);
     if (FAILED(result)) {
         report_fsr_frame_generation_status(
             FsrFrameGenerationStatus::initialization_failed);
@@ -627,6 +723,18 @@ bool D3D12FsrFrameGenerator::requires_idle_reconfigure(
     std::span<const D3D12FsrEyeInput> inputs) const noexcept {
     if (!impl_ || inputs.empty() || inputs.size() > kMaximumEyes) return false;
     const bool shared_slice = shared_stereo_slice(inputs);
+    D3D12_RESOURCE_DESC required_array{};
+    if (!fsr_generated_array_description(
+            impl_->array_description, inputs, &required_array)) {
+        return false;
+    }
+    if (impl_->generated_array &&
+        (impl_->generated_array->GetDesc().Width != required_array.Width ||
+         impl_->generated_array->GetDesc().Height != required_array.Height ||
+         impl_->generated_array->GetDesc().DepthOrArraySize !=
+             required_array.DepthOrArraySize)) {
+        return true;
+    }
     for (std::size_t eye_index = 0; eye_index < inputs.size(); ++eye_index) {
         const auto context_index = shared_slice
             ? eye_index : inputs[eye_index].output_slice;

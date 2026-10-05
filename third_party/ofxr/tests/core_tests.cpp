@@ -1,12 +1,18 @@
 #include "xrfg/image.hpp"
 #include "xrfg/generation_backpressure.hpp"
 #include "xrfg/pose.hpp"
+#include "xrfg/luke_guide_eye.hpp"
+#include "xrfg/luke_guide_window.hpp"
+#include "xrfg/luke_physical_projection.hpp"
+#include "xrfg/luke_pose_camera.hpp"
+#include "xrfg/luke_world_scale.hpp"
 
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <numbers>
 #include <string_view>
 
@@ -33,6 +39,169 @@ void expect(bool condition, std::string_view description) {
 }  // namespace
 
 int main() {
+    const std::array<float, 16> luke_projection{
+        0.70020777F, 0.0F, 0.0F, 0.0F,
+        0.0F, 0.70020777F, 0.0F, 0.0F,
+        0.0F, 0.0F, 0.0000463724F, -1.0F,
+        0.0F, 0.0F, 0.190008804F, 0.0F};
+    const auto degrees = [](float value) {
+        return value * std::numbers::pi_v<float> / 180.0F;
+    };
+    const auto left_window = xrfg::luke_guide_window(luke_projection,
+        degrees(-54), degrees(40), degrees(44), degrees(-55),
+        3344, 3344, 1672, 1672, 2594, 2803);
+    const auto right_window = xrfg::luke_guide_window(luke_projection,
+        degrees(-40), degrees(54), degrees(44), degrees(-55),
+        3344, 3344, 1672, 1672, 2594, 2803);
+    expect(left_window && right_window && left_window->x == 30 &&
+        right_window->x == 345 && left_window->y == 270 &&
+        right_window->y == 270 && left_window->width == 1297 &&
+        left_window->height == 1402,
+        "Horizon eye guide windows follow projection and physical FOV");
+    const auto double_resolution = xrfg::luke_guide_window(luke_projection,
+        degrees(-54), degrees(40), degrees(44), degrees(-55),
+        6688, 6688, 3344, 3344, 5188, 5606);
+    expect(double_resolution && double_resolution->x == 61 &&
+        double_resolution->y == 541 && double_resolution->width == 2594 &&
+        double_resolution->height == 2803,
+        "guide window scales with resolution instead of using pixel offsets");
+    expect(!xrfg::luke_guide_window(luke_projection,
+        degrees(-54), degrees(40), degrees(44), degrees(-55),
+        3344, 3344, 1672, 1672, 3000, 2803),
+        "mismatched colour extent rejects an unsafe unscaled guide");
+    auto left_physical = luke_projection;
+    auto right_physical = luke_projection;
+    expect(xrfg::luke_physical_eye_projection(left_physical,
+        degrees(-54), degrees(40), degrees(44), degrees(-55)) &&
+        xrfg::luke_physical_eye_projection(right_physical,
+        degrees(-40), degrees(54), degrees(44), degrees(-55)),
+        "source and destination physical projections are computable");
+    const auto projected_x = [](const std::array<float, 16>& matrix,
+        float angle) {
+        const double tangent = std::tan(angle);
+        return (matrix[0] * tangent - matrix[8]) /
+            (matrix[3] * tangent - matrix[11]);
+    };
+    const auto projected_y = [](const std::array<float, 16>& matrix,
+        float angle) {
+        const double tangent = std::tan(angle);
+        return (matrix[5] * tangent - matrix[9]) /
+            (matrix[7] * tangent - matrix[11]);
+    };
+    expect(near(left_physical[0], right_physical[0]) &&
+        left_physical[8] < 0.0F && right_physical[8] > 0.0F &&
+        near(static_cast<float>(projected_x(left_physical, degrees(-54))), -1) &&
+        near(static_cast<float>(projected_x(left_physical, degrees(40))), 1) &&
+        near(static_cast<float>(projected_x(right_physical, degrees(-40))), -1) &&
+        near(static_cast<float>(projected_x(right_physical, degrees(54))), 1) &&
+        near(static_cast<float>(projected_y(left_physical, degrees(44))), 1) &&
+        near(static_cast<float>(projected_y(left_physical, degrees(-55))), -1),
+        "physical-eye projections map each eye's angular edges to NDC edges");
+    auto invalid_physical = luke_projection;
+    expect(!xrfg::luke_physical_eye_projection(invalid_physical,
+        degrees(0), degrees(0), degrees(44), degrees(-55)),
+        "degenerate physical eye FOV is rejected");
+    float game_baseline{};
+    expect(xrfg::luke_game_eye_baseline(0.0643343F, 1.1F,
+        game_baseline) && near(game_baseline, 0.0584857F),
+        "Luke game-eye baseline follows physical IPD divided by WorldScale");
+    expect(!xrfg::luke_game_eye_baseline(0.0643343F, 0.0F,
+        game_baseline), "missing Luke WorldScale rejects AFW camera");
+    constexpr float physical_ipd = 0.06412F;
+    const std::array<float, 3> xr_left{-physical_ipd * 0.5F, 0.0F, 0.0F};
+    const std::array<float, 3> xr_right{physical_ipd * 0.5F, 0.0F, 0.0F};
+    float measured_ipd{};
+    expect(xrfg::luke_xr_eye_baseline(xr_left, xr_right, measured_ipd) &&
+        near(measured_ipd, physical_ipd, 1.0e-6F),
+        "same-call XR eye positions measure physical IPD");
+    for (const float angle : {0.0F, 35.0F, 90.0F, 175.0F, 300.0F}) {
+        const float cosine = std::cos(degrees(angle));
+        const float sine = std::sin(degrees(angle));
+        const std::array<float, 3> center{1.25F + angle * 0.001F,
+            1.7F, -2.1F - angle * 0.002F};
+        const auto moved_eye = [&](float local_x) {
+            return std::array<float, 3>{center[0] + local_x * cosine,
+                center[1], center[2] - local_x * sine};
+        };
+        expect(xrfg::luke_xr_eye_baseline(
+            moved_eye(xr_left[0]), moved_eye(xr_right[0]), measured_ipd) &&
+            near(measured_ipd, physical_ipd, 1.0e-5F),
+            "same-call physical IPD is invariant under common headset translation and yaw");
+    }
+    auto invalid_eye = xr_left;
+    invalid_eye[1] = std::numeric_limits<float>::quiet_NaN();
+    expect(!xrfg::luke_xr_eye_baseline(invalid_eye, xr_right, measured_ipd),
+        "nonfinite XR eye position rejects physical IPD");
+    invalid_eye = xr_right;
+    invalid_eye[2] = std::numeric_limits<float>::infinity();
+    expect(!xrfg::luke_xr_eye_baseline(xr_left, invalid_eye, measured_ipd),
+        "infinite XR eye position rejects physical IPD");
+    expect(!xrfg::luke_xr_eye_baseline(xr_left, xr_left, measured_ipd),
+        "coincident XR eye positions reject physical IPD");
+    expect(!xrfg::luke_xr_eye_baseline({0.0F, 0.0F, 0.0F},
+        {0.005F, 0.0F, 0.0F}, measured_ipd) &&
+        !xrfg::luke_xr_eye_baseline({0.0F, 0.0F, 0.0F},
+        {0.25F, 0.0F, 0.0F}, measured_ipd),
+        "unreasonable XR eye separation rejects physical IPD");
+    auto current_left = xr_left;
+    auto current_right = xr_right;
+    current_left[0] += 0.008F;
+    current_right[0] += 0.008F;
+    float shortened_cross_time{}, lengthened_cross_time{};
+    expect(xrfg::luke_xr_eye_baseline(current_left, xr_right,
+            shortened_cross_time) &&
+        xrfg::luke_xr_eye_baseline(xr_left, current_right,
+            lengthened_cross_time) &&
+        shortened_cross_time < physical_ipd - 0.007F &&
+        lengthened_cross_time > physical_ipd + 0.007F &&
+        xrfg::luke_xr_eye_baseline(current_left, current_right, measured_ipd) &&
+        near(measured_ipd, physical_ipd, 1.0e-6F),
+        "retained cross-time AER peer invents alternating IPD while a same-call pair remains constant");
+    const xrfg::LukeCameraBasis camera_basis{{
+        {1.0F, 0.0F, 0.0F}, {0.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}}};
+    xrfg::LukeCameraBasis peer_basis{};
+    expect(xrfg::luke_destination_camera_basis(yaw(0.0F), yaw(10.0F),
+        camera_basis, peer_basis) &&
+        near(peer_basis[0][0], std::cos(degrees(10))) &&
+        near(peer_basis[0][2], -std::sin(degrees(10))) &&
+        near(peer_basis[2][0], std::sin(degrees(10))),
+        "submitted headset yaw rotates only the generated peer camera");
+    expect(xrfg::luke_destination_camera_basis(yaw(10.0F), yaw(10.0F),
+        camera_basis, peer_basis) && near(peer_basis[0][0], 1.0F) &&
+        near(peer_basis[0][2], 0.0F),
+        "equal submitted orientations preserve stationary stereo");
+    expect(!xrfg::luke_destination_camera_basis({0, 0, 0, 0}, yaw(10.0F),
+        camera_basis, peer_basis), "invalid XR orientation rejects camera");
+    const std::array<float, 3> camera_right{0.27F, 0.96F, 0.01F};
+    const std::array<float, 3> camera_left_position{0.0F, 0.0F, 0.0F};
+    const std::array<float, 3> camera_right_position{0.0162F, 0.0576F, 0.0006F};
+    expect(xrfg::luke_guide_index_for_eye(camera_left_position,
+        camera_right, camera_right_position, camera_right, 0) == 0,
+        "left-first Luke publication selects older left guide");
+    expect(xrfg::luke_guide_index_for_eye(camera_left_position,
+        camera_right, camera_right_position, camera_right, 1) == 1,
+        "left-first Luke publication selects newer right guide");
+    expect(xrfg::luke_guide_index_for_eye(camera_right_position,
+        camera_right, camera_left_position, camera_right, 0) == 1,
+        "right-first Luke publication selects newer left guide");
+    expect(xrfg::luke_guide_index_for_eye(camera_right_position,
+        camera_right, camera_left_position, camera_right, 1) == 0,
+        "right-first Luke publication selects older right guide");
+    expect(!xrfg::luke_guide_index_for_eye(camera_left_position,
+        camera_right, camera_left_position, camera_right, 0),
+        "same-camera publications are not a stereo guide pair");
+    expect(xrfg::luke_guide_index_for_serial_eye(
+        3969, 3970, 3968, 1, 0) == 0,
+        "camera movement cannot skip the expected opposite-eye guide");
+    expect(xrfg::luke_guide_index_for_serial_eye(
+        3972, 3973, 3971, 1, 0) == 0,
+        "the next physical eye selects 3972 before 3973");
+    expect(xrfg::luke_guide_index_for_serial_eye(
+        3966, 3967, 3966, 0, 1) == 1,
+        "one NGX publication cannot be consumed by both eyes");
+    expect(!xrfg::luke_guide_index_for_serial_eye(
+        3972, 3973, 3973, 1, 0),
+        "stale guide pair holds the previous stereo pair");
     const xrfg::Pose start{yaw(0.0F), {0.0F, 1.0F, 2.0F}};
     const xrfg::Pose end{yaw(90.0F), {2.0F, 3.0F, 6.0F}};
     const xrfg::Pose middle = xrfg::interpolate_pose(start, end, 0.5F);

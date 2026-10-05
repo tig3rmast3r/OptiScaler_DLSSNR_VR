@@ -46,6 +46,7 @@ struct OpenXrFpsOverlay::Impl {
     std::filesystem::path ini;
     std::mutex mutex;
     FpsCounter counter;
+    bool afw_active{};
     FpsOverlayPosition position{FpsOverlayPosition::upper_right};
     std::int64_t next_refresh{};
     bool attempted{}, initialized{}, image_valid{}, acquired{}, waited{}, disabled{};
@@ -313,7 +314,9 @@ struct OpenXrFpsOverlay::Impl {
         if (!initialize(eye_width)) return;
         quad.pose.position = {placement.x, placement.y, placement.z};
         quad.size = {placement.width, placement.height};
-        upload(counter.snapshot(now));
+        auto snapshot = counter.snapshot(now);
+        snapshot.afw_active = afw_active;
+        upload(snapshot);
     }
 };
 
@@ -331,6 +334,10 @@ OpenXrFpsOverlay::~OpenXrFpsOverlay() = default;
 void OpenXrFpsOverlay::application_frame(const XrFrameEndInfo* info) noexcept {
     try { std::scoped_lock lock(impl_->mutex); impl_->application_frame(info); }
     catch (...) { /* Overlay is optional: never fail the game's frame. */ }
+}
+void OpenXrFpsOverlay::set_afw_active(bool active) noexcept {
+    std::scoped_lock lock(impl_->mutex);
+    impl_->afw_active = active;
 }
 void OpenXrFpsOverlay::reset_metrics() noexcept {
     std::scoped_lock lock(impl_->mutex);

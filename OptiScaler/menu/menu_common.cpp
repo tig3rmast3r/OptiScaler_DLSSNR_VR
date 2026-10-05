@@ -1,4 +1,4 @@
-﻿#include "pch.h"
+#include "pch.h"
 #include "menu_common.h"
 
 #include <dlssnr/DlssNr.h>
@@ -7006,6 +7006,92 @@ static void RenderOfxrVrFramegenMenu()
     else
     {
         ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F), "Bypass");
+    }
+
+    ImGui::SeparatorText("Luke Ross AFW (PureDark beta.5)");
+    const auto afwStatus = ofxr_bridge::afw_snapshot();
+    auto afw = afwStatus.desired;
+    bool afwChanged = false;
+
+    static constexpr const char* modeLabels[]{
+        "Off (Luke AER only)",
+        "AlternateEyeWarping",
+        "PreviousFrameWarping",
+        "CombinedWarping",
+    };
+    const int modeIndex = std::clamp(afw.mode, 0, 3);
+    if (ImGui::BeginCombo("Framewarp Mode", modeLabels[modeIndex]))
+    {
+        for (int index = 0; index < 4; ++index)
+        {
+            const bool selected = index == modeIndex;
+            if (ImGui::Selectable(modeLabels[index], selected))
+            {
+                afw.mode = index;
+                afwChanged = true;
+            }
+            if (selected)
+                ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+
+    afwChanged |= ImGui::Checkbox("Clear Before Framewarp",
+                                  &afw.clear_before_warping);
+    if (ImGui::Checkbox("Debug Framewarp (F6 / Keypad 6)", &afw.debug))
+        afwChanged = true;
+    if (afw.debug)
+        ImGui::TextColored(ImVec4(0.95F, 0.75F, 0.15F, 1.0F),
+                           "Debug request ON (revision %llu)",
+                           static_cast<unsigned long long>(afwStatus.revision));
+    afwChanged |= ImGui::SliderFloat("Ignore Motion Threshold",
+                                     &afw.ignore_motion_threshold,
+                                     0.0F, 16.0F, "%.2f");
+    const char* depthDilateLabels[]{"Off", "Horizontal 1x3", "Square 3x3"};
+    const int depthDilateMode = std::clamp(afw.depth_dilate_mode, 0, 2);
+    if (ImGui::BeginCombo("Depth Dilate", depthDilateLabels[depthDilateMode]))
+    {
+        for (int index = 0; index < 3; ++index)
+        {
+            const bool selected = index == depthDilateMode;
+            if (ImGui::Selectable(depthDilateLabels[index], selected))
+            {
+                afw.depth_dilate_mode = index;
+                afwChanged = true;
+            }
+            if (selected)
+                ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::TextDisabled("Motion/depth source: NGX ingress, fixed");
+    ImGui::TextDisabled("UEVR object-velocity fixes require Unreal Engine and are unavailable in Horizon");
+
+    if (afwChanged && !ofxr_bridge::request_afw(afw))
+        ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F),
+                           "AFW setting rejected");
+
+    ImGui::Text("AFW output: %llu / %llu projection frames",
+                static_cast<unsigned long long>(afwStatus.ready_frames),
+                static_cast<unsigned long long>(afwStatus.projection_frames));
+    ImGui::Text("Skipped: capture %llu, busy %llu, other %llu",
+                static_cast<unsigned long long>(afwStatus.missing_capture_frames),
+                static_cast<unsigned long long>(afwStatus.busy_frames),
+                static_cast<unsigned long long>(afwStatus.failed_frames));
+    ImGui::Text("PureDark evaluations: %llu / %llu succeeded",
+                static_cast<unsigned long long>(afwStatus.successful_evaluations),
+                static_cast<unsigned long long>(afwStatus.evaluations));
+    if (afwStatus.evaluations != 0)
+    {
+        ImGui::Text("Last guide #%llu: eye %u, MV %ux%u -> %ux%u",
+                    static_cast<unsigned long long>(afwStatus.last_publication),
+                    afwStatus.last_source_eye,
+                    afwStatus.last_motion_width, afwStatus.last_motion_height,
+                    afwStatus.last_output_width, afwStatus.last_output_height);
+        ImGui::Text("Effective MV scale: X %.4f, Y %.4f; HRESULT 0x%08lX",
+                    afwStatus.last_motion_scale_x,
+                    afwStatus.last_motion_scale_y,
+                    static_cast<unsigned long>(afwStatus.last_result));
     }
 
     int overlay = ofxr_bridge::overlay_setting();

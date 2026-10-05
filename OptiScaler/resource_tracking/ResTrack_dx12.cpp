@@ -1,6 +1,8 @@
 #include "pch.h"
 #include "ResTrack_dx12.h"
 
+#include "../ofxr/ofxr_bridge_client.hpp"
+
 #include <Config.h>
 #include <State.h>
 #include <Util.h>
@@ -691,6 +693,8 @@ void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumComm
         {
             o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
             DlssNr::CompleteCommandListSubmission(This, nrReceipts);
+            ofxr_bridge::report_d3d12_submission(
+                This, NumCommandLists, ppCommandLists);
 
             for (size_t i = 0; i < found.size(); i++)
             {
@@ -705,6 +709,8 @@ void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumComm
 
     o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
     DlssNr::CompleteCommandListSubmission(This, nrReceipts);
+    ofxr_bridge::report_d3d12_submission(
+        This, NumCommandLists, ppCommandLists);
 }
 
 #pragma region Heap hooks
@@ -1923,6 +1929,20 @@ void ResTrack_Dx12::HookQueueSubmission(ID3D12Device* device)
 {
     if (device != nullptr)
         HookToQueue(device);
+}
+
+void ResTrack_Dx12::EnsureCommandQueueSubmissionHook(ID3D12Device* InDevice)
+{
+    if (InDevice == nullptr)
+        return;
+    static std::mutex hookMutex;
+    std::lock_guard lock(hookMutex);
+    HookToQueue(InDevice);
+}
+
+void ofxr_bridge::ensure_d3d12_submission_hook(ID3D12Device* device) noexcept
+{
+    ResTrack_Dx12::EnsureCommandQueueSubmissionHook(device);
 }
 
 void ResTrack_Dx12::HookDevice(ID3D12Device* device)

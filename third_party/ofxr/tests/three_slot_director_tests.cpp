@@ -10,6 +10,7 @@ namespace {
 std::mutex test_mutex;
 std::vector<std::pair<unsigned, bool>> presented;
 std::atomic<unsigned> waits{}, begins{}, ends{};
+std::atomic<unsigned> reference_calls{}, action_calls{}, locate_calls{};
 std::atomic<bool> fail_runtime{}, blocked_end{}, entered_end{};
 std::condition_variable test_condition;
 XrTime next_time = 1000000000;
@@ -18,11 +19,19 @@ Microsoft::WRL::ComPtr<ID3D11DeviceContext> readback_context;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> readback;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> auxiliary_readback;
 bool gpu_pixels_correct = true;
+bool terminal_optical_test = false;
+unsigned terminal_real_reads{}, terminal_synthetic_reads{};
 bool three_layer_test{};
 Microsoft::WRL::ComPtr<ID3D11Device> test_device;
 std::unordered_map<XrSwapchain, Microsoft::WRL::ComPtr<ID3D11Texture2D>> auxiliary_outputs;
 std::atomic<unsigned> auxiliary_creates{}, auxiliary_destroys{};
 bool auxiliary_pixels_correct = true;
+
+std::uint32_t terminal_optical_pixel(unsigned frame, unsigned eye, unsigned x, unsigned y) {
+    const unsigned shifted_x = (x + 256 - frame * 4) % 256;
+    const unsigned blue = 32u + ((((shifted_x / 8) ^ (y / 8)) & 1u) ? 96u : 0u);
+    return 0xff000000u | (blue << 16) | ((eye ? 160u : 80u) << 8) | (frame * 24u);
+}
 
 XrResult XRAPI_CALL fake_wait(XrSession, const XrFrameWaitInfo*, XrFrameState* out) {
     ++waits;
@@ -48,7 +57,7 @@ XrResult XRAPI_CALL fake_end(XrSession, const XrFrameEndInfo* info) {
     if (!gpu_outputs.empty() && layer->viewCount) {
         const auto handle = layer->views[0].subImage.swapchain;
         synthetic = reinterpret_cast<std::uintptr_t>(handle) >= 0x910;
-        if (!synthetic) {
+        if (!synthetic || terminal_optical_test) {
             for (unsigned eye = 0; eye != 2; ++eye) {
                 const auto& sub = layer->views[eye].subImage;
                 readback_context->CopyResource(readback.Get(), gpu_outputs.at(sub.swapchain));
@@ -58,7 +67,36 @@ XrResult XRAPI_CALL fake_end(XrSession, const XrFrameEndInfo* info) {
                     continue;
                 }
                 const auto* pixel = static_cast<const unsigned char*>(mapped.pData);
-                gpu_pixels_correct &= pixel[0] == packed / 2 && pixel[1] == (eye ? 160 : 80);
+                if (terminal_optical_test) {
+                    const auto sequence = packed / 2;
+                    if (!synthetic) {
+                        for (unsigned y = 0; y < 128; ++y)
+                            for (unsigned x = 0; x < 256; ++x) {
+                                std::uint32_t actual{};
+                                std::memcpy(&actual, pixel + y * mapped.RowPitch + x * 4, sizeof(actual));
+                                gpu_pixels_correct &= actual == terminal_optical_pixel(sequence, eye, x, y);
+                            }
+                        ++terminal_real_reads;
+                    } else {
+                        // R is spatially constant but changes by 24 each frame;
+                        // B is a checker translated four pixels per production.
+                        // A copied endpoint cannot satisfy this midpoint check.
+                        unsigned interior{}, computed{}; std::uint64_t red_sum{};
+                        gpu_pixels_correct &= sequence > 1;
+                        for (unsigned y = 16; y < 112; ++y)
+                            for (unsigned x = 16; x < 240; ++x) {
+                                const auto* p = pixel + y * mapped.RowPitch + x * 4;
+                                ++interior; red_sum += p[0];
+                                computed += p[0] > (sequence - 1) * 24 && p[0] < sequence * 24;
+                                gpu_pixels_correct &= std::abs(static_cast<int>(p[1]) - (eye ? 160 : 80)) <= 1 &&
+                                    p[3] == 255;
+                            }
+                        const double midpoint_red = sequence * 24.0 - 12.0;
+                        gpu_pixels_correct &= computed > interior * 3 / 4 &&
+                            std::abs(static_cast<double>(red_sum) / interior - midpoint_red) <= 2.0;
+                        ++terminal_synthetic_reads;
+                    }
+                } else gpu_pixels_correct &= pixel[0] == packed / 2 && pixel[1] == (eye ? 160 : 80);
                 readback_context->Unmap(readback.Get(), sub.imageArrayIndex);
             }
         }
@@ -126,13 +164,68 @@ std::shared_ptr<SessionState> session() {
     return state;
 }
 
+void publication_receipt_independence_test(const std::shared_ptr<SessionState>& state,
+    const std::shared_ptr<xrfg::D3D11D3D12SwapchainInterop>& bridge) {
+    Microsoft::WRL::ComPtr<ID3D12Fence> gate;
+    check(SUCCEEDED(state->d3d12_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+        IID_PPV_ARGS(&gate))), "publication test fence");
+    check(SUCCEEDED(state->d3d12_queue->Wait(gate.Get(), 1)), "hold worker publication");
+    xrfg::D3D11PublicationReceipt worker_receipt, producer_receipt;
+    const auto queued = bridge->publish(0, std::nullopt, &worker_receipt);
+    if (FAILED(queued)) {
+        static_cast<void>(gate->Signal(2));
+        check(false, "queue worker receipt");
+    }
+    // A subsequent producer transaction is allowed to queue while A waits.
+    // Keep its completion B blocked even after the worker's A becomes ready.
+    const auto hold_next = state->d3d12_queue->Wait(gate.Get(), 2);
+    if (FAILED(hold_next)) {
+        static_cast<void>(gate->Signal(2));
+        check(false, "hold later producer publication");
+    }
+    std::atomic<bool> worker_finished{false}, producer_finished{false};
+    HRESULT worker_result = E_PENDING, producer_result = E_PENDING;
+    std::thread waiter([&] {
+        worker_result = xrfg::wait_for_d3d11_publication(worker_receipt);
+        worker_finished.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    std::thread producer([&] {
+        producer_result = bridge->prepare_capture(0);
+        if (SUCCEEDED(producer_result)) producer_result = bridge->finish_capture();
+        if (SUCCEEDED(producer_result))
+            producer_result = bridge->publish(kAfwScratchSlot, std::nullopt, &producer_receipt);
+        producer_finished.store(true);
+    });
+    for (unsigned i = 0; i < 200 && !producer_finished.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool producer_not_blocked = producer_finished.load() && !worker_finished.load();
+    static_cast<void>(gate->Signal(1));
+    for (unsigned i = 0; i < 200 && !worker_finished.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool exact_target = worker_finished.load() && producer_finished.load() &&
+        producer_receipt.copy_complete_value > worker_receipt.copy_complete_value &&
+        producer_receipt.fence->GetCompletedValue() < producer_receipt.copy_complete_value;
+    static_cast<void>(gate->Signal(2));
+    waiter.join();
+    producer.join();
+    check(producer_not_blocked && exact_target && SUCCEEDED(worker_result) && SUCCEEDED(producer_result),
+        "worker publication wait blocked producer or followed mutable next-frame completion");
+    check(SUCCEEDED(xrfg::wait_for_d3d11_publication(producer_receipt)), "finish later producer receipt");
+    check(SUCCEEDED(bridge->wait_for_idle()), "publication regression cleanup");
+    std::cout << "Publication receipt: producer queues while worker waits; worker completes before later producer GPU work\n";
+}
+
 template<class Predicate>
 void until(const std::shared_ptr<SessionState>& state, Predicate condition) {
     std::unique_lock lock(state->presenter_mutex);
     check(state->presenter_condition.wait_for(lock, std::chrono::seconds(3), condition), "timed out");
 }
 
-void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = false, bool luke = false, bool gap = false) {
+void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = false, bool luke = false, bool gap = false,
+                  bool afw_slot_probe = false, bool post_afw_packet = false) {
+    terminal_optical_test = post_afw_packet;
+    terminal_real_reads = terminal_synthetic_reads = 0;
     three_layer_test = with_layers;
     auto state = session();
     auto generation = std::make_shared<FrameGenerationSwapchainState>();
@@ -162,7 +255,7 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
         desc.Width = 256; desc.Height = 128; desc.ArraySize = with_layers ? 1 : 2; desc.MipLevels = 1;
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
         desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-        std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, 5> images;
+        std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, 6> images;
         for (auto& image : images)
             check(SUCCEEDED(state->d3d11_device->CreateTexture2D(&desc, nullptr, &image)), "texture");
         test_device = state->d3d11_device;
@@ -192,8 +285,8 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
         };
         const auto initialize_generation = [&](const auto& generation, const auto& images, unsigned base) {
         ID3D11Texture2D* sources[] = {images[0].Get()};
-        ID3D11Texture2D* reals[] = {images[1].Get(), images[2].Get()};
-        ID3D11Texture2D* synthetics[] = {images[3].Get(), images[4].Get()};
+        ID3D11Texture2D* reals[] = {images[1].Get(), images[2].Get(), images[3].Get()};
+        ID3D11Texture2D* synthetics[] = {images[4].Get(), images[5].Get()};
         generation->d3d11_interop = std::make_shared<xrfg::D3D11D3D12SwapchainInterop>();
         auto& interop = generation->d3d11_interop;
         check(SUCCEEDED(interop->initialize(state->d3d11_device.Get(), state->d3d11_context.Get(),
@@ -207,6 +300,18 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
             interop->synthetic_destination_images(), desc.Format, D3D12_RESOURCE_STATE_COMMON,
             xrfg::D3D12OpticalFlowBackend::nvidia)), "NVIDIA synthesis");
         generation->current_images_per_slot = generation->synthetic_images_per_slot = 1;
+        generation->current[kAfwScratchSlot].handle = reinterpret_cast<XrSwapchain>(std::uintptr_t(base+kAfwScratchSlot));
+        gpu_outputs[generation->current[kAfwScratchSlot].handle] = reals[kAfwScratchSlot];
+        if (post_afw_packet) {
+            generation->afw_final_history = std::make_shared<xrfg::D3D12SwapchainHistory>();
+            check(SUCCEEDED(generation->afw_final_history->initialize(state->d3d12_device.Get(),
+                state->d3d12_queue.Get(), interop->current_destination_images(), D3D12_RESOURCE_STATE_COMMON)), "post AFW history");
+            generation->afw_temporal_synthesizer = std::make_shared<xrfg::D3D12FrameSynthesizer>();
+            check(SUCCEEDED(generation->afw_temporal_synthesizer->initialize(state->d3d12_device.Get(),
+                state->d3d12_queue.Get(), generation->afw_final_history, interop->current_destination_images(),
+                interop->synthetic_destination_images(), desc.Format, D3D12_RESOURCE_STATE_COMMON,
+                xrfg::D3D12OpticalFlowBackend::nvidia, {}, true)), "post AFW OFA");
+        }
         for (unsigned i = 0; i != 2; ++i) {
             generation->current[i].handle = reinterpret_cast<XrSwapchain>(std::uintptr_t(base+i));
             generation->synthetic[i].handle = reinterpret_cast<XrSwapchain>(std::uintptr_t(base+0x10+i));
@@ -217,7 +322,8 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
         };
         const auto history = initialize_generation(generation, images, 0x900);
         const auto interop = generation->d3d11_interop;
-        std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, 5> right_images;
+        if (post_afw_packet) publication_receipt_independence_test(state, interop);
+        std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, 6> right_images;
         auto right_generation = std::make_shared<FrameGenerationSwapchainState>();
         std::shared_ptr<xrfg::D3D12SwapchainHistory> right_history;
         if (with_layers) {
@@ -280,7 +386,11 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
             check(XR_SUCCEEDED(wait_for_synthesis_handoff(state)), "GPU worker rendezvous");
             std::vector<std::uint32_t> pixels(256 * 128);
             for (unsigned eye = 0; eye != 2; ++eye) {
-                std::fill(pixels.begin(), pixels.end(), 0xff200000u | ((eye ? 160u : 80u) << 8) | n);
+                if (post_afw_packet) {
+                    for (unsigned y = 0; y < 128; ++y)
+                        for (unsigned x = 0; x < 256; ++x)
+                            pixels[y * 256 + x] = terminal_optical_pixel(n, eye, x, y);
+                } else std::fill(pixels.begin(), pixels.end(), 0xff200000u | ((eye ? 160u : 80u) << 8) | n);
                 if (!with_layers || eye == 0) state->d3d11_context->UpdateSubresource(images[0].Get(), eye, nullptr,
                     pixels.data(), 256 * 4, 0);
                 if (with_layers && eye == 1) state->d3d11_context->UpdateSubresource(right_images[0].Get(), 0, nullptr,
@@ -372,8 +482,280 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
             auto mappings = build_projection_resource_mappings(snapshot);
             check(mappings.ready(), "stereo mappings");
             check(mappings.mappings.size() == (with_layers ? 2 : 1), "split-eye mapping count");
+            if (afw_slot_probe && n == 1) {
+                // Reproduce an OFXR -> AFW transition with independent eye
+                // cursors, including the asymmetric 0/1 state in PID12328.
+                for (unsigned cursors = 0; cursors < 4; ++cursors) {
+                    for (std::size_t eye = 0; eye < mappings.mappings.size(); ++eye) {
+                        const auto& mapping = mappings.mappings[eye];
+                        const auto chain = find_swapchain(mapping.application_swapchain);
+                        const auto gen = chain->frame_generation;
+                        const auto cursor = (cursors >> eye) & 1U;
+                        gen->current_slot = cursor;
+                        gen->synthetic_slot = 1U - cursor;
+                        const auto views = build_reprojection_views(snapshot, mapping);
+                        check(views.has_value(), "AFW slot probe reprojection inputs");
+                        AfwSourceCapture frozen;
+                        {
+                            std::scoped_lock lock(chain->mutex);
+                            check(chain->last_released_capture.has_value(), "AFW admission color missing");
+                            frozen = {gen, *chain->last_released_capture};
+                            // Late producer metadata must not reselect the
+                            // admitted source after preparation starts.
+                            chain->last_released_capture.reset();
+                        }
+                        const auto prepared = prepare_frame_generation(mapping.application_swapchain,
+                            false, *views, 0.5f, false, nullptr, true, nullptr, &frozen);
+                        {
+                            std::scoped_lock lock(chain->mutex);
+                            chain->last_released_capture = frozen.capture;
+                        }
+                        check(prepared.kind == PreparedGenerationKind::prime && prepared.publication_deferred,
+                            "AFW scratch prime not prepared");
+                        check(prepared.current_handle == gen->current[kAfwScratchSlot].handle,
+                            "AFW scratch current handle wrong");
+                        check(prepared.synthetic_handle == gen->synthetic[0].handle,
+                            "AFW synthetic handle wrong");
+                        check(prepared.current_destination_index / gen->current_images_per_slot == kAfwScratchSlot,
+                            "AFW scratch flat destination wrong");
+                        check(gen->current[kAfwScratchSlot].phase == PrivateOwnershipPhase::waited,
+                            "AFW scratch ownership not waited");
+                        check(gen->current[1].phase == PrivateOwnershipPhase::idle,
+                            "AFW scratch modified director output ownership");
+                        check(gen->current_slot == cursor && gen->synthetic_slot == 1U - cursor,
+                            "AFW source changed standalone OFXR ring cursors");
+                        const auto bridge = gen->d3d11_interop;
+                        check(SUCCEEDED(bridge->publish(prepared.current_destination_index, std::nullopt)),
+                            "AFW slot probe publish");
+                        check(bridge->publication_snapshot().current_index == prepared.current_destination_index,
+                            "AFW copy targeted a different slot from release");
+                        check(release_private_image(state.get(), state->dispatch, gen->current[kAfwScratchSlot]),
+                            "AFW slot probe release");
+                        check(gen->current[kAfwScratchSlot].phase == PrivateOwnershipPhase::idle &&
+                              gen->current[1].phase == PrivateOwnershipPhase::idle,
+                            "AFW source left an output image owned");
+                        check(SUCCEEDED(bridge->wait_for_idle()), "AFW slot probe GPU completion");
+                        state->d3d11_context->CopyResource(readback.Get(), gpu_outputs.at(prepared.current_handle));
+                        D3D11_MAPPED_SUBRESOURCE mapped{};
+                        check(SUCCEEDED(state->d3d11_context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped)),
+                            "AFW slot probe pixel readback");
+                        const auto* pixel = static_cast<const unsigned char*>(mapped.pData);
+                        const bool fresh = pixel[0] == n && pixel[1] == (eye ? 160 : 80);
+                        state->d3d11_context->Unmap(readback.Get(), 0);
+                        check(fresh, "AFW scratch slot metadata references stale/wrong-eye pixels");
+                    }
+                }
+                generation->current_slot = generation->synthetic_slot = 0;
+                right_generation->current_slot = right_generation->synthetic_slot = 0;
+                std::cout << "AFW GPU source/publication/release: frozen admission color despite late metadata change, both eyes/four cursor states; fresh pixels verified\n";
+            }
             if (!luke) { std::scoped_lock lock(state->mutex); state->pending_frames.push_back({end.displayTime, 2000000}); }
-            check(XR_SUCCEEDED(layer_end_frame_impl(state->handle, &end)), "actual layer EndFrame");
+            if (post_afw_packet) {
+                PreparedProjectionFrame terminal_prepared;
+                terminal_prepared.kind = PreparedGenerationKind::prime;
+                std::vector<PostAfwFrameInput> packet;
+                for (const auto& mapping : mappings.mappings) {
+                    const auto c = find_swapchain(mapping.application_swapchain);
+                    auto gen = c->frame_generation;
+                    const auto input_views = build_reprojection_views(snapshot, mapping);
+                    check(input_views.has_value(), "post AFW source views");
+                    const auto scratch = prepare_frame_generation(c->handle,
+                        false, *input_views, 0.5f, false, nullptr, true);
+                    check(scratch.kind == PreparedGenerationKind::prime && scratch.publication_deferred,
+                        "post AFW scratch preparation");
+                    xrfg::D3D12HistoryCaptureTicket final_capture{};
+                    xrfg::D3D11PublicationReceipt receipt;
+                    check(SUCCEEDED(gen->d3d11_interop->publish(scratch.current_destination_index,
+                        std::nullopt, &receipt)), "post AFW scratch publication");
+                    check(SUCCEEDED(xrfg::wait_for_d3d11_publication(receipt)), "terminal XR output readiness");
+                    // Deliberately poison the intermediate D3D12 mirror AFTER
+                    // terminal publication. Only a read of the actual XR D3D11
+                    // image can recover the correct pixels for this packet.
+                    HANDLE shared{};
+                    const auto mirror = gen->d3d11_interop->current_destination_images()[scratch.current_destination_index];
+                    check(SUCCEEDED(state->d3d12_device->CreateSharedHandle(mirror, nullptr,
+                        GENERIC_ALL, nullptr, &shared)), "terminal mirror poison handle");
+                    Microsoft::WRL::ComPtr<ID3D11Device1> device1;
+                    Microsoft::WRL::ComPtr<ID3D11Texture2D> alias;
+                    check(SUCCEEDED(state->d3d11_device.As(&device1)), "terminal mirror poison device");
+                    const auto opened = device1->OpenSharedResource1(shared, IID_PPV_ARGS(&alias));
+                    CloseHandle(shared);
+                    check(SUCCEEDED(opened), "terminal mirror poison alias");
+                    std::fill(pixels.begin(), pixels.end(), 0xffeeffffu);
+                    state->d3d11_context->UpdateSubresource(alias.Get(), 0, nullptr, pixels.data(), 256*4, 0);
+                    check(SUCCEEDED(gen->d3d11_interop->capture_published_current(receipt)),
+                        "exact terminal D3D11 snapshot");
+                    check(SUCCEEDED(gen->afw_final_history->capture(scratch.current_destination_index,
+                        &final_capture)), "post AFW capture");
+                    check(SUCCEEDED(gen->d3d11_interop->finish_capture()), "terminal snapshot completion");
+                    check(SUCCEEDED(gen->afw_final_history->commit(final_capture)), "post AFW commit");
+                    const auto identity=make_color_identity(n,final_capture.serial,
+                        gen->current[kAfwScratchSlot].handle,scratch.current_destination_index,
+                        static_cast<std::uint32_t>(packet.size()),0,input_views->front());
+                    check(release_private_image(state.get(), state->dispatch, gen->current[kAfwScratchSlot]),
+                        "post AFW scratch release");
+                    packet.push_back({c->handle, gen->current[kAfwScratchSlot].handle,
+                        gen, final_capture, *input_views,identity});
+                    terminal_prepared.resources.push_back({c->handle, scratch});
+                    // Deliberately remove the AER ticket. The worker must not
+                    // fetch another capture/camera after packet admission.
+                    c->last_released_capture.reset();
+                }
+                GeneratedFrameEndInfo terminal;
+                ProjectionSnapshot terminal_snapshot;
+                check(build_afw_terminal_submission(&end, snapshot, terminal_prepared,
+                    terminal, terminal_snapshot), "single terminal submission builder");
+                if (n == 1) {
+                    auto& terminal_view = terminal.projections.front().views.front();
+                    terminal_view.next = reinterpret_cast<const void*>(0x123);
+                    check(!freeze_completed_afw_frame(state, &terminal.info, terminal_snapshot, packet, n),
+                        "exact-output probe silently stripped projection extension");
+                    terminal_view.next = nullptr;
+                }
+                if (n == 1) {
+                    // A color chain can be generation-eligible at enumeration,
+                    // then appear as a HUD quad. Reproduce the skipped release
+                    // and prove AFW admission classifies it before cold failure,
+                    // allowing the NEXT release to populate its owned image.
+                    auto& aux = auxiliary[0];
+                    aux->frame_generation = std::make_shared<FrameGenerationSwapchainState>();
+                    aux->composition_referenced = false;
+                    check(capture_composition_image(aux, 0) == S_FALSE,
+                        "unclassified generated HUD capture must be skipped");
+                    check(!freeze_completed_afw_frame(state, &terminal.info, terminal_snapshot, packet, n),
+                        "AFW accepted HUD without released capture");
+                    check(aux->composition_referenced,
+                        "AFW ownership cold start never classified auxiliary chain");
+                    std::fill(pixels.begin(), pixels.end(), 0xff203c00u | n);
+                    for (unsigned eye = 0; eye != 2; ++eye)
+                        state->d3d11_context->UpdateSubresource(aux->enumerated_d3d11_images[0].Get(), eye,
+                            nullptr, pixels.data(), 256*4, 0);
+                    check(capture_composition_image(aux, 0) == S_OK,
+                        "classified HUD next release capture");
+                    aux->composition_capture->valid = true;
+                    std::fill(pixels.begin(), pixels.end(), 0xffeeffffu);
+                    for (unsigned eye = 0; eye != 2; ++eye)
+                        state->d3d11_context->UpdateSubresource(aux->enumerated_d3d11_images[0].Get(), eye,
+                            nullptr, pixels.data(), 256*4, 0);
+                    aux->frame_generation.reset();
+                }
+                if (n == 1) {
+                    const auto fill_auxiliary_capture = [&](std::uint32_t value) {
+                        std::fill(pixels.begin(), pixels.end(), value);
+                        for (const auto& aux : auxiliary)
+                            for (unsigned eye = 0; eye != 2; ++eye)
+                                state->d3d11_context->UpdateSubresource(aux->composition_capture->texture.Get(),
+                                    eye, nullptr, pixels.data(), 256*4, 0);
+                    };
+                    const auto read_auxiliary_pixel = [&](const auto& owner) {
+                        const auto& image = owner->submission->composition_images.front();
+                        check(SUCCEEDED(wait_composition_fence(image->fence.Get(), image->ready_value)),
+                            "auxiliary lease pixel readiness");
+                        const auto& texture = image->textures[image->image.acquired_index];
+                        D3D11_TEXTURE2D_DESC desc{}; texture->GetDesc(&desc);
+                        desc.Usage = D3D11_USAGE_STAGING; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                        desc.BindFlags = 0; desc.MiscFlags = 0;
+                        Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+                        check(SUCCEEDED(state->d3d11_device->CreateTexture2D(&desc, nullptr, &staging)),
+                            "auxiliary lease pixel staging");
+                        state->d3d11_context->CopyResource(staging.Get(), texture.Get());
+                        D3D11_MAPPED_SUBRESOURCE mapped{};
+                        check(SUCCEEDED(state->d3d11_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)),
+                            "auxiliary lease pixel readback");
+                        const auto value = *static_cast<const std::uint32_t*>(mapped.pData);
+                        state->d3d11_context->Unmap(staging.Get(), 0);
+                        return value;
+                    };
+                    // A and B remain retained by the director/worker while C
+                    // is frozen BEFORE the normal capacity gate. No old frame
+                    // may be reused to make room for this producer snapshot.
+                    fill_auxiliary_capture(0xff112201u);
+                    auto a = freeze_completed_afw_frame(state, &terminal.info, terminal_snapshot, packet, n);
+                    fill_auxiliary_capture(0xff334402u);
+                    auto b = freeze_completed_afw_frame(state, &terminal.info, terminal_snapshot, packet, n);
+                    fill_auxiliary_capture(0xff556603u);
+                    auto c = freeze_completed_afw_frame(state, &terminal.info, terminal_snapshot, packet, n);
+                    check(a && b && c, "third pre-admission AFW auxiliary lease missing");
+                    const auto handle_a = a->submission->composition_images.front()->image.handle;
+                    const auto handle_b = b->submission->composition_images.front()->image.handle;
+                    const auto handle_c = c->submission->composition_images.front()->image.handle;
+                    check(handle_a != handle_b && handle_a != handle_c && handle_b != handle_c,
+                        "pre-admission auxiliary overwrote a retained endpoint handle");
+                    check(read_auxiliary_pixel(a) == 0xff112201u &&
+                          read_auxiliary_pixel(b) == 0xff334402u &&
+                          read_auxiliary_pixel(c) == 0xff556603u,
+                        "pre-admission auxiliary overwrote retained endpoint pixels");
+                    check(!freeze_completed_afw_frame(state, &terminal.info, terminal_snapshot, packet, n),
+                        "auxiliary pool grew beyond its bounded ownership budget");
+                    a.reset();
+                    fill_auxiliary_capture(0xff778804u);
+                    auto recycled = freeze_completed_afw_frame(state, &terminal.info, terminal_snapshot, packet, n);
+                    check(recycled && recycled->submission->composition_images.front()->image.handle == handle_a,
+                        "released auxiliary lease was not reusable");
+                    check(read_auxiliary_pixel(b) == 0xff334402u &&
+                          read_auxiliary_pixel(c) == 0xff556603u &&
+                          read_auxiliary_pixel(recycled) == 0xff778804u,
+                        "auxiliary recycling contaminated still-retained endpoints");
+                    // Restore the real fixture's released dynamic/static HUD
+                    // colors; application textures remain deliberately poisoned.
+                    for (unsigned i = 0; i != auxiliary.size(); ++i) {
+                        std::fill(pixels.begin(), pixels.end(),
+                            0xff200000u | (60u*(i+1) << 8) | (i ? 55u : n));
+                        for (unsigned eye = 0; eye != 2; ++eye)
+                            state->d3d11_context->UpdateSubresource(auxiliary[i]->composition_capture->texture.Get(),
+                                eye, nullptr, pixels.data(), 256*4, 0);
+                    }
+                    std::cout << "AFW auxiliary pool: three distinct retained colors, bounded fourth rejection, release-only recycling\n";
+                }
+                auto completed = freeze_completed_afw_frame(state, &terminal.info, terminal_snapshot, std::move(packet), n);
+                check(completed && completed->application_serial == n, "completed direct-XR packet freeze");
+                if (n == 1) {
+                    // Reproduce promotion with one eye's inline post-AFW
+                    // prime still on the GPU. The ordinary synthesizer is
+                    // idle, so waiting only for it cannot protect admission.
+                    Microsoft::WRL::ComPtr<ID3D12Fence> promotion_gate;
+                    check(SUCCEEDED(state->d3d12_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                        IID_PPV_ARGS(&promotion_gate))), "AFW promotion fence");
+                    check(SUCCEEDED(state->d3d12_queue->Wait(promotion_gate.Get(), 1)),
+                        "AFW promotion GPU hold");
+                    const auto& right_input = completed->inputs.back();
+                    xrfg::D3D12FrameSynthesisTicket pending_prime{};
+                    const HRESULT prime_result = right_input.generation->afw_temporal_synthesizer->submit_prime(
+                        right_input.capture, right_input.views, 0, &pending_prime);
+                    if (FAILED(prime_result)) {
+                        static_cast<void>(promotion_gate->Signal(1));
+                        check(false, "AFW promotion pending prime");
+                    }
+                    std::atomic<bool> promotion_finished{false};
+                    HRESULT promotion_result = E_PENDING;
+                    std::thread promotion([&] {
+                        promotion_result = wait_for_previous_session_synthesis(state);
+                        promotion_finished.store(true);
+                    });
+                    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                    const bool waited_for_afw = !promotion_finished.load();
+                    static_cast<void>(promotion_gate->Signal(1));
+                    promotion.join();
+                    check(waited_for_afw && SUCCEEDED(promotion_result),
+                        "director promotion ignored outstanding post-AFW GPU work");
+                    check(SUCCEEDED(right_input.generation->afw_temporal_synthesizer->retire_previous()),
+                        "AFW promotion prime retirement");
+                }
+                const auto exact_time = completed->submission->info.displayTime;
+                const auto exact_pose = completed->snapshot.layers.front().views.front().pose;
+                // Poison BEFORE admission: the same direct-XR AFW packet must
+                // reach the worker, not reconstructed caller/session metadata.
+                for (auto& v : views) v.pose.position.y = 99.0f;
+                snapshot.layers.front().views.front().pose.position.y = 88.0f;
+                end.displayTime += 900000000;
+                check(XR_SUCCEEDED(handoff_three_slot_frame(state, &end, snapshot,
+                    mappings.mappings, n > 1, completed)), "post AFW immutable handoff");
+                check(completed->submission->info.displayTime == exact_time &&
+                    completed->snapshot.layers.front().views.front().pose.position.y == exact_pose.position.y,
+                    "consumer changed direct-XR AFW packet");
+            } else {
+                check(XR_SUCCEEDED(layer_end_frame_impl(state->handle, &end)), "actual layer EndFrame");
+            }
             if(luke) {
                 const auto sequence = state->next_source_sequence;
                 const auto anchor = state->previous_projection->display_time;
@@ -404,6 +786,26 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
         }
         check(XR_SUCCEEDED(wait_for_presenter_idle(state)), "GPU pipeline drain");
         stop_continuous_presenter(state);
+        if (post_afw_packet) {
+            for (const auto& gen : {generation, right_generation}) {
+                check(SUCCEEDED(gen->afw_temporal_synthesizer->wait_for_idle()), "post AFW optical drain");
+                bool measured_final_pair = false;
+                for (;;) {
+                    xrfg::D3D12NvidiaGpuTiming optical{};
+                    const HRESULT result = gen->afw_temporal_synthesizer->consume_nvidia_gpu_timing(&optical);
+                    if (result == S_FALSE) break;
+                    check(result == S_OK && optical.previous_serial + 1 == optical.current_serial &&
+                        optical.current_serial >= 2 && optical.current_serial <= 8 &&
+                        optical.eye_count == 1 && optical.eye0_microseconds > 0 &&
+                        optical.total_microseconds >= optical.pack_microseconds + optical.composition_microseconds,
+                        "post AFW synthetic did not execute a measured NVIDIA optical pair");
+                    measured_final_pair |= optical.previous_serial == 7 && optical.current_serial == 8;
+                }
+                check(measured_final_pair, "post AFW final 7/8 optical pair was not measured");
+            }
+            check(terminal_real_reads == 16 && terminal_synthetic_reads == 14,
+                "post AFW optical fixture missed real/synthetic image readback");
+        }
         if(diagnostic) {
             state->frame_capture->shutdown();
             unsigned samples=0,views=0,handoffs=0,submissions=0,consumers=0;
@@ -427,12 +829,20 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
         }
         check(presented == expected && waits == expected.size() && begins == waits && ends == waits, "GPU order/count");
         check(presented.back() == std::pair<unsigned,bool>{8,false}, "GPU final real");
-        check(gpu_pixels_correct, "real image stale or eyes crossed");
+        check(gpu_pixels_correct, "real image stale, synthetic copied an endpoint, or eyes crossed");
         check(auxiliary_pixels_correct, "auxiliary ownership, pixels or metadata changed");
         for (auto& aux : auxiliary) if (aux) destroy_composition_capture(aux);
         check(auxiliary_creates == auxiliary_destroys, "auxiliary swapchain leak");
-        if (with_layers) check(auxiliary_creates == 4, "output pool not bounded to two handles per source");
+        if (with_layers) check(auxiliary_creates == (post_afw_packet ? 6u : 4u),
+            "auxiliary allocation exceeded endpoint/producer ownership budget");
         check(SUCCEEDED(generation->synthesizer->wait_for_idle()), "GPU shutdown");
+        check(SUCCEEDED(interop->wait_for_idle()), "publication shutdown");
+        const auto publication = interop->publication_snapshot();
+        check(publication.fence_identity != 0 && publication.ready_value != 0 &&
+              publication.copy_complete_value > publication.ready_value &&
+              publication.completed_value >= publication.copy_complete_value &&
+              publication.current_index < 2,
+              "V30013 publication snapshot lacks completed copy identity");
         if (with_layers) check(SUCCEEDED(right_generation->synthesizer->wait_for_idle()), "right GPU shutdown");
         { std::scoped_lock lock(g_state_mutex); g_swapchains.clear(); g_sessions.clear(); }
         gpu_outputs.clear(); readback.Reset(); auxiliary_readback.Reset(); readback_context.Reset();
@@ -447,6 +857,141 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
         throw;
     }
 }
+}
+
+void luke_inline_diagnostic_test() {
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"ofxr-v30013-inline-" + std::to_wstring(GetCurrentProcessId()));
+    std::filesystem::create_directories(root);
+    { std::ofstream ini(root / "ofxr_bridge.ini");
+      ini << "[diagnostics]\ntiming_capture=1\npose_cadence_capture=1\n"; }
+    auto& logger = xrfg::bridge_flight_logger();
+    logger.shutdown(); logger.initialize(root);
+    check(logger.ram_enabled() && !logger.enabled(), "inline diagnostic must be RAM only");
+    auto s = session();
+    s->graphics_binding_capabilities = 8;
+    s->next_application_frame_serial = 43;
+    s->dispatch->instance = reinterpret_cast<XrInstance>(0x456);
+    s->dispatch->convert_time_to_qpc = [](XrInstance, XrTime time, LARGE_INTEGER* qpc) -> XrResult {
+        qpc->QuadPart = time / 100 + 1234567; return XR_SUCCESS;
+    };
+    s->dispatch->locate_views = [](XrSession, const XrViewLocateInfo*, XrViewState* state,
+        std::uint32_t capacity, std::uint32_t* count, XrView* views) -> XrResult {
+        *count = 1;
+        state->viewStateFlags = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
+        if (capacity) {
+            views[0].pose.orientation.w = 1.0f;
+            views[0].pose.position.x = -0.032f;
+            views[0].fov = {-0.7f, 0.7f, 0.8f, -0.8f};
+        }
+        return XR_SUCCESS;
+    };
+    { std::scoped_lock lock(g_state_mutex); g_sessions[s->handle] = s; }
+    XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
+    locate.space = reinterpret_cast<XrSpace>(0x123); locate.displayTime = 1000000000;
+    XrView view{XR_TYPE_VIEW}; XrViewState located{XR_TYPE_VIEW_STATE}; std::uint32_t count{};
+    check(layer_locate_views(s->handle, &locate, &located, 1, &count, &view) == XR_SUCCESS &&
+        count == 1 && view.pose.position.x == -0.032f && view.fov.angleUp == 0.8f,
+        "LocateViews observation altered downstream output");
+    XrCompositionLayerProjectionView projection_view{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+    projection_view.pose = view.pose; projection_view.fov = view.fov;
+    projection_view.subImage.swapchain = reinterpret_cast<XrSwapchain>(0xabc);
+    XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    projection.space = locate.space; projection.viewCount = 1; projection.views = &projection_view;
+    const XrCompositionLayerBaseHeader* layers[]{reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection)};
+    XrFrameEndInfo frame_info{XR_TYPE_FRAME_END_INFO};
+    frame_info.displayTime = locate.displayTime; frame_info.layerCount = 1; frame_info.layers = layers;
+    log_luke_physical_boundary(s, &frame_info, 42, 4, nullptr);
+    s->dispatch->wait_frame = [](XrSession, const XrFrameWaitInfo*, XrFrameState* frame) -> XrResult {
+        frame->predictedDisplayTime = 1011111111; frame->predictedDisplayPeriod = 11111111;
+        frame->shouldRender = XR_TRUE; return XR_SUCCESS;
+    };
+    s->dispatch->begin_frame = [](XrSession, const XrFrameBeginInfo*) -> XrResult { return XR_SUCCESS; };
+    s->dispatch->end_frame = [](XrSession, const XrFrameEndInfo* frame) -> XrResult {
+        const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(frame->layers[0]);
+        return frame->displayTime == 1011111111 && projection->views[0].pose.position.x == -0.032f &&
+            projection->views[0].subImage.swapchain == reinterpret_cast<XrSwapchain>(0xabc)
+            ? XR_SUCCESS : XR_ERROR_VALIDATION_FAILURE;
+    };
+    const auto cycle = submit_current_cycle(s, frame_info, 42);
+    check(cycle.completed && cycle.result == XR_SUCCESS && frame_info.displayTime == locate.displayTime,
+          "physical observation changed scheduling, projection pose or caller metadata");
+    reference_calls = action_calls = locate_calls = 0;
+    s->dispatch->create_reference_space = [](XrSession, const XrReferenceSpaceCreateInfo* info,
+        XrSpace* space) -> XrResult {
+        ++reference_calls;
+        *space = reinterpret_cast<XrSpace>(0xdef);
+        return info->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_VIEW &&
+            info->poseInReferenceSpace.orientation.w == 1.0f ? XR_SUCCESS : XR_ERROR_VALIDATION_FAILURE;
+    };
+    s->dispatch->create_action_space = [](XrSession, const XrActionSpaceCreateInfo*,
+        XrSpace* space) -> XrResult { ++action_calls; *space = reinterpret_cast<XrSpace>(0xddd); return XR_SUCCESS; };
+    s->dispatch->locate_space = [](XrSpace space, XrSpace base, XrTime time,
+        XrSpaceLocation* location) -> XrResult {
+        ++locate_calls;
+        if (time == 999) return XR_ERROR_TIME_INVALID;
+        if (space != reinterpret_cast<XrSpace>(0xdef) || base != reinterpret_cast<XrSpace>(0x123) ||
+            time != 1000000000) return XR_ERROR_VALIDATION_FAILURE;
+        location->locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+        location->pose.orientation = {0.0f, 0.0f, 0.6f, 0.8f};
+        location->pose.position = {0.125f, 0.25f, -0.5f};
+        return XR_SUCCESS;
+    };
+    XrReferenceSpaceCreateInfo reference_info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    reference_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+    reference_info.poseInReferenceSpace.orientation.w = 1.0f;
+    XrSpace reference{};
+    check(layer_create_reference_space(s->handle, &reference_info, &reference) == XR_SUCCESS &&
+        reference == reinterpret_cast<XrSpace>(0xdef), "reference space passthrough/ownership");
+    XrActionSpaceCreateInfo action_info{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+    action_info.poseInActionSpace.orientation.w = 1.0f;
+    XrSpace action{};
+    check(layer_create_action_space(s->handle, &action_info, &action) == XR_SUCCESS &&
+        action == reinterpret_cast<XrSpace>(0xddd), "action space passthrough/ownership");
+    XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+    const auto sample_id = g_space_sample_id.load();
+    check(layer_locate_space(reference, locate.space, locate.displayTime, &location) == XR_SUCCESS &&
+        location.pose.position.x == 0.125f && location.pose.orientation.z == 0.6f &&
+        location.pose.orientation.w == 0.8f, "absolute space sample changed runtime pose");
+    const auto retained_pose = location.pose;
+    check(layer_locate_space(reference, locate.space, 999, &location) == XR_ERROR_TIME_INVALID &&
+        location.pose.position.x == retained_pose.position.x,
+        "invalid space sample changed result/output or manufactured valid pose");
+    check(reference_calls == 1 && action_calls == 1 && locate_calls == 2,
+        "space observation issued extra runtime calls");
+    xrfg::DlssMotionVectorFrame guide{};
+    guide.publication = 777; guide.camera_data_valid = true;
+    guide.camera_position = {0.125f, 0.25f, -0.5f};
+    guide.camera_right = {1.0f, 0.0f, 0.0f};
+    guide.camera_up = {0.0f, 1.0f, 0.0f};
+    guide.camera_forward = {0.0f, 0.0f, 1.0f};
+    log_luke_guide_basis(guide);
+    s->dispatch->convert_time_to_qpc = nullptr;
+    log_luke_physical_boundary(s, &frame_info, 43, 4, nullptr);
+    std::filesystem::path saved; std::wstring error;
+    check(xrfg::save_ram_timing(GetCurrentProcessId(), root, &saved, &error), "inline diagnostic save");
+    std::ifstream input(saved); const std::string csv(std::istreambuf_iterator<char>{input}, {});
+    check(csv.find("luke_inline_clock,0,42,1000000000,11234567") != std::string::npos &&
+          csv.find("luke_inline_clock,0,42,1011111111,11345678") != std::string::npos &&
+          csv.find("luke_physical_submit,600,42,1011111111,") != std::string::npos &&
+          csv.find("luke_physical_submit,700,42,1011111111,") != std::string::npos &&
+          csv.find("luke_locate_context,0,42,1000000000,291") != std::string::npos &&
+          csv.find("luke_inline_pose_bits,6000,42,") != std::string::npos,
+          "missing converted clocks, actual second slot, locate identity or raw pose");
+    check(csv.find("luke_inline_clock," + std::to_string(XR_ERROR_FUNCTION_UNSUPPORTED) +
+          ",43,1000000000,0") != std::string::npos, "unsupported clock was silently guessed");
+    check(csv.find("luke_space_created,1,3567,") != std::string::npos &&
+        csv.find("luke_space_created,-1,3549,") != std::string::npos &&
+        csv.find("luke_space_locate,0," + std::to_string(sample_id) + ",3567,291") != std::string::npos &&
+        csv.find("luke_space_time,3," + std::to_string(sample_id) + ",1000000000,42") != std::string::npos &&
+        csv.find("luke_inline_pose_bits,9500," + std::to_string(sample_id) + ",") != std::string::npos &&
+        csv.find("luke_inline_pose_bits,9500," + std::to_string(sample_id + 1) + ",") == std::string::npos &&
+        csv.find("luke_render_camera,200,777,4467570831400108032,13763000462309588992") != std::string::npos,
+        "missing numerical camera/absolute head identity or invalid pose logged as valid");
+    logger.shutdown();
+    { std::scoped_lock lock(g_state_mutex); g_sessions.erase(s->handle);
+      g_observed_spaces.erase(reference); g_observed_spaces.erase(action); }
+    std::cout << "V30013: unchanged LocateViews output; actual second slot, raw poses, calibrated clock and unsupported-clock records verified\n";
 }
 
 void embedded_eligibility_test() {
@@ -531,6 +1076,80 @@ void luke_admission_test() {
     check(luke_pair_decision(mappings).action==A::normal,"non-Luke route changed");
     s->synthesis_busy=false;s->presenter_active=false;
     { std::scoped_lock lock(g_state_mutex);for(auto& c:chains)g_swapchains.erase(c->handle); }
+}
+
+void luke_same_time_baseline_test() {
+    auto& logger = xrfg::bridge_flight_logger();
+    logger.shutdown();
+    check(!logger.ram_enabled(), "baseline regression must run without RAM logging");
+    auto s = session();
+    s->graphics_binding_capabilities = 8;
+    static std::array<XrView, 2> runtime_views;
+    static XrViewStateFlags runtime_flags;
+    static XrResult runtime_result;
+    runtime_views = {XrView{XR_TYPE_VIEW}, XrView{XR_TYPE_VIEW}};
+    for (auto& view : runtime_views) {
+        view.pose.orientation.w = 1.0f;
+        view.fov = {-0.7f, 0.7f, 0.8f, -0.8f};
+    }
+    runtime_views[0].pose.position.x = -0.03206f;
+    runtime_views[1].pose.position.x = 0.03206f;
+    runtime_flags = XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT;
+    runtime_result = XR_SUCCESS;
+    s->dispatch->locate_views = [](XrSession, const XrViewLocateInfo*, XrViewState* out,
+        std::uint32_t capacity, std::uint32_t* count, XrView* views) -> XrResult {
+        *count = 2;
+        out->viewStateFlags = runtime_flags;
+        for (std::uint32_t eye = 0; eye < std::min(capacity, 2u); ++eye)
+            views[eye] = runtime_views[eye];
+        return runtime_result;
+    };
+    { std::scoped_lock lock(g_state_mutex); g_sessions[s->handle] = s; }
+    XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
+    locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    locate.displayTime = 1000000000;
+    const auto sample = [&] {
+        std::array<XrView, 2> output{XrView{XR_TYPE_VIEW}, XrView{XR_TYPE_VIEW}};
+        XrViewState view_state{XR_TYPE_VIEW_STATE};
+        std::uint32_t count{};
+        check(layer_locate_views(s->handle, &locate, &view_state, 2, &count,
+            output.data()) == runtime_result && count == 2 && view_state.viewStateFlags == runtime_flags,
+            "baseline latch changed runtime result/count/flags");
+        for (std::size_t eye = 0; eye < output.size(); ++eye)
+            check(std::memcmp(&output[eye].pose, &runtime_views[eye].pose, sizeof(XrPosef)) == 0 &&
+                std::memcmp(&output[eye].fov, &runtime_views[eye].fov, sizeof(XrFovf)) == 0,
+                "baseline latch modified the application's located pose/FOV");
+    };
+    sample();
+    check(s->luke_xr_eye_baseline && std::abs(*s->luke_xr_eye_baseline - 0.06412f) < 1e-6f,
+        "valid stereo locate did not latch physical IPD without logging");
+    for (auto& view : runtime_views) {
+        view.pose.position.x += 0.17f;
+        view.pose.position.y = -0.3f;
+        view.pose.position.z = 0.42f;
+    }
+    sample();
+    check(s->luke_xr_eye_baseline && std::abs(*s->luke_xr_eye_baseline - 0.06412f) < 1e-6f,
+        "common headset translation contaminated same-time physical IPD");
+    s->luke_xr_eye_baseline.reset();
+    runtime_flags = XR_VIEW_STATE_ORIENTATION_VALID_BIT;
+    sample();
+    check(!s->luke_xr_eye_baseline, "invalid position flags manufactured a baseline");
+    runtime_flags |= XR_VIEW_STATE_POSITION_VALID_BIT;
+    locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO;
+    sample();
+    check(!s->luke_xr_eye_baseline, "non-stereo configuration manufactured a baseline");
+    locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    runtime_result = XR_ERROR_RUNTIME_FAILURE;
+    sample();
+    check(!s->luke_xr_eye_baseline, "failed locate manufactured a baseline");
+    runtime_result = XR_SUCCESS;
+    s->graphics_binding_capabilities = 0;
+    sample();
+    check(!s->luke_xr_eye_baseline, "non-Luke locate acquired an AFW baseline");
+    s->presenter_active = false;
+    { std::scoped_lock lock(g_state_mutex); g_sessions.erase(s->handle); }
+    std::cout << "Luke baseline latch: unchanged poses, translation-invariant IPD, invalid samples rejected without logging\n";
 }
 
 void luke_cycle_clock_test() {
@@ -625,10 +1244,40 @@ void native_stereo_time_match_test() {
     check(state->pending_frames.empty(), "stale pending Native frames survived");
 }
 
+void afw_producer_release_independence_test() {
+    auto s = session();
+    s->luke_afw_enabled = true;
+    s->three_slot_director = true;
+    s->synthesis_busy = true;
+    s->dispatch->release_swapchain_image = [](XrSwapchain,
+        const XrSwapchainImageReleaseInfo*) -> XrResult { return XR_SUCCESS; };
+    XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    auto chain = std::make_shared<SwapchainState>(s, info);
+    chain->frame_generation = std::make_shared<FrameGenerationSwapchainState>();
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool finished = false;
+    XrResult result = XR_ERROR_RUNTIME_FAILURE;
+    std::thread producer([&] {
+        result = release_swapchain_with_identity(chain, nullptr, std::nullopt);
+        { std::scoped_lock lock(mutex); finished = true; }
+        condition.notify_all();
+    });
+    bool independent;
+    { std::unique_lock lock(mutex);
+      independent = condition.wait_for(lock, std::chrono::milliseconds(100), [&] { return finished; }); }
+    // Release a regressed wait before asserting, so a failing test cannot hang.
+    { std::scoped_lock lock(s->presenter_mutex); s->synthesis_busy = false; }
+    s->presenter_condition.notify_all();
+    producer.join();
+    check(independent && XR_SUCCEEDED(result), "AFW producer Release waited for OFXR worker");
+}
+
 int main(int argc, char** argv) {
     auto state = session();
     try {
         native_stereo_time_match_test();
+        afw_producer_release_independence_test();
         check(three_slot_generation_session(state), "Nvidia (new) must select director");
         state->nvidia_new_route = false;
         check(!three_slot_generation_session(state), "Nvidia legacy must exclude director");
@@ -639,9 +1288,21 @@ int main(int argc, char** argv) {
         state->optical_flow_backend = xrfg::D3D12OpticalFlowBackend::fidelity_fx;
         check(!three_slot_generation_session(state), "FidelityFX must exclude NVIDIA director");
         state->optical_flow_backend = xrfg::D3D12OpticalFlowBackend::nvidia;
+        state->luke_afw_enabled = true;
+        check(three_slot_generation_session(state),
+              "Luke AFW must enter the new director after its completed packet");
+        state->nvidia_new_route = false;
+        check(!three_slot_generation_session(state), "Luke legacy must stay inline");
+        check(!queued_nvidia_session(state),
+              "Luke AFW must not enter the NVIDIA queued presenter");
+        state->nvidia_new_route = true;
+        state->luke_afw_enabled = false;
         if (argc > 1) {
             const auto mode = std::string_view(argv[1]);
-            if(mode == "luke-unit") { luke_admission_test(); return 0; }
+            if(mode == "luke-afw-slot") { gpu_pipeline(true, false, false, false, false, true); return 0; }
+            if(mode == "post-afw-packet") { gpu_pipeline(true, false, false, false, false, false, true); return 0; }
+            if(mode == "luke-inline-diagnostic") { luke_inline_diagnostic_test(); return 0; }
+            if(mode == "luke-unit") { luke_admission_test(); luke_same_time_baseline_test(); return 0; }
             if(mode == "luke-clock") { luke_cycle_clock_test(); return 0; }
             if(mode == "luke-gpu") { gpu_pipeline(true,false,false,true); return 0; }
             if(mode == "gap") { gpu_pipeline(true,false,false,false,true); return 0; }

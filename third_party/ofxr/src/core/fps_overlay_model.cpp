@@ -116,7 +116,9 @@ std::vector<std::uint32_t> rasterize_fps_overlay(
     };
     // Premultiplied alpha: transparent black outside opaque digit strokes.
     std::vector<std::uint32_t> pixels(static_cast<std::size_t>(width) * height, 0);
-    const auto status = snapshot.active ? color(64, 235, 112) : color(255, 80, 80);
+    const auto status = !snapshot.active ? color(255, 80, 80)
+        : snapshot.afw_active ? color(50, 140, 255)
+                              : color(64, 235, 112);
     const unsigned scale = std::min(width / 24, height / 12);
     const float rate = std::isfinite(snapshot.submitted_fps) ? snapshot.submitted_fps : 0.0f;
     char text[4]{};

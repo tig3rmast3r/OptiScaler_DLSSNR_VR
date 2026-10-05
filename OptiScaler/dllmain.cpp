@@ -24,7 +24,7 @@
 #include "inputs/FSR2_Vk.h"
 #include "inputs/FSR3_Dx12.h"
 #include "inputs/FG/FSR3_Dx12_FG.h"
-
+#include "inputs/NVNGX_DLSS.h"
 #include <fsr4/FSR4ModelSelection.h>
 
 #include <hooks/Dxgi_Hooks.h>

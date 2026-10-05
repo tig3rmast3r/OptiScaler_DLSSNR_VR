@@ -60,9 +60,13 @@ int main(int argc, char** argv) {
         require(overlay_texture_width(4000) > overlay_texture_width(1600), "resolution adaptation");
         require(overlay_texture_width(1) == 96 && overlay_texture_width(UINT32_MAX) == 336, "texture bounds");
         const auto green = rasterize_fps_overlay(240, 120, snapshot, false);
+        auto afw = snapshot; afw.afw_active = true;
+        const auto blue = rasterize_fps_overlay(240, 120, afw, false);
         auto inactive = snapshot; inactive.active = false;
         const auto red = rasterize_fps_overlay(240, 120, inactive, false);
         require(std::count(green.begin(), green.end(), 0xff70eb40u) > 100, "green glyphs");
+        require(std::count(blue.begin(), blue.end(), 0xffff8c32u) > 100,
+                "AFW plus OFXR must be blue");
         require(std::count(red.begin(), red.end(), 0xff5050ffu) > 100, "red glyphs");
         for (std::size_t i = 0; i < green.size(); ++i) {
             require(green[i] == 0 || green[i] == 0xff70eb40u, "extra text or opaque background");

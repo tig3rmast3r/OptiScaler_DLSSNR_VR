@@ -21,6 +21,7 @@
 
 #include <proxies/NVNGX_Proxy.h>
 #include <diagnostics/DredMarkers.h>
+#include <inputs/NVNGX_DLSS.h>
 
 #include <mutex>
 #include <algorithm>
@@ -334,7 +335,10 @@ std::atomic<bool> g_nrRetirementSignalFailed { false };
 
 void MarkNrRecorded(unsigned int sourceHandleId, ID3D12GraphicsCommandList* commandList)
 {
-    if (commandList == nullptr)
+    // Luke Ross submits the native NGX command list outside the queue path observed by
+    // OptiScaler. V30004 waited forever for a receipt that never arrives; keep the
+    // V23291 native-NGX lifetime contract for that ingress only.
+    if (commandList == nullptr || LukeRossDlssIngress::Detected())
         return;
 
     std::lock_guard<std::mutex> lock(g_nrFlightMutex);
@@ -384,6 +388,8 @@ struct NrRetirementObservation
 bool RetirePreviousNrEvaluate(unsigned int sourceHandleId)
 {
     NrRetirementObservation observation(sourceHandleId);
+    if (LukeRossDlssIngress::Detected())
+        return observation.admitted = true;
     Microsoft::WRL::ComPtr<ID3D12Fence> fence;
     unsigned long long fenceValue = 0;
 

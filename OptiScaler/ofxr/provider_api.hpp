@@ -180,6 +180,29 @@ struct OFXR_DlssGuidePublicationV2 {
     // producer. Appended so older V2 producers and consumers remain ABI-safe
     // through struct_size negotiation.
     ID3D12Device* verified_native_device{};
+    // Optional post-ReShade camera contract. These values must describe the
+    // same game camera that produced depth and motion vectors; an OpenXR HMD
+    // pose is not a substitute for them.
+    float camera_position[3]{};
+    float camera_up[3]{};
+    float camera_right[3]{};
+    float camera_forward[3]{};
+    float camera_fov_vertical{};
+    std::int32_t camera_data_valid{};
+    std::uint32_t output_resource_state{};
+    std::int32_t snapshot_output{};
+    // Exact row-major Streamline projection contract for the frame that
+    // produced these guides. Appended to preserve the V2 prefix ABI.
+    float camera_view_to_clip[16]{};
+    float camera_clip_to_view[16]{};
+    std::int32_t camera_matrices_valid{};
+    // Optional F10-only input colour. Appended to keep the V2 prefix stable.
+    ID3D12Resource* input_color{};
+    std::uint32_t input_color_x{}, input_color_y{};
+    std::uint32_t input_color_width{}, input_color_height{};
+    std::uint32_t input_color_resource_state{
+        static_cast<std::uint32_t>(
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
 };
 
 struct OFXR_DlssGuideStatisticsV2 {

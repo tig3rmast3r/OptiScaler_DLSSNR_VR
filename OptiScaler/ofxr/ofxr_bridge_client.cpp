@@ -2,16 +2,69 @@
 
 #include "ofxr_bridge_client.hpp"
 
+#include "../State.h"
+#include "../hooks/Streamline_Hooks.h"
+#include "../inputs/NVNGX_DLSS.h"
+
 #include "../../third_party/ofxr/include/xrfg/dlss_motion_vectors.hpp"
 #include "../../third_party/ofxr/include/xrfg/embedded_control.hpp"
 #include "../../third_party/ofxr/include/xrfg/fsr_frame_generation.hpp"
+#include "../../third_party/ofxr/include/xrfg/two_frame_capture.hpp"
 
-#include <mutex>
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cmath>
+#include <mutex>
+#include <utility>
 
 namespace {
 
 std::atomic_bool g_embedded_layer_active{false};
+
+struct StreamlineCameraEntry {
+    std::uint32_t frame{};
+    std::array<float, 16> view_to_clip{};
+    std::array<float, 16> clip_to_view{};
+    std::array<float, 3> position{};
+    std::array<float, 3> up{};
+    std::array<float, 3> right{};
+    std::array<float, 3> forward{};
+    float near_plane{};
+    float far_plane{};
+    float fov_vertical{};
+    bool depth_inverted{};
+    bool valid{};
+};
+
+std::mutex g_streamline_camera_mutex;
+std::array<StreamlineCameraEntry, 8> g_streamline_cameras{};
+thread_local StreamlineCameraEntry g_active_streamline_camera{};
+thread_local std::shared_ptr<const xrfg::DlssMotionVectorFrame> g_luke_origin_frame;
+
+bool finite_values(const float* values, std::size_t count) noexcept {
+    if (values == nullptr) return false;
+    for (std::size_t index = 0; index < count; ++index)
+        if (!std::isfinite(values[index])) return false;
+    return true;
+}
+
+float length_squared(const float* value) noexcept {
+    return value[0] * value[0] + value[1] * value[1] +
+        value[2] * value[2];
+}
+
+bool plausible_basis(const float* up, const float* right,
+    const float* forward) noexcept {
+    if (!finite_values(up, 3) || !finite_values(right, 3) ||
+        !finite_values(forward, 3)) return false;
+    const float up_length = length_squared(up);
+    const float right_length = length_squared(right);
+    const float forward_length = length_squared(forward);
+    return up_length > 0.25F && up_length < 2.25F &&
+        right_length > 0.25F && right_length < 2.25F &&
+        forward_length > 0.25F && forward_length < 2.25F;
+}
 
 using GetVersion = std::uint32_t (*)() noexcept;
 using GetControlV1 = int (*)(OFXR_ControlSnapshotV1*) noexcept;
@@ -79,10 +132,11 @@ bool complete(const Dispatch& value) noexcept {
 }
 
 Dispatch current_dispatch() noexcept {
-    // The permanent external OFXR DLL remains the OpenXR-loader bootstrap. In
-    // FSR mode it delegates layer negotiation back into this module, so using
-    // the bootstrap's provider API here would split controls/guides away from
-    // the actual embedded layer instance.
+    // The permanent external OFXR DLL is only the OpenXR-loader bootstrap when
+    // this module is present. It delegates the whole session here before the
+    // initial NVIDIA/FSR selection is known. Never publish DLSS guides or send
+    // a later hot-switch request back to the external bootstrap: both modes
+    // must share this embedded layer instance and its temporal ownership.
     if (g_embedded_layer_active.load(std::memory_order_acquire)) return {};
     std::scoped_lock lock(dispatch_mutex());
     auto& cached = cached_dispatch();
@@ -206,6 +260,66 @@ extern "C" __declspec(dllexport) int OFXR_SetEmbeddedLayerActiveV1(
     return 1;
 }
 
+// Combined-module-only handoff. Luke Ross presents through a D3D11 OpenXR
+// device even though its post-ReShade DLSS guides are produced by the game's
+// D3D12 queue. Returning that exact native queue lets the embedded layer build
+// its D3D11 sharing resources on the guide device instead of an unrelated
+// private D3D12 device. Ordinary OpenXR hosts are deliberately rejected.
+extern "C" __declspec(dllexport) int OFXR_GetLukeRossD3D12ContextV1(
+    ID3D12Device** device,
+    ID3D12CommandQueue** queue) noexcept {
+    if (device != nullptr) *device = nullptr;
+    if (queue != nullptr) *queue = nullptr;
+    if (device == nullptr || queue == nullptr) return 0;
+    try {
+        if (!LukeRossDlssIngress::Detected()) return 0;
+        ID3D12CommandQueue* producer_queue_raw =
+            State::Instance().currentCommandQueue;
+        void* native_queue = nullptr;
+        if (StreamlineHooks::getBorrowedNativeInterface(
+                producer_queue_raw, &native_queue)) {
+            producer_queue_raw = static_cast<ID3D12CommandQueue*>(native_queue);
+        }
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> producer_queue =
+            producer_queue_raw;
+        if (!producer_queue ||
+            producer_queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+            return 0;
+        }
+        Microsoft::WRL::ComPtr<ID3D12Device> producer_device;
+        if (FAILED(producer_queue->GetDevice(
+                IID_PPV_ARGS(producer_device.GetAddressOf())))) {
+            return 0;
+        }
+        // A native queue can still report a Streamline device proxy. Match the
+        // guide ingress's native-device resolution, not merely its adapter.
+        void* native_device = nullptr;
+        if (StreamlineHooks::getBorrowedNativeInterface(producer_device.Get(), &native_device)) {
+            Microsoft::WRL::ComPtr<ID3D12Device> canonical_device;
+            if (FAILED(static_cast<ID3D12Device*>(native_device)->QueryInterface(
+                    IID_PPV_ARGS(canonical_device.GetAddressOf())))) return 0;
+            producer_device = std::move(canonical_device);
+        }
+        if (FAILED(producer_device.CopyTo(device))) return 0;
+        if (FAILED(producer_queue.CopyTo(queue))) {
+            (*device)->Release();
+            *device = nullptr;
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        if (*device != nullptr) {
+            (*device)->Release();
+            *device = nullptr;
+        }
+        if (*queue != nullptr) {
+            (*queue)->Release();
+            *queue = nullptr;
+        }
+        return 0;
+    }
+}
+
 namespace ofxr_bridge {
 
 bool available() noexcept { return true; }
@@ -286,6 +400,15 @@ bool request(const OFXR_ControlSettingsV2& settings) noexcept {
     return api.request_control_v1(&old) != 0;
 }
 
+xrfg::embedded::AfwSnapshot afw_snapshot() noexcept {
+    return xrfg::embedded::afw_snapshot();
+}
+
+bool request_afw(
+    const xrfg::embedded::AfwSettings& settings) noexcept {
+    return xrfg::embedded::request_afw(settings);
+}
+
 bool logging_setting() noexcept {
     const auto api = current_dispatch();
     return complete(api) ? api.get_logging() != 0
@@ -316,12 +439,87 @@ void configure_dlss_guides(bool enabled) noexcept {
     else
         xrfg::configure_dlss_motion_vector_tracking(enabled);
 }
+void cache_streamline_camera(
+    std::uint32_t frame,
+    const float* camera_view_to_clip,
+    const float* camera_clip_to_view,
+    const float* camera_position,
+    const float* camera_up,
+    const float* camera_right,
+    const float* camera_forward,
+    float camera_near,
+    float camera_far,
+    float camera_fov_vertical,
+    bool depth_inverted) noexcept {
+    StreamlineCameraEntry camera{};
+    if (!finite_values(camera_view_to_clip, 16) ||
+        !finite_values(camera_clip_to_view, 16) ||
+        !finite_values(camera_position, 3) ||
+        !plausible_basis(camera_up, camera_right, camera_forward)) return;
+    camera.frame = frame;
+    std::copy_n(camera_view_to_clip, 16, camera.view_to_clip.begin());
+    std::copy_n(camera_clip_to_view, 16, camera.clip_to_view.begin());
+    std::copy_n(camera_position, 3, camera.position.begin());
+    std::copy_n(camera_up, 3, camera.up.begin());
+    std::copy_n(camera_right, 3, camera.right.begin());
+    std::copy_n(camera_forward, 3, camera.forward.begin());
+    camera.near_plane = camera_near;
+    camera.far_plane = camera_far;
+    camera.fov_vertical = camera_fov_vertical;
+    camera.depth_inverted = depth_inverted;
+    camera.valid = true;
+    std::scoped_lock lock(g_streamline_camera_mutex);
+    g_streamline_cameras[frame % g_streamline_cameras.size()] = camera;
+}
+
+void begin_streamline_evaluation(std::uint32_t frame) noexcept {
+    g_active_streamline_camera = {};
+    std::scoped_lock lock(g_streamline_camera_mutex);
+    const auto& candidate =
+        g_streamline_cameras[frame % g_streamline_cameras.size()];
+    if (candidate.valid && candidate.frame == frame)
+        g_active_streamline_camera = candidate;
+}
+
+void end_streamline_evaluation() noexcept {
+    g_active_streamline_camera = {};
+}
+
+bool apply_streamline_camera(
+    OFXR_DlssGuidePublicationV2& publication) noexcept {
+    const auto& camera = g_active_streamline_camera;
+    if (!camera.valid) return false;
+    std::copy(camera.view_to_clip.begin(), camera.view_to_clip.end(),
+              publication.camera_view_to_clip);
+    std::copy(camera.clip_to_view.begin(), camera.clip_to_view.end(),
+              publication.camera_clip_to_view);
+    std::copy(camera.position.begin(), camera.position.end(),
+              publication.camera_position);
+    std::copy(camera.up.begin(), camera.up.end(), publication.camera_up);
+    std::copy(camera.right.begin(), camera.right.end(),
+              publication.camera_right);
+    std::copy(camera.forward.begin(), camera.forward.end(),
+              publication.camera_forward);
+    publication.camera_near = camera.near_plane;
+    publication.camera_far = camera.far_plane;
+    publication.camera_fov_vertical = camera.fov_vertical;
+    publication.depth_inverted = camera.depth_inverted ? 1 : 0;
+    publication.depth_infinite = camera.far_plane == 0.0F ? 1 : 0;
+    publication.camera_data_valid = 1;
+    publication.camera_matrices_valid = 1;
+    return true;
+}
+
 bool publish_dlss_guides(
     const OFXR_DlssGuidePublicationV2& publication,
     ID3D12Device* verifiedProducerDevice) noexcept {
+    g_luke_origin_frame.reset();
     const auto api = current_dispatch();
     if (!complete(api)) {
         xrfg::DlssMotionVectorPublication embedded{};
+        embedded.protect_snapshot_lifetime = LukeRossDlssIngress::Detected();
+        embedded.camera_frame_token = g_active_streamline_camera.frame;
+        embedded.camera_frame_token_valid = g_active_streamline_camera.valid;
         embedded.stream = publication.stream;
         embedded.output = publication.output;
         embedded.motion_vectors = publication.motion_vectors;
@@ -355,13 +553,46 @@ bool publish_dlss_guides(
         embedded.camera_far = publication.camera_far;
         embedded.depth_inverted = publication.depth_inverted != 0;
         embedded.depth_infinite = publication.depth_infinite != 0;
+        std::copy_n(publication.camera_position, 3,
+                    embedded.camera_position.begin());
+        std::copy_n(publication.camera_up, 3, embedded.camera_up.begin());
+        std::copy_n(publication.camera_right, 3,
+                    embedded.camera_right.begin());
+        std::copy_n(publication.camera_forward, 3,
+                    embedded.camera_forward.begin());
+        embedded.camera_fov_vertical = publication.camera_fov_vertical;
+        embedded.camera_data_valid = publication.camera_data_valid != 0;
+        std::copy_n(publication.camera_view_to_clip, 16,
+                    embedded.camera_view_to_clip.begin());
+        std::copy_n(publication.camera_clip_to_view, 16,
+                    embedded.camera_clip_to_view.begin());
+        embedded.camera_matrices_valid =
+            publication.camera_matrices_valid != 0;
+        embedded.output_resource_state =
+            static_cast<D3D12_RESOURCE_STATES>(
+                publication.output_resource_state);
+        embedded.snapshot_output = publication.snapshot_output != 0;
+        embedded.input_color = publication.input_color;
+        embedded.input_color_x = publication.input_color_x;
+        embedded.input_color_y = publication.input_color_y;
+        embedded.input_color_width = publication.input_color_width;
+        embedded.input_color_height = publication.input_color_height;
+        embedded.input_color_resource_state =
+            static_cast<D3D12_RESOURCE_STATES>(
+                publication.input_color_resource_state);
         embedded.verified_producer_device = verifiedProducerDevice;
-        xrfg::publish_dlss_motion_vectors(embedded);
-        return true;
+        const auto frame = xrfg::publish_dlss_motion_vectors(embedded);
+        if (frame && embedded.protect_snapshot_lifetime &&
+            xrfg::embedded::afw_snapshot().desired.mode != 0)
+            g_luke_origin_frame = frame;
+        return frame != nullptr;
     }
     if (api.v2) return api.publish_guides_v2(&publication) != 0;
     const auto old = as_v1(publication);
     return api.publish_vectors_v1(&old) != 0;
+}
+std::shared_ptr<const xrfg::DlssMotionVectorFrame> take_luke_origin_frame() noexcept {
+    return std::exchange(g_luke_origin_frame, {});
 }
 void retire_dlss_guide_stream(std::uint64_t stream) noexcept {
     const auto api = current_dispatch();
@@ -369,6 +600,16 @@ void retire_dlss_guide_stream(std::uint64_t stream) noexcept {
         api.retire_stream(stream);
     else
         xrfg::retire_dlss_motion_vector_stream(stream);
+}
+void report_d3d12_submission(
+    ID3D12CommandQueue* queue,
+    std::uint32_t commandListCount,
+    ID3D12CommandList* const* commandLists) noexcept {
+    xrfg::two_frame_capture_submission(queue, commandListCount, commandLists);
+    // Native verified-device publications use the local registry even when
+    // the embedded API is complete. Its producer receipts must not be skipped.
+    xrfg::report_dlss_motion_vector_submission(
+        queue, commandListCount, commandLists);
 }
 OFXR_DlssGuideStatisticsV2 dlss_guide_statistics() noexcept {
     OFXR_DlssGuideStatisticsV2 value{};

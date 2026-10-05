@@ -14,6 +14,7 @@ enum class FpsOverlayPosition { off, upper_left, upper_right, lower_left, lower_
 struct FpsSnapshot {
     float submitted_fps{};
     bool active{};
+    bool afw_active{};
 };
 
 // Caller serializes access. Fixed storage, monotonic wall-clock measurements;

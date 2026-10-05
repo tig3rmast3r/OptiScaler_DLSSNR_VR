@@ -1,6 +1,7 @@
 #include "xrfg/ram_timing.hpp"
 #include "xrfg/d3d12_ram_timing.hpp"
 #include <windows.h>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -20,7 +21,7 @@ int main(int argc, char** argv) {
         fs::path saved; std::wstring error;
         return xrfg::save_ram_timing(std::stoul(argv[2]),argv[3],&saved,&error) ? 0 : 2;
     }
-    const auto root=fs::temp_directory_path()/(L"xrfg-ram-v222-"+std::to_wstring(GetCurrentProcessId())+
+    const auto root=fs::temp_directory_path()/(L"xrfg-ram-v225-"+std::to_wstring(GetCurrentProcessId())+
         L"-"+std::to_wstring(GetTickCount64()));
     try {
         fs::create_directories(root);
@@ -53,7 +54,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         { std::ofstream ini(root/L"ofxr_bridge.ini");
-          ini<<"[diagnostics]\nlogging_enabled=1\ntiming_capture=1\n"; }
+          ini<<"[diagnostics]\nlogging_enabled=1\ntiming_capture=1\npose_cadence_capture=1\n"; }
         xrfg::BridgeFlightLogger logger; logger.initialize(root);
         require(logger.ram_enabled() && !logger.enabled() && logger.log_path().empty(),"RAM must not enable normal diagnostics");
         using O=xrfg::BridgeFlightOperation;
@@ -67,25 +68,44 @@ int main(int argc, char** argv) {
         require(xrfg::pause_ram_timing(GetCurrentProcessId(),true),"pause failed");
         require(!logger.begin(O::application_wait_frame).sequence,"pause didn't stop records");
         require(xrfg::pause_ram_timing(GetCurrentProcessId(),false),"resume failed");
-        // Force wrap while carrying a predictable payload.
+        // Verify the enlarged ring retains both ends of this payload.
         for(unsigned n=0;n<80000;++n) logger.event(O::three_slot_handoff,0,n,n-1,215);
         fs::path saved; std::wstring error;
         require(xrfg::save_ram_timing(GetCurrentProcessId(),root,&saved,&error),"save failed");
         const auto csv=read(saved);
-        require(csv.find("schema=222")!=std::string::npos &&
+        require(csv.find("schema=225")!=std::string::npos &&
             csv.find("three_slot_handoff,0,79999,79998,215")!=std::string::npos,
-            "wrapped ring payload lost");
-        require(csv.find("three_slot_handoff,0,1,0,215")==std::string::npos,"overwritten ring entry retained");
+            "ring payload lost");
+        require(csv.find("three_slot_handoff,0,1,0,215")!=std::string::npos,"early ring entry lost");
         // Cross-process reader while multiple writer threads are running.
         std::atomic<bool> stop{};
         std::atomic<std::uint64_t> count{};
+        std::atomic<unsigned> registered{}, missing{};
         std::vector<std::jthread> writers;
-        for(unsigned i=0;i<3;++i) writers.emplace_back([&]{
+        // Forty concurrently live owners reproduce V41's 8 mapped + 32 lost
+        // threads. Keep startup owners alive while the late producers arrive.
+        for(unsigned i=0;i<39;++i) writers.emplace_back([&,i]{
+            const auto marker=logger.begin(O::application_wait_frame,9000+i,122,887);
+            if(!marker.sequence) ++missing;
+            logger.end(marker,O::application_wait_frame,0,9000+i,122,887);
+            // Selected AFW identity, optical and compact read telemetry.
+            for(const std::uint64_t stage : {89ULL,90ULL,101ULL,122ULL})
+                logger.event(O::luke_afw_stage,0,stage,9000+i,887);
+            ++registered;
             while(!stop.load()) {
-                auto t=logger.begin(O::timing_worker_run,123,122,0);
-                logger.end(t,O::timing_worker_run,0,123,122,0); ++count;
+                if(i<7) {
+                    auto t=logger.begin(O::timing_worker_run,123,122,0);
+                    logger.end(t,O::timing_worker_run,0,123,122,0); ++count;
+                } else std::this_thread::yield();
             }
         });
+        const auto registration_deadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
+        while(registered.load()!=39 && std::chrono::steady_clock::now()<registration_deadline)
+            std::this_thread::yield();
+        if(registered.load()!=39 || missing.load()!=0) {
+            stop=true; writers.clear();
+            require(false,"late producer threads did not receive independent lanes");
+        }
         wchar_t exe[32768]{}; GetModuleFileNameW(nullptr,exe,32768);
         std::wstring command=L"\""+std::wstring(exe)+L"\" save "+std::to_wstring(GetCurrentProcessId())+
             L" \""+root.wstring()+L"\"";
@@ -101,16 +121,51 @@ int main(int argc, char** argv) {
         require(logger.begin(O::application_end_frame).sequence!=0,"capture did not resume");
         require(xrfg::pause_ram_timing(GetCurrentProcessId(),true),"second pause");
         require(xrfg::save_ram_timing(GetCurrentProcessId(),root,&saved,&error),"save paused");
+        const auto forty_csv=read(saved);
+        require(forty_csv.find("unmapped_threads=0") != std::string::npos,
+            "producer/worker/director writer lanes were dropped");
+        require(forty_csv.find("lane_count=64") != std::string::npos,
+            "snapshot used obsolete eight-lane layout");
+        for(unsigned i=7;i<39;++i)
+            for(const std::uint64_t stage : {89ULL,90ULL,101ULL,122ULL})
+                require(forty_csv.find("luke_afw_stage,0,"+std::to_string(stage)+","+
+                    std::to_string(9000+i)+",887") != std::string::npos,
+                    "late AFW/XR/SR producer stage was lost");
         require(!logger.begin(O::application_wait_frame).sequence,"save changed manual pause state");
         xrfg::pause_ram_timing(GetCurrentProcessId(),false);
         const auto before=std::chrono::steady_clock::now();
         for(unsigned n=0;n<200000;++n) logger.event(O::three_slot_handoff,0,n,0,0);
         const auto us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-before).count();
         std::cout<<"RAM capture record mean (local CPU test, not game validation): "<<us/200000<<" us\n";
+        require(xrfg::save_ram_timing(GetCurrentProcessId(),root,&saved,&error),"wrapped ring save failed");
+        const auto wrapped_csv=read(saved);
+        require(wrapped_csv.find("capacity=262144")!=std::string::npos &&
+            wrapped_csv.find("truncated_window=1")!=std::string::npos &&
+            wrapped_csv.find("three_slot_handoff,0,199999,0,0")!=std::string::npos,
+            "bounded ring did not expose truncation or retain newest event");
         logger.shutdown();
         require(!xrfg::pause_ram_timing(GetCurrentProcessId(),true),"mapping leaked after shutdown");
+        // Retain mature cadence/AFW records and compact read telemetry only.
+        { std::ofstream ini(root/L"ofxr_bridge.ini");
+          ini<<"[diagnostics]\nlogging_enabled=0\ntiming_capture=1\npose_cadence_capture=1\n"; }
+        logger.initialize(root);
+        require(logger.ram_enabled() && !logger.enabled(),"pose profile enabled normal logging");
+        constexpr std::array<std::uint64_t,6> selected{28,71,89,90,101,122};
+        constexpr std::array<std::uint64_t,5> unselected{102,121,200,354,999};
+        for(const auto stage:selected) logger.event(O::luke_afw_stage,-731,stage,812,913);
+        for(const auto stage:unselected) logger.event(O::luke_afw_stage,-732,stage,812,913);
+        require(xrfg::save_ram_timing(GetCurrentProcessId(),root,&saved,&error),"pose profile save failed");
+        const auto pose_csv=read(saved);
+        for(const auto stage:selected)
+            require(pose_csv.find("luke_afw_stage,-731,"+std::to_string(stage)+",812,913") !=
+                std::string::npos,"pose profile filtered compact AFW or cadence telemetry");
+        for(const auto stage:unselected)
+            require(pose_csv.find("luke_afw_stage,-732,"+std::to_string(stage)+",812,913") ==
+                std::string::npos,"pose profile admitted a removed diagnostic stage");
+        logger.shutdown();
+        require(!xrfg::pause_ram_timing(GetCurrentProcessId(),true),"pose mapping leaked after shutdown");
         fs::remove_all(root);
-        std::cout<<"RAM wrap, no disk before save, cross-process concurrent snapshot, pause/resume: PASS\n";
+        std::cout<<"RAM retention, no disk before save, cross-process concurrent snapshot, pause/resume: PASS\n";
         return 0;
     } catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1; }
 }

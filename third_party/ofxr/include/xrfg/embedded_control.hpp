@@ -19,8 +19,51 @@ struct Snapshot {
     unsigned sessions{}, pending{}, bypass{}, ready{}, errors{};
     long last_error{};
 };
+
+// Laboratory-only controls for the embedded Luke Ross / PureDark AFW path.
+// This has an independent revision so changing a warp interpretation never
+// drains or rebuilds the ordinary OFXR synthesis backend.
+struct AfwSettings {
+    int mode{3}; // 0 off, 1 alternate eye, 2 previous frame, 3 combined
+    bool debug{};
+    bool clear_before_warping{};
+    float ignore_motion_threshold{2.5F};
+    int depth_dilate_mode{1}; // 0 off, 1 horizontal 1x3, 2 square 3x3
+    bool operator==(const AfwSettings&) const = default;
+};
+
+struct AfwSnapshot {
+    AfwSettings desired{};
+    std::uint64_t revision{1};
+    std::uint64_t projection_frames{};
+    std::uint64_t ready_frames{};
+    std::uint64_t missing_capture_frames{};
+    std::uint64_t busy_frames{};
+    std::uint64_t failed_frames{};
+    std::uint64_t evaluations{};
+    std::uint64_t successful_evaluations{};
+    std::uint64_t last_publication{};
+    std::uint32_t last_source_eye{};
+    std::uint32_t last_motion_width{};
+    std::uint32_t last_motion_height{};
+    std::uint32_t last_output_width{};
+    std::uint32_t last_output_height{};
+    float last_motion_scale_x{};
+    float last_motion_scale_y{};
+    long last_result{};
+};
+
 Snapshot snapshot();
 bool request(Settings settings); // persists only owned keys; false means INI write failed
+AfwSnapshot afw_snapshot();
+bool request_afw(AfwSettings settings);
+bool toggle_afw_debug();
+void report_afw_prepare(std::int64_t reason);
+void report_afw_evaluation(std::uint64_t publication,
+    std::uint32_t source_eye, std::uint32_t motion_width,
+    std::uint32_t motion_height, std::uint32_t output_width,
+    std::uint32_t output_height, float motion_scale_x,
+    float motion_scale_y, long result);
 std::uint64_t attach();
 void detach(std::uint64_t id);
 void applied(std::uint64_t id, std::uint64_t revision, bool enabled, long error);

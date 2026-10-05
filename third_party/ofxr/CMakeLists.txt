@@ -53,8 +53,16 @@ target_compile_features(xrfg_core PUBLIC cxx_std_20)
 add_executable(xrfg_reference src/reference/main.cpp)
 target_link_libraries(xrfg_reference PRIVATE xrfg_core)
 
+# Separate-process consumer for V30006's RAM-only frame cadence capture.
+# The injected layer never performs a disk write or starts a worker thread.
+add_executable(xrfg_pose_cadence_watch
+    src/reference/pose_cadence_watch.cpp
+    src/common/ram_timing.cpp)
+target_include_directories(xrfg_pose_cadence_watch PRIVATE include)
+target_compile_features(xrfg_pose_cadence_watch PRIVATE cxx_std_20)
+
 if(MSVC)
-    foreach(target xrfg_core xrfg_reference)
+    foreach(target xrfg_core xrfg_reference xrfg_pose_cadence_watch)
         target_compile_options(${target} PRIVATE /W4 /permissive- /EHsc)
         target_compile_definitions(${target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     endforeach()
@@ -62,6 +70,16 @@ endif()
 
 if(XRFG_BUILD_TESTS)
     enable_testing()
+    if(WIN32)
+        add_executable(xrfg_streamline_native_interface_tests tests/streamline_native_interface_tests.cpp)
+        target_include_directories(xrfg_streamline_native_interface_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../OptiScaler/hooks")
+        target_compile_features(xrfg_streamline_native_interface_tests PRIVATE cxx_std_20)
+        target_compile_definitions(xrfg_streamline_native_interface_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        if(MSVC)
+            target_compile_options(xrfg_streamline_native_interface_tests PRIVATE /W4 /permissive- /EHsc)
+        endif()
+        add_test(NAME xrfg_streamline_native_interface_tests COMMAND xrfg_streamline_native_interface_tests)
+    endif()
     add_executable(xrfg_two_output_schedule_tests tests/two_output_schedule_tests.cpp)
     target_include_directories(xrfg_two_output_schedule_tests PRIVATE include)
     target_compile_features(xrfg_two_output_schedule_tests PRIVATE cxx_std_20)
@@ -70,6 +88,10 @@ if(XRFG_BUILD_TESTS)
     target_include_directories(xrfg_midpoint_schedule_tests PRIVATE include)
     target_compile_features(xrfg_midpoint_schedule_tests PRIVATE cxx_std_20)
     add_test(NAME xrfg_midpoint_schedule_tests COMMAND xrfg_midpoint_schedule_tests)
+    add_executable(xrfg_luke_color_token_tests tests/luke_color_token_tests.cpp)
+    target_include_directories(xrfg_luke_color_token_tests PRIVATE include)
+    target_compile_features(xrfg_luke_color_token_tests PRIVATE cxx_std_20)
+    add_test(NAME xrfg_luke_color_token_tests COMMAND xrfg_luke_color_token_tests)
     include("${CMAKE_CURRENT_SOURCE_DIR}/../../tests/ofxr_host_tests.cmake")
     add_executable(xrfg_fsr_cadence_probe_tests tests/fsr_cadence_probe_tests.cpp)
     target_include_directories(xrfg_fsr_cadence_probe_tests PRIVATE include)
@@ -160,6 +182,8 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     set(XRFG_NVIDIA_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_bidirectional_synthesize_midpoint_pixel_shader.hpp")
     set(XRFG_NVIDIA_FAST_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_fast_synthesize_midpoint_pixel_shader.hpp")
     set(XRFG_NVIDIA_FAST_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_fast_bidirectional_synthesize_midpoint_pixel_shader.hpp")
+    set(XRFG_LUKE_DEPTH_CONVERT_HEADER "${XRFG_GENERATED_SHADER_DIR}/luke_depth_convert_shader.hpp")
+    set(XRFG_LUKE_COMPOSE_MOTION_HEADER "${XRFG_GENERATED_SHADER_DIR}/luke_compose_motion_shader.hpp")
     add_custom_command(
         OUTPUT
             "${XRFG_GAME_MOTION_SYNTHESIZE_PIXEL_HEADER}"
@@ -177,6 +201,8 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             "${XRFG_NVIDIA_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}"
             "${XRFG_NVIDIA_FAST_SYNTHESIZE_PIXEL_HEADER}"
             "${XRFG_NVIDIA_FAST_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}"
+            "${XRFG_LUKE_DEPTH_CONVERT_HEADER}"
+            "${XRFG_LUKE_COMPOSE_MOTION_HEADER}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${XRFG_GENERATED_SHADER_DIR}"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E SynthesizeGameMotionMidpointPS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
@@ -238,19 +264,33 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_NVIDIA_FAST_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}" /Vn g_xrfg_nvidia_fast_bidirectional_synthesize_midpoint_pixel_shader
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+        COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E ConvertLukeDepth
+            /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
+            /Fh "${XRFG_LUKE_DEPTH_CONVERT_HEADER}" /Vn g_xrfg_luke_depth_convert_shader
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/luke_depth_convert.hlsl"
+        COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E ComposeLukeSameEyeMotion
+            /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
+            /Fh "${XRFG_LUKE_COMPOSE_MOTION_HEADER}" /Vn g_xrfg_luke_compose_motion_shader
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/luke_compose_motion.hlsl"
         DEPENDS
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/fsr_cinema_projection.hlsl"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/luke_depth_convert.hlsl"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/luke_compose_motion.hlsl"
         VERBATIM)
 
     add_library(xrfg_d3d12_history STATIC
         "${XRFG_GAME_MOTION_SYNTHESIZE_PIXEL_HEADER}"
         src/common/dlss_motion_vectors.cpp
+        src/common/two_frame_capture.cpp
         src/common/fsr_frame_generation.cpp
         src/d3d11/d3d11_d3d12_interop.cpp
+        src/d3d11/d3d11_color_identity.cpp
         src/d3d12/d3d12_history.cpp
         src/d3d12/d3d12_fsr_frame_generator.cpp
         src/d3d12/d3d12_frame_synthesizer.cpp
+        src/d3d12/luke_afw.cpp
+        src/d3d12/luke_color_origin.cpp
         "${XRFG_PACK_INPUT_HEADER}"
         "${XRFG_FULLSCREEN_VERTEX_HEADER}"
         "${XRFG_SYNTHESIZE_PIXEL_HEADER}"
@@ -262,7 +302,9 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         "${XRFG_NVIDIA_SYNTHESIZE_PIXEL_HEADER}"
         "${XRFG_NVIDIA_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}"
         "${XRFG_NVIDIA_FAST_SYNTHESIZE_PIXEL_HEADER}"
-        "${XRFG_NVIDIA_FAST_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}")
+        "${XRFG_NVIDIA_FAST_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}"
+        "${XRFG_LUKE_DEPTH_CONVERT_HEADER}"
+        "${XRFG_LUKE_COMPOSE_MOTION_HEADER}")
     target_include_directories(xrfg_d3d12_history
         PUBLIC include
         PRIVATE
@@ -275,6 +317,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     target_link_libraries(xrfg_d3d12_history PUBLIC
         xrfg_core
         d3d11
+        d3dcompiler
         d3d12
         dxgi
         "${XRFG_FIDELITYFX_OPTICALFLOW_LIBRARY}"
@@ -485,6 +528,19 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         add_executable(xrfg_three_slot_director_tests
             tests/three_slot_director_tests.cpp
             src/common/embedded_control.cpp)
+        add_executable(xrfg_d3d11_color_identity_tests tests/d3d11_color_identity_tests.cpp)
+        add_executable(xrfg_luke_color_origin_tests tests/luke_color_origin_tests.cpp src/d3d12/luke_color_origin.cpp)
+        target_include_directories(xrfg_luke_color_origin_tests PRIVATE include)
+        target_compile_features(xrfg_luke_color_origin_tests PRIVATE cxx_std_20)
+        target_compile_definitions(xrfg_luke_color_origin_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        target_link_libraries(xrfg_luke_color_origin_tests PRIVATE d3d12 dxgi xrfg_bridge_flight_logger)
+        add_test(NAME xrfg_luke_color_origin COMMAND xrfg_luke_color_origin_tests)
+        set_tests_properties(xrfg_luke_color_origin PROPERTIES TIMEOUT 30)
+        target_link_libraries(xrfg_d3d11_color_identity_tests PRIVATE xrfg_d3d12_history)
+        target_compile_features(xrfg_d3d11_color_identity_tests PRIVATE cxx_std_20)
+        target_compile_definitions(xrfg_d3d11_color_identity_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        add_test(NAME xrfg_d3d11_color_identity COMMAND xrfg_d3d11_color_identity_tests)
+        set_tests_properties(xrfg_d3d11_color_identity PROPERTIES TIMEOUT 30)
         target_include_directories(xrfg_three_slot_director_tests PRIVATE
             include "${XRFG_OPENXR_SDK_ROOT}/include")
         target_compile_features(xrfg_three_slot_director_tests PRIVATE cxx_std_20)
@@ -496,6 +552,11 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             xrfg_fps_overlay xrfg_implicit_layer psapi xrfg_frame_capture)
         add_test(NAME xrfg_three_slot_director_tests COMMAND xrfg_three_slot_director_tests)
         add_test(NAME xrfg_luke_admission COMMAND xrfg_three_slot_director_tests luke-unit)
+        add_test(NAME xrfg_luke_inline_diagnostic COMMAND xrfg_three_slot_director_tests luke-inline-diagnostic)
+        add_test(NAME xrfg_luke_afw_output_slot COMMAND xrfg_three_slot_director_tests luke-afw-slot)
+        add_test(NAME xrfg_luke_post_afw_director_packet COMMAND xrfg_three_slot_director_tests post-afw-packet)
+        set_tests_properties(xrfg_luke_post_afw_director_packet PROPERTIES TIMEOUT 30)
+        set_tests_properties(xrfg_luke_afw_output_slot PROPERTIES TIMEOUT 30)
         add_test(NAME xrfg_luke_cycle_clock COMMAND xrfg_three_slot_director_tests luke-clock)
         set_tests_properties(xrfg_luke_cycle_clock PROPERTIES TIMEOUT 10)
         add_test(NAME xrfg_luke_gpu_pipeline COMMAND xrfg_three_slot_director_tests luke-gpu)
@@ -724,6 +785,8 @@ if(WIN32 AND XRFG_BUILD_LAYER)
                 WIN32_LEAN_AND_MEAN)
         endif()
         add_test(NAME xrfg_d3d12_history_tests COMMAND xrfg_d3d12_history_tests)
+        add_test(NAME xrfg_luke_protected_guides COMMAND xrfg_d3d12_history_tests protected-guides)
+
 
 
         add_executable(xrfg_vertical_fov_tests tests/vertical_fov_tests.cpp)

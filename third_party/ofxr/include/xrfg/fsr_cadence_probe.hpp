@@ -47,7 +47,7 @@ public:
         try {
             const auto ini = directory / L"ofxr_bridge.ini";
             enabled_ = GetPrivateProfileIntW(L"diagnostics", L"cadence_logging_enabled", 0, ini.c_str()) != 0;
-            marker_ = GetPrivateProfileIntW(L"diagnostics", L"synthetic_marker_enabled", -1, ini.c_str());
+            marker_ = GetPrivateProfileIntW(L"diagnostics", L"synthetic_marker_enabled", 0, ini.c_str());
             if (!enabled_) return;
             SYSTEMTIME now{}; GetLocalTime(&now);
             wchar_t name[160]{};
@@ -62,8 +62,8 @@ public:
     FsrCadenceProbe(const FsrCadenceProbe&) = delete;
     FsrCadenceProbe& operator=(const FsrCadenceProbe&) = delete;
 
-    bool marker_enabled(bool full_logging) const noexcept {
-        return marker_ < 0 ? (full_logging || enabled_) : marker_ != 0;
+    bool marker_enabled() const noexcept {
+        return marker_ > 0;
     }
     void generated(bool marker) noexcept {
         if (!enabled_) return;
