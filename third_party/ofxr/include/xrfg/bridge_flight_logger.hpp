@@ -186,6 +186,9 @@ enum class BridgeFlightOperation : std::uint32_t {
     process_excluded,
     vulkan_negotiation,
     vulkan_bridge,
+    compositor_vsync,
+    compositor_presentation,
+    compositor_timeline,
 };
 
 struct BridgeFlightToken {

@@ -734,6 +734,12 @@ SteamVrDelivery::settled_frames() noexcept {
                 ? timing.m_nFrameIndex - impl_->settled_last_index - 1
                 : 0;
             frame.reprojection_flags = timing.m_nReprojectionFlags;
+            frame.total_render_gpu_us = static_cast<std::uint32_t>(
+                std::clamp(static_cast<double>(timing.m_flTotalRenderGpuMs) * 1000.0,
+                    0.0, 1'000'000'000.0));
+            frame.compositor_render_gpu_us = static_cast<std::uint32_t>(
+                std::clamp(static_cast<double>(timing.m_flCompositorRenderGpuMs) * 1000.0,
+                    0.0, 1'000'000'000.0));
             frame.ready_vsyncs = timing.m_nNumVSyncsReadyForUse;
             frame.vsyncs_to_first_view = timing.m_nNumVSyncsToFirstView;
             frame.system_time_seconds = timing.m_flSystemTimeInSeconds;

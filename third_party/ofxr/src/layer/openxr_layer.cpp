@@ -606,6 +606,7 @@ struct SessionState {
     std::mutex logged_view_rects_mutex;
     std::unordered_map<XrSwapchain, std::array<std::optional<std::array<std::uint64_t, 3>>, 4>> logged_view_rects;
     std::unique_ptr<xrfg::SteamVrDelivery> steamvr_delivery;
+    std::chrono::steady_clock::time_point compositor_diagnostic_next_poll{};
     std::uint32_t application_frames_submitted{};
     // The D3D11 bridge. The application bound D3D11; the runtime was handed
     // a D3D12 session on the layer's own device, so from here on the session
@@ -1009,6 +1010,50 @@ private:
     bool outermost_{};
     std::chrono::steady_clock::time_point entered_{};
 };
+
+// Observer only: compositor records never feed this variant's pacing policy.
+// Poll on the application frame thread, at most four times a second, and only
+// while diagnostics are enabled. Session establishment remains the D33 gate.
+void log_compositor_delivery(SessionState& state) noexcept {
+    if (!xrfg::bridge_flight_logger().enabled() || !state.steamvr_delivery) return;
+    try {
+        const auto now = std::chrono::steady_clock::now();
+        if (now < state.compositor_diagnostic_next_poll) return;
+        state.compositor_diagnostic_next_poll = now + std::chrono::milliseconds(250);
+        const auto pack = [](float ms) -> std::uint64_t {
+            return static_cast<std::uint64_t>(std::clamp(
+                static_cast<double>(ms) * 100.0 + 32768.0, 0.0, 65535.0));
+        };
+        auto& logger = xrfg::bridge_flight_logger();
+        if (const auto vsync = state.steamvr_delivery->vsync_anchor()) {
+            logger.event(xrfg::BridgeFlightOperation::compositor_vsync, 0,
+                vsync->frame_counter,
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                    vsync->at.time_since_epoch()).count()),
+                static_cast<std::uint64_t>(vsync->cost.count()));
+        }
+        for (const auto& frame : state.steamvr_delivery->settled_frames()) {
+            logger.event(xrfg::BridgeFlightOperation::compositor_presentation,
+                frame.mispresented, frame.frame_index,
+                static_cast<std::uint64_t>(frame.reprojection_flags) |
+                    (static_cast<std::uint64_t>(frame.skipped) << 32),
+                static_cast<std::uint64_t>(frame.presents) |
+                    (static_cast<std::uint64_t>(frame.dropped) << 32));
+            logger.event(xrfg::BridgeFlightOperation::compositor_timeline, 0,
+                frame.frame_index,
+                static_cast<std::uint64_t>(std::max(0.0, frame.system_time_seconds) * 1e6),
+                pack(frame.wait_get_poses_called_ms) |
+                    (pack(frame.new_frame_ready_ms) << 16) |
+                    (pack(frame.compositor_render_start_ms) << 32));
+            logger.event(xrfg::BridgeFlightOperation::compositor_timeline, 1,
+                frame.frame_index,
+                static_cast<std::uint64_t>(frame.total_render_gpu_us) |
+                    (static_cast<std::uint64_t>(frame.compositor_render_gpu_us) << 32),
+                static_cast<std::uint64_t>(frame.ready_vsyncs) |
+                    (static_cast<std::uint64_t>(frame.vsyncs_to_first_view) << 32));
+        }
+    } catch (...) {} // An optional observer cannot fail an application frame.
+}
 
 // The gate covers exactly one call into the runtime, so a call is what it
 // takes. Several frame submissions reach the runtime through the overlay
@@ -10999,6 +11044,7 @@ XrResult layer_end_frame_impl(
         state->application_frames_submitted < 100 &&
         ++state->application_frames_submitted == 100)
         state->steamvr_delivery->mark_established();
+    log_compositor_delivery(*state);
     const auto application_end_now = std::chrono::steady_clock::now();
     const bool frame_had_overlapping_wait =
         state->application_frame_has_overlapping_wait;
