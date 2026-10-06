@@ -85,4 +85,15 @@ bool marker_setting();
 bool set_marker_setting(bool enabled);
 int overlay_setting();
 bool set_overlay_setting(int position); // existing overlay polls its INI live
+
+// The imported DJ deep policy is session-bound, as in the upstream tray.
+// Editing it saves the next session's preference, without a renderer revision.
+struct DjulesPipelineSnapshot {
+    bool prefer_fps{true};
+    bool triple_frame_gen{};
+    bool pending{};
+};
+DjulesPipelineSnapshot djules_pipeline_snapshot();
+bool set_djules_prefer_fps(bool enabled);
+void register_djules_pipeline(std::uint64_t id, bool prefer_fps);
 }

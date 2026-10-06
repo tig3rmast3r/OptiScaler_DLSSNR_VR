@@ -177,6 +177,184 @@ std::shared_ptr<SessionState> session() {
     return state;
 }
 
+void pipelined_route_handoff_test(bool steamvr = false) {
+    auto state = session();
+    state->presenter_active = false;
+    state->graphics_binding = SessionGraphicsBinding::d3d12;
+    state->dispatch->steamvr_runtime = steamvr;
+    state->pipelined_presenter_mode = true;
+    state->last_inline_frame_state_valid = true;
+    state->last_inline_frame_state = state->presenter_frame_state;
+    std::mutex physical_mutex;
+    unsigned physical_waits{}, physical_begins{}, physical_ends{}, order_errors{};
+    bool physical_waited{}, physical_begun{};
+    // Dispatch has C function pointers, so keep this fixture's strict runtime
+    // journal separate from the deliberately permissive other director tests.
+    struct Journal {
+        std::mutex* mutex;
+        unsigned *waits, *begins, *ends, *errors;
+        bool *waited, *begun;
+        XrTime time{1'000'000'000};
+    } journal{&physical_mutex, &physical_waits, &physical_begins, &physical_ends,
+              &order_errors, &physical_waited, &physical_begun};
+    static Journal* runtime;
+    runtime = &journal;
+    state->dispatch->wait_frame = +[](XrSession, const XrFrameWaitInfo*, XrFrameState* out) -> XrResult {
+        std::scoped_lock lock(*runtime->mutex);
+        if (*runtime->waited || *runtime->begun) {
+            ++*runtime->errors; return XR_ERROR_CALL_ORDER_INVALID;
+        }
+        ++*runtime->waits; *runtime->waited = true;
+        runtime->time += 2'000'000;
+        out->predictedDisplayTime = runtime->time;
+        out->predictedDisplayPeriod = 2'000'000;
+        out->shouldRender = XR_TRUE;
+        return XR_SUCCESS;
+    };
+    state->dispatch->begin_frame = +[](XrSession, const XrFrameBeginInfo*) -> XrResult {
+        std::scoped_lock lock(*runtime->mutex);
+        if (!*runtime->waited || *runtime->begun) {
+            ++*runtime->errors; return XR_ERROR_CALL_ORDER_INVALID;
+        }
+        ++*runtime->begins; *runtime->waited = false; *runtime->begun = true;
+        return XR_SUCCESS;
+    };
+    state->dispatch->end_frame = +[](XrSession, const XrFrameEndInfo*) -> XrResult {
+        std::scoped_lock lock(*runtime->mutex);
+        if (!*runtime->begun) {
+            ++*runtime->errors; return XR_ERROR_CALL_ORDER_INVALID;
+        }
+        ++*runtime->ends; *runtime->begun = false;
+        return XR_SUCCESS;
+    };
+    const auto original = xrfg::embedded::snapshot().desired;
+    auto choice = original;
+    choice.enabled = true; choice.backend = 0; choice.frame_generation = 1;
+    check(xrfg::embedded::request(choice), "handoff initial FSR setting");
+    apply_embedded_control(state);
+    { std::scoped_lock lock(g_state_mutex); g_sessions[state->handle] = state; }
+    check(start_continuous_presenter(state, nullptr, true), "handoff initial owner");
+    try {
+        XrFrameState prediction{XR_TYPE_FRAME_STATE};
+        check(XR_SUCCEEDED(layer_wait_frame_impl(state->handle, nullptr, &prediction)), "initial virtual Wait");
+        check(XR_SUCCEEDED(layer_begin_frame_impl(state->handle, nullptr)), "initial virtual Begin");
+        // Every change occurs after the *next* virtual Wait has already returned
+        // on another thread. A stop-only switch passes End yet strands that Begin.
+        for (const auto target : std::array<std::pair<int,int>, 8>{{
+                {1,0}, {2,0}, {0,0}, {-1,0}, {1,0}, {0,1}, {1,0}, {0,1}}}) {
+            XrFrameState next{XR_TYPE_FRAME_STATE};
+            XrResult wait_result = XR_ERROR_RUNTIME_FAILURE;
+            std::thread application_wait([&] {
+                wait_result = layer_wait_frame_impl(state->handle, nullptr, &next);
+            });
+            application_wait.join();
+            check(XR_SUCCEEDED(wait_result), "overlapping virtual Wait");
+            choice.enabled = target.first >= 0;
+            choice.backend = (std::max)(target.first, 0);
+            choice.frame_generation = target.second;
+            check(xrfg::embedded::request(choice), "handoff menu setting");
+            XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
+            end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+            end.displayTime = prediction.predictedDisplayTime;
+            check(XR_SUCCEEDED(layer_end_frame_impl(state->handle, &end)), "old owner boundary End");
+            check(XR_SUCCEEDED(layer_begin_frame_impl(state->handle, nullptr)), "Begin after changed owner");
+            check(continuous_presenter_active(state), "virtual tickets lost their physical owner");
+            check(state->fsr_two_slot_presenter == fsr_two_slot_session(state), "FSR owner mismatch");
+            check(state->queued_nvidia_presenter == queued_nvidia_session(state), "NVIDIA owner mismatch");
+            prediction = next;
+        }
+        XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
+        end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        end.displayTime = prediction.predictedDisplayTime;
+        check(XR_SUCCEEDED(layer_end_frame_impl(state->handle, &end)), "last virtual End");
+        stop_continuous_presenter(state);
+        check(order_errors == 0 && physical_waits > 8 &&
+              physical_waits == physical_begins && physical_begins == physical_ends &&
+              !physical_waited && !physical_begun, "physical Wait/Begin/End journal imbalance");
+    } catch (...) {
+        stop_continuous_presenter(state);
+        static_cast<void>(xrfg::embedded::request(original));
+        { std::scoped_lock lock(g_state_mutex); g_sessions.erase(state->handle); }
+        throw;
+    }
+    check(xrfg::embedded::request(original), "restore handoff fixture configuration");
+    { std::scoped_lock lock(g_state_mutex); g_sessions.erase(state->handle); }
+    std::cout << "Eight live route changes preserve outstanding virtual tickets and balanced physical cycles\n";
+}
+
+void djules_pipeline_preference_test() {
+    const auto ini = current_layer_directory() / L"ofxr_bridge.ini";
+    wchar_t old_deep[64]{}, old_triple[64]{};
+    GetPrivateProfileStringW(L"ofxr", L"deep_pipeline", L"absent", old_deep, 64, ini.c_str());
+    GetPrivateProfileStringW(L"ofxr", L"triple_frame_gen", L"absent", old_triple, 64, ini.c_str());
+    const auto id = xrfg::embedded::attach();
+    const auto restore = [&] {
+        xrfg::embedded::detach(id);
+        WritePrivateProfileStringW(L"ofxr", L"deep_pipeline",
+            std::wcscmp(old_deep,L"absent") ? old_deep : nullptr, ini.c_str());
+        WritePrivateProfileStringW(L"ofxr", L"triple_frame_gen",
+            std::wcscmp(old_triple,L"absent") ? old_triple : nullptr, ini.c_str());
+    };
+    try {
+        check(WritePrivateProfileStringW(L"ofxr", L"triple_frame_gen", L"0", ini.c_str()), "preference fixture 2X");
+        check(xrfg::embedded::set_djules_prefer_fps(true), "save initial deep preference");
+        xrfg::embedded::register_djules_pipeline(id, true);
+        const auto before = xrfg::embedded::snapshot();
+        check(xrfg::embedded::set_djules_prefer_fps(false), "save shallow preference");
+        auto pipeline = xrfg::embedded::djules_pipeline_snapshot();
+        check(!pipeline.prefer_fps && pipeline.pending, "preference must await the frame-boundary receipt");
+        // Ordinary route receipts must not erase the pending policy indication.
+        xrfg::embedded::applied(id, before.revision, true, 0);
+        check(xrfg::embedded::djules_pipeline_snapshot().pending, "route apply erased policy receipt");
+        xrfg::embedded::register_djules_pipeline(id, false);
+        check(!xrfg::embedded::djules_pipeline_snapshot().pending, "applied live receipt must clear pending");
+        check(xrfg::embedded::set_djules_prefer_fps(true), "restore deep preference");
+        check(xrfg::embedded::djules_pipeline_snapshot().pending, "reverse edit must await application");
+        xrfg::embedded::register_djules_pipeline(id, true);
+        check(!xrfg::embedded::djules_pipeline_snapshot().pending, "matching preference is already applied");
+        check(WritePrivateProfileStringW(L"ofxr", L"triple_frame_gen", L"1", ini.c_str()), "preference fixture 3X");
+        check(!xrfg::embedded::set_djules_prefer_fps(false), "3X must prevent disabling its deep setup");
+        pipeline = xrfg::embedded::djules_pipeline_snapshot();
+        check(pipeline.prefer_fps && pipeline.triple_frame_gen, "3X effective preference");
+        const auto after = xrfg::embedded::snapshot();
+        check(after.revision == before.revision && after.desired == before.desired,
+              "preference click reconfigured the active renderer");
+#ifdef OFXR_DJULES_COMPARISON
+        auto live = std::make_shared<SessionState>(std::make_shared<Dispatch>());
+        live->graphics_binding = SessionGraphicsBinding::d3d12;
+        live->nvidia_new_route = true;
+        live->optical_flow_backend = xrfg::D3D12OpticalFlowBackend::nvidia;
+        live->frame_generation_mode = xrfg::D3D12FrameGenerationMode::ofxr;
+        live->djules_pipeline_switchable = true;
+        check(WritePrivateProfileStringW(L"ofxr", L"triple_frame_gen", L"0", ini.c_str()), "live 2X");
+        check(xrfg::embedded::set_djules_prefer_fps(true), "request live deep");
+        const auto poll = [&] {
+            live->djules_pipeline_poll = {};
+            check(XR_SUCCEEDED(poll_djules_pipeline(live)), "live policy poll");
+        };
+        poll();
+        check(!live->djules_deep_pipeline, "single observation applied partially written policy");
+        poll();
+        check(live->djules_deep_pipeline && live->djules_configuration_epoch == 1, "INI policy did not apply live");
+        live->nvidia_new_route = false;
+        check(xrfg::embedded::set_djules_prefer_fps(false), "request shallow outside DJ");
+        poll(); poll();
+        check(live->djules_deep_pipeline && live->djules_configuration_epoch == 1, "reference applied DJ policy");
+        live->nvidia_new_route = true;
+        poll(); poll();
+        check(!live->djules_deep_pipeline && live->djules_configuration_epoch == 2, "return to DJ did not apply preference");
+        check(WritePrivateProfileStringW(L"ofxr", L"triple_frame_gen", L"1", ini.c_str()), "request live 3X");
+        poll(); poll();
+        check(live->djules_triple_requested && live->djules_deep_pipeline, "3X did not force effective preference");
+        check(WritePrivateProfileStringW(L"ofxr", L"triple_frame_gen", L"0", ini.c_str()), "return live 2X");
+        poll(); poll();
+        check(!live->djules_triple_requested && !live->djules_deep_pipeline, "2X did not restore saved shallow preference");
+#endif
+    } catch (...) { restore(); throw; }
+    restore();
+    std::cout << "DJ preference persists independently, preserves pending receipts and honors 3X\n";
+}
+
 void publication_receipt_independence_test(const std::shared_ptr<SessionState>& state,
     const std::shared_ptr<xrfg::D3D11D3D12SwapchainInterop>& bridge) {
     Microsoft::WRL::ComPtr<ID3D12Fence> gate;
@@ -1562,9 +1740,9 @@ int main(int argc, char** argv) {
         timing->nvidia_new_route=false;
         check(synthetic_interpolation_fraction(timing,a,b)==0.5F,"reference fraction changed");
         timing->nvidia_new_route=true; timing->three_slot_director=true;
-        check(XR_SUCCEEDED(switch_djules_multiplier(timing,false)),"switch 2X");
+        check(XR_SUCCEEDED(switch_djules_pipeline(timing,false,false)),"switch 2X");
         check(!timing->djules_triple_requested && timing->three_slots.empty(),"2X shape reset");
-        check(XR_SUCCEEDED(switch_djules_multiplier(timing,true)),"switch 3X");
+        check(XR_SUCCEEDED(switch_djules_pipeline(timing,true,true)),"switch 3X");
         check(timing->djules_triple_requested && timing->three_slots.empty(),"3X shape reset");
         xrfg::DjulesTripleRelease release;
         const auto window=[&](unsigned late) {
@@ -1581,7 +1759,7 @@ int main(int argc, char** argv) {
         window(0);
         check(release.delay==std::chrono::milliseconds(9),"ceiling recovery");
         timing->djules_triple_release=release;
-        check(XR_SUCCEEDED(switch_djules_multiplier(timing,false)),"controller switch");
+        check(XR_SUCCEEDED(switch_djules_pipeline(timing,false,false)),"controller switch");
         check(timing->djules_triple_release.delay.count()==0,"controller survived shape switch");
     }
 #endif
@@ -1610,6 +1788,9 @@ int main(int argc, char** argv) {
         state->luke_afw_enabled = false;
         if (argc > 1) {
             const auto mode = std::string_view(argv[1]);
+            if (mode == "route-handoff") { pipelined_route_handoff_test(); return 0; }
+            if (mode == "route-handoff-steamvr") { pipelined_route_handoff_test(true); return 0; }
+            if (mode == "pipeline-preference") { djules_pipeline_preference_test(); return 0; }
             if (mode == "vulkan-contract") { vulkan_bridge_contract_test(); return 0; }
 #ifdef OFXR_DJULES_COMPARISON
             if (mode == "binding-queue") { djules_binding_queue_test(); return 0; }

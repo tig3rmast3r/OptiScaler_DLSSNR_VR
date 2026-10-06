@@ -19,6 +19,7 @@ std::unordered_map<XrSwapchain, ComPtr<ID3D12Resource>> images;
 std::unordered_set<XrSwapchain> synthetic_handles;
 std::vector<std::pair<unsigned, bool>> submissions;
 std::atomic<unsigned> waits{}, begins{}, ends{}, created{}, destroyed{};
+unsigned empty_submissions{};
 XrTime runtime_time = 1000000000;
 bool correct = true;
 bool alternating_eyes{};
@@ -33,6 +34,7 @@ bool deep_readiness{};
 bool triple_core{};
 bool triple_inline{};
 bool triple_switch{};
+bool deep_switch{};
 bool fsr_queue_gpu_pending{};
 ComPtr<ID3D12Fence> fsr_gpu_gate;
 std::jthread fsr_gpu_watchdog;
@@ -161,9 +163,12 @@ bool is_private_image(XrSwapchain handle) {
     return images.contains(handle);
 }
 XrResult XRAPI_CALL fake_end(XrSession,const XrFrameEndInfo* end) {
-    output_times.push_back(std::chrono::steady_clock::now());
+    // Cadence receipts measure entry into EndFrame, before its simulated
+    // compositor stall. Empty call-order probes carry no output receipt.
+    if (end->layerCount) output_times.push_back(std::chrono::steady_clock::now());
     if(fsr_queue_slow && ends.load() == 5) std::this_thread::sleep_for(std::chrono::milliseconds(25));
     ++ends;
+    if (!end->layerCount) { ++empty_submissions; return XR_SUCCESS; }
     const auto* projection=reinterpret_cast<const XrCompositionLayerProjection*>(end->layers[0]);
     bool synthetic=synthetic_handles.contains(projection->views[0].subImage.swapchain);
     const unsigned frame_id=static_cast<unsigned>(projection->views[0].pose.position.y);
@@ -271,7 +276,8 @@ void release(const std::shared_ptr<SwapchainState>& c, bool poison = true) {
 
 int main(int argc,char** argv) {
     RamTimingFixture capture(argc>1 && (std::string_view(argv[1])=="ram" || std::string_view(argv[1]).starts_with("gap-")));
-    ComPtr<ID3D12Fence> blocked_synthesis;
+    ComPtr<ID3D12Fence> blocked_synthesis, policy_gate;
+    std::jthread policy_unblock;
     std::vector<std::shared_ptr<SwapchainState>> chains;
     try {
         ComPtr<ID3D12Debug> debug;
@@ -282,6 +288,8 @@ int main(int argc,char** argv) {
         s->nvidia_new_route = true;
 #ifdef OFXR_DJULES_COMPARISON
         deep_readiness=argc>1 && std::string_view(argv[1])=="deep-readiness";
+        deep_switch=argc>1 && std::string_view(argv[1])=="deep-switch";
+        deep_readiness=deep_readiness || deep_switch;
         s->djules_deep_pipeline=deep_readiness;
         triple_switch=argc>1 && std::string_view(argv[1])=="triple-switch";
         triple_core=triple_switch || (argc>1 && std::string_view(argv[1])=="triple-core");
@@ -372,7 +380,13 @@ int main(int argc,char** argv) {
         for(unsigned n=1;n<=8;++n) {
 #ifdef OFXR_DJULES_COMPARISON
             if(triple_switch && (n==5 || n==7))
-                require(XR_SUCCEEDED(switch_djules_multiplier(s,n==7)),"live GPU multiplier switch");
+                require(XR_SUCCEEDED(switch_djules_pipeline(s,n==7,false)),"live GPU multiplier switch");
+            if(deep_switch && (n==5 || n==7)) {
+                if(n==5) require(policy_gate->GetCompletedValue()==0,"policy fixture did not retain pending GPU work");
+                require(XR_SUCCEEDED(switch_djules_pipeline(s,false,n==7)),"live GPU deep preference switch");
+                require(s->djules_deep_pipeline==(n==7),"live preference not applied");
+                if(n==5) require(policy_gate->GetCompletedValue()==1,"policy crossed unfinished GPU work");
+            }
 #endif
             require(XR_SUCCEEDED(wait_for_synthesis_handoff(s)),"worker rendezvous");
             if(midpoint_cadence && n>2)
@@ -434,6 +448,14 @@ int main(int argc,char** argv) {
             XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=prediction.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
             end.layerCount=promotion_test && !s->three_slot_director ? 1 : 3;end.layers=layers;
             const unsigned independence_frame=(fsr_test || legacy_queue || triple_inline) ? 0 : promotion_test ? 5 : 2;
+            if(deep_switch && n==4) {
+                hr(s->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&policy_gate)),"policy GPU gate");
+                hr(s->d3d12_synthesis_queue->Wait(policy_gate.Get(),1),"hold policy GPU work");
+                policy_unblock=std::jthread([gate=policy_gate] {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    gate->Signal(1);
+                });
+            }
             if(n==independence_frame){hr(s->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&blocked_synthesis)),"test gate");
                 hr(s->d3d12_synthesis_queue->Wait(blocked_synthesis.Get(),1),"block synthesis");}
             require(XR_SUCCEEDED(layer_end_frame_impl(s->handle,&end)),"actual EndFrame");
@@ -472,7 +494,17 @@ int main(int argc,char** argv) {
                 require(XR_SUCCEEDED(layer_begin_frame_impl(s->handle,nullptr)), "switch Begin");
                 end.displayTime=switch_prediction.predictedDisplayTime;
                 require(XR_SUCCEEDED(layer_end_frame_impl(s->handle,&end)), "switch End");
-                require(!continuous_presenter_active(s) && !s->fsr_two_slot_presenter, "FSR consumer survived route switch");
+                require(continuous_presenter_active(s) && !s->fsr_two_slot_presenter && s->queued_nvidia_presenter,
+                    "selected NVIDIA owner did not replace the FSR consumer");
+                // The former fixture stopped after End, before the failing Begin.
+                XrFrameState following{XR_TYPE_FRAME_STATE};
+                require(XR_SUCCEEDED(layer_wait_frame_impl(s->handle,nullptr,&following)), "following Wait");
+                require(XR_SUCCEEDED(layer_begin_frame_impl(s->handle,nullptr)), "following Begin");
+                end.displayTime=following.predictedDisplayTime;
+                // Empty composition checks the live frame call chain without
+                // adding another GPU-generated output to this pixel fixture.
+                auto empty=end; empty.layerCount=0; empty.layers=nullptr;
+                require(XR_SUCCEEDED(layer_end_frame_impl(s->handle,&empty)), "following End");
             }
             if(gap_test && (n==4 || n==6 || n==7)) {
                 require(XR_SUCCEEDED(wait_for_synthesis_handoff(s)),"gap prime completed");
@@ -514,8 +546,10 @@ int main(int argc,char** argv) {
             require(submissions.size()==fresh.size()+repeats,"deep physical output accounting");
             submissions=std::move(fresh);
         }
-        const unsigned expected_count=triple_switch?17:(triple_core||triple_inline)?22:fsr_queue_switch ? 16 : fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
-        require(submissions.size()==expected_count && waits==expected_count+repeats && begins==expected_count+repeats && ends==expected_count+repeats,"unique output/cycle count");
+        const unsigned expected_count=deep_switch?13:triple_switch?17:(triple_core||triple_inline)?22:fsr_queue_switch ? 16 : fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
+        const unsigned expected_cycles = expected_count + repeats + empty_submissions;
+        require(submissions.size()==expected_count && waits==expected_cycles && begins==expected_cycles && ends==expected_cycles,"unique output/cycle count");
+        require(empty_submissions == (fsr_queue_switch ? 1U : 0U), "unexpected empty physical submission");
         if(fsr_missing) {
             for(unsigned i=0;i<8;++i) require(submissions[i]==std::pair<unsigned,bool>{i+1,false},"FSR missing guide repeated/lost real");
         } else if(gap_test) {
@@ -534,6 +568,13 @@ int main(int argc,char** argv) {
                     ++next_real;
                 } else require(submissions[i].second,"promotion synthetic order");
             }
+        } else if(deep_switch) {
+            std::vector<std::pair<unsigned,bool>> expected;
+            for(unsigned n=1;n<=8;++n) {
+                if(n>1 && n!=5 && n!=7) expected.emplace_back(n,true);
+                expected.emplace_back(n,false);
+            }
+            require(submissions==expected,"deep toggle lost or reordered owned output");
         } else if(triple_switch) {
             std::vector<std::pair<unsigned,bool>> expected;
             for(unsigned n=1;n<=8;++n) {
@@ -569,7 +610,7 @@ int main(int argc,char** argv) {
         if(fsr_queue_gpu_pending) require(fsr_wait_before_gpu_complete,
             "FSR consumer CPU-waited before entering XR with pending GPU work");
         if(fsr_queue || legacy_queue) {
-            require(waits == expected_count && output_times.size() == expected_count, "FSR repeated or lost output");
+            require(waits == expected_cycles && output_times.size() == expected_count, "FSR repeated or lost output");
             for(unsigned i=1;i<output_times.size();++i)
                 require(output_times[i]-output_times[i-1] >= std::chrono::milliseconds(6), "FSR bunched output slots");
         }

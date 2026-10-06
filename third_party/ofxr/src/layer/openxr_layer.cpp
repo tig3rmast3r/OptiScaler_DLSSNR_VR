@@ -11161,9 +11161,10 @@ XrResult layer_end_frame_impl(
     state->luke_afw_previous_selected = afw_selected;
     capture_application_metadata(state,end_info);
     const bool manually_disarmed = state->manual_control.stop_requested();
-    const bool fsr_presenter_mismatch = use_continuous_presenter &&
-        fsr_two_slot_session(state) != state->fsr_two_slot_presenter ||
-        queued_nvidia_session(state) != state->queued_nvidia_presenter;
+    const bool presenter_route_mismatch = use_continuous_presenter &&
+        (three_slot_generation_session(state) != state->three_slot_director ||
+         fsr_two_slot_session(state) != state->fsr_two_slot_presenter ||
+         queued_nvidia_session(state) != state->queued_nvidia_presenter);
     if (manually_disarmed && !state->manual_stop_applied) {
         // The existing queue has been drained before taking the content lock.
         // Do not unload hooks/resources, cancel submitted GPU work, or hand
@@ -11280,8 +11281,24 @@ XrResult layer_end_frame_impl(
                     return start_result;
                 }
             }
-            if (use_continuous_presenter && (!pipelined_presenter_mode || fsr_presenter_mismatch)) {
+            if (use_continuous_presenter && (!pipelined_presenter_mode || presenter_route_mismatch)) {
                 stop_continuous_presenter(state);
+                state->pipelined_presenter_start_requested = false;
+                state->presenter_start_requested = false;
+                if (pipelined_presenter_mode && !presenter_forbidden(*state)) {
+                    // The application's outstanding Wait/Begin tickets are virtual.
+                    // Finish the old physical cycle above, join its owner, and
+                    // start the selected owner before returning this boundary.
+                    // Even Off keeps a borrowed-frame presenter for a pipelined
+                    // app: those tickets cannot become unmatched runtime Begins.
+                    if (!start_continuous_presenter(state, nullptr, true))
+                        return XR_ERROR_RUNTIME_FAILURE;
+                } else {
+                    state->pipelined_presenter_mode = false;
+                    if (state->application_wait_pending_begin &&
+                        !state->runtime_frame_waited_unbegun)
+                        state->application_begin_needs_wait = true;
+                }
                 std::scoped_lock lock(state->mutex);
                 state->steamvr_throttled_wait_streak = 0;
                 // Both promotion routes start over, or the demotion would be
@@ -11295,7 +11312,7 @@ XrResult layer_end_frame_impl(
     // this virtual application frame through its current owner before stopping
     // it; the next promotion selects the appropriate backend's director. Never
     // hand a synthesis job to an old presenter with no worker thread.
-    if (use_continuous_presenter && (!pipelined_presenter_mode || fsr_presenter_mismatch)) {
+    if (use_continuous_presenter) {
         const bool desired_director = three_slot_generation_session(state);
         bool route_changed = false;
         {

@@ -739,13 +739,13 @@ struct SessionState {
     std::chrono::steady_clock::time_point video_memory_first_poll{};
 
     bool nvidia_new_route{};
-    bool djules_deep_pipeline{};
+    std::atomic_bool djules_deep_pipeline{};
     std::atomic_bool djules_triple_requested{};
     std::atomic_uint64_t djules_configuration_epoch{};
     xrfg::DjulesTripleRelease djules_triple_release;
-    bool djules_triple_switchable{};
-    std::chrono::steady_clock::time_point djules_triple_poll{};
-    std::optional<bool> djules_triple_candidate;
+    bool djules_pipeline_switchable{};
+    std::chrono::steady_clock::time_point djules_pipeline_poll{};
+    std::optional<std::pair<bool, bool>> djules_pipeline_candidate;
 
     bool dlss_motion_vectors{};
     xrfg::D3D12FrameGenerationMode frame_generation_mode{};
@@ -4174,11 +4174,12 @@ XrResult layer_create_session_impl(
     state->optical_flow_backend = initial_control.desired.backend == 0
         ? xrfg::D3D12OpticalFlowBackend::fidelity_fx : xrfg::D3D12OpticalFlowBackend::nvidia;
     state->nvidia_new_route = initial_control.desired.backend == 2;
-    state->djules_triple_switchable=true;
+    state->djules_pipeline_switchable=true;
     state->djules_triple_requested=GetPrivateProfileIntW(L"ofxr",L"triple_frame_gen",0,
         (current_layer_directory()/L"ofxr_bridge.ini").c_str())==1;
-    state->djules_deep_pipeline = GetPrivateProfileIntW(L"ofxr",L"deep_pipeline",1,
+    state->djules_deep_pipeline = state->djules_triple_requested || GetPrivateProfileIntW(L"ofxr",L"deep_pipeline",1,
         (current_layer_directory()/L"ofxr_bridge.ini").c_str())==1;
+    xrfg::embedded::register_djules_pipeline(state->control_id, state->djules_deep_pipeline);
     state->nvidia_options = {
         static_cast<xrfg::D3D12NvidiaPerformancePreset>(initial_control.desired.preset),
         static_cast<xrfg::D3D12NvidiaInputScale>(initial_control.desired.scale),
@@ -11249,8 +11250,10 @@ HRESULT reconcile_depth_history_for_route(SwapchainState& chain) {
 
 // Frame-call ownership is held. Drain exact old descriptors before changing
 // buffer shape; reserved staging capacity covers both multipliers.
-[[nodiscard]] XrResult switch_djules_multiplier(const std::shared_ptr<SessionState>& state,bool target) {
-    if(target==state->djules_triple_requested) return XR_SUCCESS;
+[[nodiscard]] XrResult switch_djules_pipeline(const std::shared_ptr<SessionState>& state,bool target,bool prefer_fps) {
+    if(!djules_native_scheduler(*state)) return XR_SUCCESS;
+    prefer_fps = target || prefer_fps;
+    if(target==state->djules_triple_requested && prefer_fps==state->djules_deep_pipeline) return XR_SUCCESS;
     if(continuous_presenter_active(state)) {
         const auto result=wait_for_presenter_idle(state);
         if(XR_FAILED(result)) return result;
@@ -11260,6 +11263,7 @@ HRESULT reconcile_depth_history_for_route(SwapchainState& chain) {
         std::scoped_lock content(state->presenter_content_mutex);
         std::scoped_lock lock(state->presenter_mutex);
         state->djules_triple_requested=target;
+        state->djules_deep_pipeline=prefer_fps;
         ++state->djules_configuration_epoch;
         state->djules_triple_release={};
         state->three_slots.configure(djules_triple_director(*state)?3:2);
@@ -11269,20 +11273,23 @@ HRESULT reconcile_depth_history_for_route(SwapchainState& chain) {
     if(state->fps_overlay) state->fps_overlay->reset_metrics();
     xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::presenter_transition,
         700,target?3:2,state->djules_deep_pipeline && !target,2);
+    xrfg::embedded::register_djules_pipeline(state->control_id, prefer_fps);
     return XR_SUCCESS;
 }
 
-void poll_djules_multiplier(const std::shared_ptr<SessionState>& state) {
-    if(!state->djules_triple_switchable || !djules_native_scheduler(*state)) return;
+[[nodiscard]] XrResult poll_djules_pipeline(const std::shared_ptr<SessionState>& state) {
+    if(!state->djules_pipeline_switchable || !djules_native_scheduler(*state)) return XR_SUCCESS;
     const auto now=std::chrono::steady_clock::now();
-    if(now<state->djules_triple_poll) return;
-    state->djules_triple_poll=now+std::chrono::milliseconds(250);
-    const bool target=GetPrivateProfileIntW(L"ofxr",L"triple_frame_gen",0,
-        (current_layer_directory()/L"ofxr.ini").c_str())!=0;
-    // Two matching observations avoid acting on a partially rewritten INI.
-    if(state->djules_triple_candidate && *state->djules_triple_candidate==target)
-        static_cast<void>(switch_djules_multiplier(state,target));
-    state->djules_triple_candidate=target;
+    if(now<state->djules_pipeline_poll) return XR_SUCCESS;
+    state->djules_pipeline_poll=now+std::chrono::milliseconds(250);
+    const auto desired=xrfg::embedded::djules_pipeline_snapshot();
+    const auto target=std::pair{desired.triple_frame_gen,desired.prefer_fps};
+    // One owned INI and two matching observations for both live policy controls.
+    XrResult result=XR_SUCCESS;
+    if(state->djules_pipeline_candidate && *state->djules_pipeline_candidate==target)
+        result=switch_djules_pipeline(state,target.first,target.second);
+    state->djules_pipeline_candidate=target;
+    return result;
 }
 
 // Called with frame ownership and presenter content excluded. No GUI thread
@@ -11778,7 +11785,8 @@ XrResult layer_end_frame_impl(
     };
 
     apply_embedded_control(state);
-    poll_djules_multiplier(state);
+    const auto pipeline_result=poll_djules_pipeline(state);
+    if(XR_FAILED(pipeline_result)) return pipeline_result;
     const auto afw_control = xrfg::embedded::afw_snapshot();
     const bool afw_selected = state->luke_afw_enabled &&
         afw_control.desired.mode != 0;
@@ -11808,9 +11816,10 @@ XrResult layer_end_frame_impl(
     state->luke_afw_previous_selected = afw_selected;
     capture_application_metadata(state,end_info);
     const bool manually_disarmed = state->manual_control.stop_requested();
-    const bool fsr_presenter_mismatch = use_continuous_presenter &&
-        fsr_two_slot_session(state) != state->fsr_two_slot_presenter ||
-        queued_nvidia_session(state) != state->queued_nvidia_presenter;
+    const bool presenter_route_mismatch = use_continuous_presenter &&
+        (three_slot_generation_session(state) != state->three_slot_director ||
+         fsr_two_slot_session(state) != state->fsr_two_slot_presenter ||
+         queued_nvidia_session(state) != state->queued_nvidia_presenter);
     if (manually_disarmed && !state->manual_stop_applied) {
         // The existing queue has been drained before taking the content lock.
         // Do not unload hooks/resources, cancel submitted GPU work, or hand
@@ -11928,8 +11937,24 @@ XrResult layer_end_frame_impl(
                     return start_result;
                 }
             }
-            if (use_continuous_presenter && (!pipelined_presenter_mode || fsr_presenter_mismatch)) {
+            if (use_continuous_presenter && (!pipelined_presenter_mode || presenter_route_mismatch)) {
                 stop_continuous_presenter(state);
+                state->pipelined_presenter_start_requested = false;
+                state->presenter_start_requested = false;
+                if (pipelined_presenter_mode && !presenter_forbidden(*state)) {
+                    // The application's outstanding Wait/Begin tickets are virtual.
+                    // Finish the old physical cycle above, join its owner, and
+                    // start the selected owner before returning this boundary.
+                    // Even Off keeps a borrowed-frame presenter for a pipelined
+                    // app: those tickets cannot become unmatched runtime Begins.
+                    if (!start_continuous_presenter(state, nullptr, true))
+                        return XR_ERROR_RUNTIME_FAILURE;
+                } else {
+                    state->pipelined_presenter_mode = false;
+                    if (state->application_wait_pending_begin &&
+                        !state->runtime_frame_waited_unbegun)
+                        state->application_begin_needs_wait = true;
+                }
                 std::scoped_lock lock(state->mutex);
                 state->steamvr_throttled_wait_streak = 0;
                 // Both promotion routes start over, or the demotion would be
@@ -11943,7 +11968,7 @@ XrResult layer_end_frame_impl(
     // this virtual application frame through its current owner before stopping
     // it; the next promotion selects the appropriate backend's director. Never
     // hand a synthesis job to an old presenter with no worker thread.
-    if (use_continuous_presenter && (!pipelined_presenter_mode || fsr_presenter_mismatch)) {
+    if (use_continuous_presenter) {
         const bool desired_director = three_slot_generation_session(state);
         bool route_changed = false;
         {

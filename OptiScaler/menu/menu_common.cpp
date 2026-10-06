@@ -6975,6 +6975,28 @@ static void RenderOfxrVrFramegenMenu()
         }
     }
 
+#ifdef OFXR_DJULES_COMPARISON
+    if (engine == 3)
+    {
+        const auto pipeline = xrfg::embedded::djules_pipeline_snapshot();
+        bool preferFps = pipeline.prefer_fps;
+        ImGui::BeginDisabled(pipeline.triple_frame_gen);
+        if (ImGui::Checkbox("Prefer FPS over latency", &preferFps) &&
+            !xrfg::embedded::set_djules_prefer_fps(preferFps))
+            ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F), "Could not save preference");
+        ImGui::EndDisabled();
+        if (pipeline.triple_frame_gen)
+            ImGui::TextDisabled("Enabled with 3X Frame Gen");
+        if (xrfg::embedded::djules_pipeline_snapshot().pending)
+            ImGui::TextColored(ImVec4(0.95F, 0.65F, 0.15F, 1.0F), "Applying at the next frame boundary");
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Helps games near half the headset refresh rate hold steadier FPS.\n"
+                              "Adds about one frame of latency (11 ms at 90 Hz).\n"
+                              "Applies during play after pending frames complete.");
+    }
+#endif
+
     if (changed && !ofxr_bridge::request(settings))
         ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F),
                            "Setting rejected by the loaded OFXR layer");

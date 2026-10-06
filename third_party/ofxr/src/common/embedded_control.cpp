@@ -7,6 +7,7 @@
 #include <cmath>
 #include <atomic>
 #include <cwchar>
+#include <optional>
 
 namespace xrfg::embedded {
 namespace {
@@ -24,7 +25,10 @@ bool luke_afw_requires_dlss_guides() {
     return GetPrivateProfileIntW(
         L"experimental", L"luke_afw", 0, ini().c_str()) != 0;
 }
-struct Receipt { std::uint64_t revision{}; bool enabled{}; long error{}; };
+struct Receipt {
+    std::uint64_t revision{}; bool enabled{}; long error{};
+    std::optional<bool> djules_prefer_fps;
+};
 struct Control {
     std::mutex mutex;
     Settings settings;
@@ -228,7 +232,31 @@ std::uint64_t attach() { auto& c = control(); std::scoped_lock lock(c.mutex); au
 void detach(std::uint64_t id) { auto& c = control(); std::scoped_lock lock(c.mutex); c.sessions.erase(id); }
 void applied(std::uint64_t id, std::uint64_t revision, bool enabled, long error) {
     auto& c = control(); std::scoped_lock lock(c.mutex);
-    if (auto it = c.sessions.find(id); it != c.sessions.end()) it->second = {revision, enabled, error};
+    if (auto it = c.sessions.find(id); it != c.sessions.end()) {
+        it->second.revision = revision;
+        it->second.enabled = enabled;
+        it->second.error = error;
+    }
+}
+DjulesPipelineSnapshot djules_pipeline_snapshot() {
+    DjulesPipelineSnapshot s;
+    s.triple_frame_gen = GetPrivateProfileIntW(L"ofxr", L"triple_frame_gen", 0, ini().c_str()) != 0;
+    s.prefer_fps = s.triple_frame_gen ||
+        GetPrivateProfileIntW(L"ofxr", L"deep_pipeline", 1, ini().c_str()) != 0;
+    auto& c = control(); std::scoped_lock lock(c.mutex);
+    for (const auto& [id, receipt] : c.sessions)
+        if (receipt.djules_prefer_fps && *receipt.djules_prefer_fps != s.prefer_fps)
+            s.pending = true;
+    return s;
+}
+bool set_djules_prefer_fps(bool enabled) {
+    if (!enabled && GetPrivateProfileIntW(L"ofxr", L"triple_frame_gen", 0, ini().c_str())) return false;
+    return write(L"ofxr", L"deep_pipeline", enabled ? L"1" : L"0");
+}
+void register_djules_pipeline(std::uint64_t id, bool prefer_fps) {
+    auto& c = control(); std::scoped_lock lock(c.mutex);
+    if (auto it = c.sessions.find(id); it != c.sessions.end())
+        it->second.djules_prefer_fps = prefer_fps;
 }
 void set_layer_active(bool active) noexcept { g_layer_active.store(active, std::memory_order_release); }
 bool layer_active() noexcept { return g_layer_active.load(std::memory_order_acquire); }
