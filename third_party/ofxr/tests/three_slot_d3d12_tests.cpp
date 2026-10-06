@@ -216,7 +216,13 @@ XrResult XRAPI_CALL fake_end(XrSession,const XrFrameEndInfo* end) {
        !session_state->three_slot_director) {
         ++promotion_gate_count;
         hr(session_state->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&promotion_gate)),"promotion fence");
-        hr(session_state->d3d12_synthesis_queue->Wait(promotion_gate.Get(),1),"delay deferred endpoint");
+        auto* endpoint_queue=session_state->d3d12_synthesis_queue.Get();
+#ifdef OFXR_DJULES_COMPARISON
+        // Staging already contains B. Its remaining operation is the handover
+        // copy on the binding queue; block that actual endpoint dependency.
+        if(djules_native_scheduler(*session_state)) endpoint_queue=runtime_queue(*session_state);
+#endif
+        hr(endpoint_queue->Wait(promotion_gate.Get(),1),"delay final endpoint dependency");
         promotion_unblock=std::jthread([] {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             promotion_gate_released=true;

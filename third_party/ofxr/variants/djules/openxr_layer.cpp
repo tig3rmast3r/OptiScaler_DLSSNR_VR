@@ -1311,7 +1311,25 @@ constexpr std::size_t kCurrentSlotCount = 2;
 constexpr std::size_t kSyntheticSlotCount = 2;
 constexpr std::size_t kAfwScratchSlot = kCurrentSlotCount;
 
+struct CompositionCopy12 {
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    std::uint64_t ready_value{};
+};
+
+struct DjulesOutputStaging {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    std::atomic<std::uint64_t> last_handover_copy{};
+};
+
 struct FrameGenerationSwapchainState {
+    bool staged_outputs{};
+    std::array<std::shared_ptr<DjulesOutputStaging>,2> current_staging, synthetic_staging;
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> current_runtime_images, synthetic_runtime_images;
+    Microsoft::WRL::ComPtr<ID3D12Fence> handover_fence;
+    std::array<CompositionCopy12,8> handover_copies;
+    std::uint64_t handover_serial{};
+    std::size_t handover_copy_slot{};
     // AFW scratch has its own handle. It cannot repoint either queued real.
     std::array<PrivateSwapchainState, kCurrentSlotCount + 1> current{};
     // Destination images are addressed by a flat index across every slot, so
@@ -1329,11 +1347,6 @@ struct FrameGenerationSwapchainState {
     std::shared_ptr<xrfg::D3D12FrameSynthesizer> afw_temporal_synthesizer;
 };
 
-struct CompositionCopy12 {
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
-    std::uint64_t ready_value{};
-};
 
 struct CompositionImageSlot {
     PrivateSwapchainState image;
@@ -2083,6 +2096,8 @@ void destroy_frame_generation_swapchains(
         }
 
         const auto& dispatch = state->session->dispatch;
+        if(generation->staged_outputs)
+            static_cast<void>(wait_composition_fence(generation->handover_fence.Get(),generation->handover_serial));
         for (PrivateSwapchainState& image : generation->synthetic) {
             static_cast<void>(
                 release_private_image(state->session.get(), dispatch, image));
@@ -2354,13 +2369,16 @@ create_d3d12_frame_generation_swapchains(
             return nullptr;
         }
 
+        auto generation = std::make_shared<FrameGenerationSwapchainState>();
+        generation->staged_outputs = djules_native_scheduler(*state->session);
+        const auto output_slots = generation->staged_outputs ? 1U : kCurrentSlotCount;
         XrSwapchainCreateInfo private_info = state->create_info;
         private_info.next = nullptr;
         private_info.usageFlags |=
             XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
         XrResult refusal = XR_SUCCESS;
         if (!create_current_ring(state, private_info, &current, &refusal,
-                state->session->luke_afw_enabled ? kCurrentSlotCount + 1 : kCurrentSlotCount)) {
+                state->session->luke_afw_enabled ? kCurrentSlotCount + 1 : output_slots)) {
             if (failure_reason != nullptr) {
                 *failure_reason =
                     SwapchainEligibilityReason::current_private_swapchain_failed;
@@ -2373,7 +2391,7 @@ create_d3d12_frame_generation_swapchains(
             return nullptr;
         }
         log_video_memory(*state->session, VideoMemoryStage::current_ring, handle_value(state->handle));
-        if (!create_current_ring(state, private_info, &synthetic, &refusal)) {
+        if (!create_current_ring(state, private_info, &synthetic, &refusal, output_slots)) {
             if (failure_reason != nullptr) {
                 *failure_reason =
                     SwapchainEligibilityReason::synthetic_private_swapchain_failed;
@@ -2388,6 +2406,33 @@ create_d3d12_frame_generation_swapchains(
         }
 
         log_video_memory(*state->session, VideoMemoryStage::synthetic_ring, handle_value(state->handle));
+        if (generation->staged_outputs) {
+            for(auto* image:current.d3d12_resources) generation->current_runtime_images.emplace_back(image);
+            for(auto* image:synthetic.d3d12_resources) generation->synthetic_runtime_images.emplace_back(image);
+            auto description = current.d3d12_resources.front()->GetDesc();
+            description.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            D3D12_HEAP_PROPERTIES heap{}; heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+            HRESULT created = state->session->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,
+                IID_PPV_ARGS(&generation->handover_fence));
+            current.d3d12_resources.clear(); synthetic.d3d12_resources.clear();
+            for(std::size_t slot=0;slot<2 && SUCCEEDED(created);++slot) {
+                for(auto* set:{&generation->current_staging,&generation->synthetic_staging}) {
+                    (*set)[slot]=std::make_shared<DjulesOutputStaging>();
+                    created=state->session->d3d12_device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,
+                        &description,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&(*set)[slot]->resource));
+                    if(FAILED(created)) break;
+                }
+                if(SUCCEEDED(created)) {
+                    current.d3d12_resources.push_back(generation->current_staging[slot]->resource.Get());
+                    synthetic.d3d12_resources.push_back(generation->synthetic_staging[slot]->resource.Get());
+                }
+            }
+            if(FAILED(created)) {
+                if(failure_detail) *failure_detail=static_cast<std::uint64_t>(created);
+                destroy_current_ring(dispatch,&synthetic); destroy_current_ring(dispatch,&current);
+                return nullptr;
+            }
+        }
         auto synthesizer = std::make_shared<xrfg::D3D12FrameSynthesizer>();
         const xrfg::D3D12OpticalFlowBackend backend =
             state->session->optical_flow_backend;
@@ -2430,7 +2475,7 @@ create_d3d12_frame_generation_swapchains(
             // synthesis lists already starts and ends at this state, and a
             // resource in COMMON is implicitly promoted on first use, so a
             // runtime that wants it as a render target still gets one.
-            state->session->d3d12_synthesis_queue
+            (generation->staged_outputs || state->session->d3d12_synthesis_queue)
                 ? D3D12_RESOURCE_STATE_COMMON
                 : D3D12_RESOURCE_STATE_RENDER_TARGET,
             backend,
@@ -2459,9 +2504,12 @@ create_d3d12_frame_generation_swapchains(
         }
 
         log_video_memory(*state->session, VideoMemoryStage::synthesizer, handle_value(state->handle));
-        auto generation = std::make_shared<FrameGenerationSwapchainState>();
         adopt_current_ring(generation, current);
         adopt_synthetic_ring(generation, synthetic);
+        if(generation->staged_outputs) {
+            generation->current_images_per_slot=1;
+            generation->synthetic_images_per_slot=1;
+        }
         generation->synthesizer = std::move(synthesizer);
         if (failure_reason != nullptr) {
             *failure_reason = SwapchainEligibilityReason::ready;
@@ -6321,7 +6369,43 @@ using OwnedCompositionLayer = std::variant<
     XrCompositionLayerPassthroughHTC,
     XrCompositionLayerPassthroughANDROID>;
 
+[[nodiscard]] bool acquire_and_wait_private_image(SessionState* session,
+    const std::shared_ptr<Dispatch>& dispatch, PrivateSwapchainState& image) noexcept;
+
+struct DjulesPendingOutput {
+    std::shared_ptr<FrameGenerationSwapchainState> generation;
+    std::shared_ptr<DjulesOutputStaging> staging;
+    std::shared_ptr<xrfg::D3D12FrameSynthesizer> synthesizer;
+    xrfg::D3D12FrameSynthesisTicket ticket;
+    bool synthetic{};
+};
+
+[[nodiscard]] bool handover_djules_outputs(SessionState* session,
+    std::vector<DjulesPendingOutput>& outputs) noexcept {
+    try {
+        while(!outputs.empty()) {
+            auto& pending=outputs.front(); auto& generation=*pending.generation;
+            auto& image=pending.synthetic?generation.synthetic[0]:generation.current[0];
+            auto& images=pending.synthetic?generation.synthetic_runtime_images:generation.current_runtime_images;
+            if(FAILED(pending.synthesizer->synchronize_consumer_queue(runtime_queue(*session),pending.ticket)) ||
+               !acquire_and_wait_private_image(session,session->dispatch,image) || image.acquired_index>=images.size())
+                return false;
+            const auto copy_slot=generation.handover_copy_slot++ % generation.handover_copies.size();
+            const HRESULT copied=copy_composition12(session->d3d12_device.Get(),runtime_queue(*session),
+                generation.handover_fence.Get(),generation.handover_serial,generation.handover_copies[copy_slot],
+                images[image.acquired_index].Get(),D3D12_RESOURCE_STATE_COMMON,
+                pending.staging->resource.Get(),D3D12_RESOURCE_STATE_COMMON);
+            if(FAILED(copied)) return false;
+            pending.staging->last_handover_copy.store(generation.handover_serial,std::memory_order_release);
+            if(!release_private_image(session,session->dispatch,image)) return false;
+            outputs.erase(outputs.begin());
+        }
+        return true;
+    } catch(...) { return false; }
+}
+
 struct GeneratedFrameEndInfo {
+    std::vector<DjulesPendingOutput> pending_outputs;
     std::uint64_t app_release_value{};
     bool synthetic{};
     XrFrameEndInfo info{XR_TYPE_FRAME_END_INFO};
@@ -6982,6 +7066,8 @@ void continuous_presenter_main(
                 ? request->owned_frame ? request->owned_frame->app_release_value : request->app_release_value
                 : repeated_frame ? repeated_frame->app_release_value : 0);
             end_result = with_runtime_entry(state, [&] {
+                auto* owned=request?request->owned_frame.get():repeated_frame.get();
+                if(owned && !handover_djules_outputs(state.get(),owned->pending_outputs)) return XR_ERROR_RUNTIME_FAILURE;
                 return state->fps_overlay
                     ? state->fps_overlay->end_frame(&submitted, fresh_synthetic, request != nullptr)
                     : state->dispatch->end_frame(state->handle, &submitted);
@@ -7689,6 +7775,8 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
                     join_runtime_queue_to_application(state.get(), selected
                         ? selected->frame->app_release_value
                         : borrowed->owned_frame ? borrowed->owned_frame->app_release_value : borrowed->app_release_value);
+                    auto* owned=selected?selected->frame.get():borrowed->owned_frame.get();
+                    if(owned && !handover_djules_outputs(state.get(),owned->pending_outputs)) return XR_ERROR_RUNTIME_FAILURE;
                     phase_step = sample_djules_phase_step(state, selected && !synthetic,
                         selected ? selected->source_sequence : 0);
                     return state->fps_overlay ? state->fps_overlay->end_frame(&end, synthetic)
@@ -8828,6 +8916,8 @@ static_assert(!should_preserve_missing_capture_anchor(
     true, xrfg::D3D12FrameGenerationMode::fsr3, false));
 
 struct PreparedGeneration {
+    std::shared_ptr<FrameGenerationSwapchainState> staging_generation;
+    xrfg::D3D12FrameSynthesisTicket staging_ticket{};
     PreparedGenerationKind kind{PreparedGenerationKind::none};
     GenerationPrepareReason reason{GenerationPrepareReason::exception};
     XrSwapchain current_handle{XR_NULL_HANDLE};
@@ -8862,6 +8952,19 @@ struct PreparedProjectionFrame {
     bool preserve_previous{};
     std::shared_ptr<const HeldAfwPair> held_afw_pair;
 };
+
+void attach_djules_outputs(PreparedProjectionFrame& prepared,
+    GeneratedFrameEndInfo& real, GeneratedFrameEndInfo* synthetic=nullptr) {
+    for(auto& resource:prepared.resources) {
+        auto& output=resource.generation;
+        if(!output.staging_generation) continue;
+        auto generation=output.staging_generation;
+        real.pending_outputs.push_back({generation,generation->current_staging[output.current_slot],
+            output.synthesizer,output.staging_ticket,false});
+        if(synthetic) synthetic->pending_outputs.push_back({generation,generation->synthetic_staging[output.synthetic_slot],
+            output.synthesizer,output.staging_ticket,true});
+    }
+}
 
 void log_luke_publication_boundary(
     std::uint64_t serial, std::int64_t boundary, std::size_t resource,
@@ -9029,9 +9132,9 @@ struct AfwSourceCapture {
         const std::size_t synthetic_slot = defer_d3d11_publication
             ? 0 : generation->synthetic_slot;
         PrivateSwapchainState& current_image =
-            generation->current[current_slot];
+            generation->current[generation->staged_outputs ? 0 : current_slot];
         PrivateSwapchainState& synthetic_image =
-            generation->synthetic[synthetic_slot];
+            generation->synthetic[generation->staged_outputs ? 0 : synthetic_slot];
         if (current_image.handle == XR_NULL_HANDLE ||
             synthetic_image.handle == XR_NULL_HANDLE ||
             generation->current_images_per_slot == 0 ||
@@ -9049,7 +9152,28 @@ struct AfwSourceCapture {
             }
         }
 
-        if (!acquire_and_wait_private_image(
+        if (generation->staged_outputs) {
+            std::unique_lock lock(state->session->presenter_mutex);
+            state->session->presenter_condition.wait(lock,[&] {
+                return (generation->current_staging[current_slot].use_count()==1 &&
+                    (!request_pair || generation->synthetic_staging[synthetic_slot].use_count()==1)) ||
+                    state->session->presenter_stop_requested || XR_FAILED(state->session->presenter_failure);
+            });
+            if(state->session->presenter_stop_requested || XR_FAILED(state->session->presenter_failure)) {
+                output.reason=GenerationPrepareReason::synthesis_busy; return output;
+            }
+            lock.unlock();
+            auto* queue=state->session->d3d12_synthesis_queue ? state->session->d3d12_synthesis_queue.Get()
+                : state->session->d3d12_queue.Get();
+            for(const auto& stage:{generation->current_staging[current_slot],
+                    request_pair ? generation->synthetic_staging[synthetic_slot] : nullptr}) {
+                if(stage && FAILED(queue->Wait(generation->handover_fence.Get(),
+                        stage->last_handover_copy.load(std::memory_order_acquire)))) {
+                    output.reason=GenerationPrepareReason::synthesis_failed; return output;
+                }
+            }
+        }
+        if (!generation->staged_outputs && !acquire_and_wait_private_image(
                 state->session.get(),
                 state->session->dispatch,
                 current_image)) {
@@ -9061,7 +9185,7 @@ struct AfwSourceCapture {
             return output;
         }
 
-        if (request_pair &&
+        if (request_pair && !generation->staged_outputs &&
             !acquire_and_wait_private_image(
                 state->session.get(),
                 state->session->dispatch,
@@ -9081,7 +9205,7 @@ struct AfwSourceCapture {
         // write on the queue the application supplied, which is not the one
         // about to write them, so carry that guarantee across before any
         // synthesis is queued.
-        if (state->session->d3d12_synthesis_queue) {
+        if (!generation->staged_outputs && state->session->d3d12_synthesis_queue) {
             std::scoped_lock gpu_lock(state->session->gpu_mutex);
             static_cast<void>(
                 synthesizer->synchronize_producer_queue(
@@ -9091,11 +9215,11 @@ struct AfwSourceCapture {
         const std::uint32_t current_destination_index =
             static_cast<std::uint32_t>(current_slot) *
                 generation->current_images_per_slot +
-            current_image.acquired_index;
+            (generation->staged_outputs ? 0 : current_image.acquired_index);
         const std::uint32_t synthetic_destination_index =
             static_cast<std::uint32_t>(synthetic_slot) *
                 generation->synthetic_images_per_slot +
-            synthetic_image.acquired_index;
+            (generation->staged_outputs ? 0 : synthetic_image.acquired_index);
 
         xrfg::D3D12FrameSynthesisTicket ticket{};
         const auto debug_marker = request_pair && state->session->fsr_cadence.marker_enabled() &&
@@ -9141,7 +9265,7 @@ struct AfwSourceCapture {
             // The legacy queue can hand S to the runtime while the producer
             // advances. Submit B now as well, so its queue dependency precedes
             // that next application frame rather than being inserted after S.
-            const bool defer_current_copy = !worker_submission &&
+            const bool defer_current_copy = !generation->staged_outputs && !worker_submission &&
                 generation->d3d11_interop == nullptr &&
                 !state->session->queued_nvidia_presenter;
             if (!generation->d3d11_interop || SUCCEEDED(submit_result)) {
@@ -9216,6 +9340,11 @@ struct AfwSourceCapture {
                     ticket));
         }
 
+        if (generation->staged_outputs && SUCCEEDED(submit_result)) {
+            output.staging_generation=generation; output.staging_ticket=ticket;
+            output.synthesizer=synthesizer;
+            output.current_slot=current_slot; output.synthetic_slot=synthetic_slot;
+        }
         if (worker_submission && SUCCEEDED(submit_result)) {
             // Submit both eyes before waiting. No unfinished synthesis fence
             // is placed on the application's D3D11 context here.
@@ -9237,13 +9366,13 @@ struct AfwSourceCapture {
             return output;
         }
         bool synthetic_released = true;
-        if (request_pair) {
+        if (request_pair && !generation->staged_outputs) {
             synthetic_released = release_private_image(
                 state->session.get(),
                 state->session->dispatch,
                 synthetic_image);
         }
-        const bool current_released = defer_d3d11_publication && SUCCEEDED(submit_result)
+        const bool current_released = generation->staged_outputs || (defer_d3d11_publication && SUCCEEDED(submit_result))
             ? true
             : release_private_image(state->session.get(),
                 state->session->dispatch, current_image);
@@ -9461,6 +9590,7 @@ struct AfwSourceCapture {
                 g.worker_publication.copy_complete_value);
             success = SUCCEEDED(published) && success;
         }
+        if (g.staging_generation) continue;
         if (g.kind == PreparedGenerationKind::pair)
             success = release_private_image(state.get(), state->dispatch,
                 g.worker_generation->synthetic[g.synthetic_slot]) && success;
@@ -9536,12 +9666,15 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
                 GeneratedFrameEndInfo real_info, synthetic_info;
                 success = success && build_generated_frame_end_info(&job->metadata->info, job->snapshot,
                     false, real_destinations, &real_info);
+                GeneratedFrameEndInfo pending_synthetic;
+                attach_djules_outputs(prepared,real_info,job->pair?&pending_synthetic:nullptr);
                 real_info.composition_images = job->metadata->composition_images;
                 if (success) real = make_presenter_owned_frame(std::move(real_info));
                 success = success && real != nullptr;
                 if (success && job->pair) {
                     success = build_generated_frame_end_info(&job->metadata->info, job->snapshot,
                         true, synthetic_destinations, &synthetic_info);
+                    synthetic_info.pending_outputs=std::move(pending_synthetic.pending_outputs);
                     synthetic_info.synthetic = true;
                     synthetic_info.composition_images = job->metadata->composition_images;
                     if (success) synthetic = make_presenter_owned_frame(std::move(synthetic_info));
@@ -10654,6 +10787,16 @@ struct InternalCycleResult {
     join_runtime_queue_to_application(state.get(), state->app_end_frame_release_value);
     const XrResult end_result = with_runtime_entry(state, [&] {
         log_luke_physical_boundary(state, &submitted, frame_serial, 6, prepared);
+        GeneratedFrameEndInfo pending;
+        if(prepared) {
+            // Only this real's exact staging; no extra current copy or latest lookup.
+            for(const auto& resource:prepared->resources) {
+                const auto& output=resource.generation;
+                if(output.staging_generation) pending.pending_outputs.push_back({output.staging_generation,
+                    output.staging_generation->current_staging[output.current_slot],output.synthesizer,output.staging_ticket,false});
+            }
+        }
+        if(!handover_djules_outputs(state.get(),pending.pending_outputs)) return XR_ERROR_RUNTIME_FAILURE;
         return state->fps_overlay
             ? state->fps_overlay->end_frame(&submitted, false)
             : state->dispatch->end_frame(state->handle, &submitted);
@@ -12049,7 +12192,7 @@ XrResult layer_end_frame_impl(
             if (!state->queued_nvidia_presenter)
             for (const PreparedProjectionResource& resource :
                  prepared.resources) {
-                if (resource.generation.synthesizer) {
+                if (resource.generation.synthesizer && !resource.generation.staging_generation) {
                     first_generated.pending_current_copies.push_back(
                         resource.generation.synthesizer);
                 }
@@ -12067,6 +12210,8 @@ XrResult layer_end_frame_impl(
         clear_generation_continuity(state);
     }
 
+    if(prepared.kind==PreparedGenerationKind::prime) attach_djules_outputs(prepared,first_generated);
+    else if(pair_ready) attach_djules_outputs(prepared,current_generated,&first_generated);
     if (completed_afw) {
         first_generated.composition_images = completed_afw->submission->composition_images;
         current_generated.composition_images = completed_afw->submission->composition_images;
@@ -12255,6 +12400,8 @@ XrResult layer_end_frame_impl(
         join_runtime_queue_to_application(state.get(), generated_release_value);
         result = with_runtime_entry(state, [&] {
             log_luke_physical_boundary(state, submitted_end_info, frame_serial, 4, &prepared);
+            if(submitted_end_info==&first_generated.info &&
+               !handover_djules_outputs(state.get(),first_generated.pending_outputs)) return XR_ERROR_RUNTIME_FAILURE;
             return state->fps_overlay
                 ? state->fps_overlay->end_frame(submitted_end_info, pair_ready)
                 : state->dispatch->end_frame(session, submitted_end_info);
