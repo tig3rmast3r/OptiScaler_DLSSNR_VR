@@ -1,6 +1,10 @@
 // Real D3D12/NVIDIA and the actual release/EndFrame/worker/director code.
 // The runtime alone is mocked. Sources are poisoned after intercepted release.
+#ifdef OFXR_DJULES_COMPARISON
+#include "../variants/djules/openxr_layer.cpp"
+#else
 #include "../src/layer/openxr_layer.cpp"
+#endif
 #include <d3d12sdklayers.h>
 #include <iostream>
 #include <stdexcept>

@@ -13,6 +13,21 @@ endif()
 # V23043 embeds the unchanged layer implementation in the OptiScaler module.
 set(XRFG_TEST_LAYER_DLL "" CACHE FILEPATH "Combined DLL tested by the layer harnesses")
 set(XRFG_LAYER_KIND STATIC)
+set(XRFG_COMPARISON_ROUTE "standard" CACHE STRING "standard or djules comparison runtime")
+set_property(CACHE XRFG_COMPARISON_ROUTE PROPERTY STRINGS standard djules)
+if(XRFG_COMPARISON_ROUTE STREQUAL "djules")
+    set(XRFG_LAYER_SOURCE variants/djules/openxr_layer.cpp)
+    set(XRFG_SYNTHESIS_SOURCE variants/djules/d3d12_frame_synthesizer.cpp)
+    set(XRFG_SYNTHESIS_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/variants/djules/frame_synthesis.hlsl")
+    add_compile_definitions(OFXR_DJULES_COMPARISON=1)
+elseif(XRFG_COMPARISON_ROUTE STREQUAL "standard")
+    set(XRFG_LAYER_SOURCE src/layer/openxr_layer.cpp)
+    set(XRFG_SYNTHESIS_SOURCE src/d3d12/d3d12_frame_synthesizer.cpp)
+    set(XRFG_SYNTHESIS_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl")
+else()
+    message(FATAL_ERROR "Unknown XRFG_COMPARISON_ROUTE")
+endif()
+
 
 option(XRFG_BUILD_LAYER "Build the Windows OpenXR API layer" ON)
 option(XRFG_BUILD_TESTS "Build the core test executable" ON)
@@ -217,27 +232,27 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E SynthesizeGameMotionMidpointPS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_GAME_MOTION_SYNTHESIZE_PIXEL_HEADER}" /Vn g_xrfg_game_motion_synthesize_midpoint_pixel_shader
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${XRFG_SYNTHESIS_SHADER}"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E PackFlowInput
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_PACK_INPUT_HEADER}" /Vn g_xrfg_pack_flow_input_shader
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${XRFG_SYNTHESIS_SHADER}"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T vs_5_1 /E FullscreenTriangleVS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_FULLSCREEN_VERTEX_HEADER}" /Vn g_xrfg_fullscreen_vertex_shader
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${XRFG_SYNTHESIS_SHADER}"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E SynthesizeMidpointPS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_SYNTHESIZE_PIXEL_HEADER}" /Vn g_xrfg_synthesize_midpoint_pixel_shader
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${XRFG_SYNTHESIS_SHADER}"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E ReprojectGeneratedPS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_REPROJECT_GENERATED_PIXEL_HEADER}" /Vn g_xrfg_reproject_generated_pixel_shader
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${XRFG_SYNTHESIS_SHADER}"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E ReprojectGeneratedWithLateHudPS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_REPROJECT_LATE_HUD_PIXEL_HEADER}" /Vn g_xrfg_reproject_late_hud_pixel_shader
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${XRFG_SYNTHESIS_SHADER}"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T vs_5_1 /E CinemaPanelVS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_FSR_CINEMA_VERTEX_HEADER}" /Vn g_xrfg_fsr_cinema_vertex_shader
@@ -249,11 +264,11 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E PackNvidiaFlowInput
             /D XRFG_NVIDIA_LUMA_INPUT=1 /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_NVIDIA_LUMA_INPUT_HEADER}" /Vn g_xrfg_nvidia_pack_luma_input_shader
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${XRFG_SYNTHESIS_SHADER}"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E PackNvidiaFlowInput
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_NVIDIA_PACK_INPUT_HEADER}" /Vn g_xrfg_nvidia_pack_flow_input_shader
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${XRFG_SYNTHESIS_SHADER}"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T vs_5_1 /E CinemaFlattenVS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_CINEMA_FLATTEN_VERTEX_HEADER}" /Vn g_xrfg_cinema_flatten_vertex_shader
@@ -265,19 +280,19 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E SynthesizeNvidiaMidpointPS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_NVIDIA_SYNTHESIZE_PIXEL_HEADER}" /Vn g_xrfg_nvidia_synthesize_midpoint_pixel_shader
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${XRFG_SYNTHESIS_SHADER}"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E SynthesizeNvidiaBidirectionalMidpointPS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_NVIDIA_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}" /Vn g_xrfg_nvidia_bidirectional_synthesize_midpoint_pixel_shader
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${XRFG_SYNTHESIS_SHADER}"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E SynthesizeNvidiaFastMidpointPS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_NVIDIA_FAST_SYNTHESIZE_PIXEL_HEADER}" /Vn g_xrfg_nvidia_fast_synthesize_midpoint_pixel_shader
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${XRFG_SYNTHESIS_SHADER}"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E SynthesizeNvidiaFastBidirectionalMidpointPS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_NVIDIA_FAST_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}" /Vn g_xrfg_nvidia_fast_bidirectional_synthesize_midpoint_pixel_shader
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${XRFG_SYNTHESIS_SHADER}"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E ConvertLukeDepth
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_LUKE_DEPTH_CONVERT_HEADER}" /Vn g_xrfg_luke_depth_convert_shader
@@ -287,7 +302,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             /Fh "${XRFG_LUKE_COMPOSE_MOTION_HEADER}" /Vn g_xrfg_luke_compose_motion_shader
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/luke_compose_motion.hlsl"
         DEPENDS
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${XRFG_SYNTHESIS_SHADER}"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/fsr_cinema_projection.hlsl"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/luke_depth_convert.hlsl"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/luke_compose_motion.hlsl"
@@ -302,7 +317,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         src/d3d11/d3d11_color_identity.cpp
         src/d3d12/d3d12_history.cpp
         src/d3d12/d3d12_fsr_frame_generator.cpp
-        src/d3d12/d3d12_frame_synthesizer.cpp
+        ${XRFG_SYNTHESIS_SOURCE}
         src/d3d12/luke_afw.cpp
         src/d3d12/luke_color_origin.cpp
         "${XRFG_PACK_INPUT_HEADER}"
@@ -401,7 +416,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     endif()
 
     add_library(XR_APILAYER_XRFrameBridge_diagnostic ${XRFG_LAYER_KIND}
-        src/layer/openxr_layer.cpp)
+        ${XRFG_LAYER_SOURCE})
     target_include_directories(XR_APILAYER_XRFrameBridge_diagnostic PRIVATE
         include
         "${XRFG_OPENXR_SDK_ROOT}/include")

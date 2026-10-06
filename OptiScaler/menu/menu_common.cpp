@@ -6941,8 +6941,13 @@ static void RenderOfxrVrFramegenMenu()
         : settings.frame_generation == 1
             ? 4
             : settings.backend == 2 ? 3 : settings.backend == 1 ? 2 : 1;
+#ifdef OFXR_DJULES_COMPARISON
+    bool changed = ImGui::Combo(
+        "Engine", &engine, "Off\0FidelityFX\0Nvidia\0Nvidia (djules)\0FSR 3.1\0");
+#else
     bool changed = ImGui::Combo(
         "Engine", &engine, "Off\0FidelityFX\0Nvidia\0Nvidia (new)\0FSR 3.1\0");
+#endif
     if (changed)
     {
         settings.enabled = engine == 0 ? 0 : 1;

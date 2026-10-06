@@ -1,3 +1,4 @@
+param([ValidateSet("standard","djules")][string]$ComparisonRoute = "standard")
 $ErrorActionPreference = 'Stop'
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
 $vsInstall = & $vswhere -latest -version '[17.0,18.0)' -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -20,7 +21,7 @@ if (-not (Test-Path -LiteralPath $ffxBackend) -or
     & $cmake --build "$PSScriptRoot/build-ofxr-ffx" --config Release --parallel 8
     if ($LASTEXITCODE) { throw 'FidelityFX build failed' }
 }
-& $cmake --fresh -S "$PSScriptRoot/third_party/ofxr" -B "$PSScriptRoot/build-ofxr" -G 'Visual Studio 17 2022' -A x64 -DXRFG_BUILD_STANDALONE=OFF -DXRFG_BUILD_TESTS=OFF "-DXRFG_FIDELITYFX_SDK_ROOT=$sdk" "-DXRFG_OPENXR_SDK_ROOT=$openXrSdk" "-DXRFG_NVIDIA_OPTICAL_FLOW_SDK_ROOT=$nvidiaOpticalFlowSdk" "-DXRFG_FXC_EXECUTABLE=$fxc" "-DXRFG_TEST_LAYER_DLL=$PSScriptRoot/x64/Release/OptiScaler.dll"
+& $cmake --fresh -S "$PSScriptRoot/third_party/ofxr" -B "$PSScriptRoot/build-ofxr" -G 'Visual Studio 17 2022' -A x64 -DXRFG_BUILD_STANDALONE=OFF -DXRFG_BUILD_TESTS=OFF "-DXRFG_COMPARISON_ROUTE=$ComparisonRoute" "-DXRFG_FIDELITYFX_SDK_ROOT=$sdk" "-DXRFG_OPENXR_SDK_ROOT=$openXrSdk" "-DXRFG_NVIDIA_OPTICAL_FLOW_SDK_ROOT=$nvidiaOpticalFlowSdk" "-DXRFG_FXC_EXECUTABLE=$fxc" "-DXRFG_TEST_LAYER_DLL=$PSScriptRoot/x64/Release/OptiScaler.dll"
 if ($LASTEXITCODE) { throw 'OFXR configuration failed' }
 & $cmake --build "$PSScriptRoot/build-ofxr" --config Release --parallel 8
 if ($LASTEXITCODE) { throw 'OFXR build failed' }

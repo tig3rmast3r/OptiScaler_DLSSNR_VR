@@ -1,6 +1,10 @@
 // Compile the actual layer implementation into this test: no test-only switch
 // or alternate director implementation is added to the distributed DLL.
+#ifdef OFXR_DJULES_COMPARISON
+#include "../variants/djules/openxr_layer.cpp"
+#else
 #include "../src/layer/openxr_layer.cpp"
+#endif
 #include <iostream>
 #include <stdexcept>
 #include <fstream>
