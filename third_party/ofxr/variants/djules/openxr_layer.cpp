@@ -353,6 +353,8 @@ struct Dispatch {
     // capture can say whether the runtime stopped asking for frames, and why.
     PFN_xrPollEvent poll_event{};
     bool steamvr_runtime{};
+    bool virtual_desktop_runtime{};
+    bool inline_unless_pipelined{};
     XrVersion runtime_version{};
     std::string runtime_name;
 };
@@ -1129,6 +1131,18 @@ void drain_binding_queue(SessionState* state) noexcept {
     const auto error = *left - target;
     if (error >= -dead_band && error <= dead_band) return {};
     return std::clamp(error / 4, -period / 2, period / 2);
+}
+
+// Non-SteamVR/non-VD runtimes pace through xrWaitFrame. Impose only a
+// half-period floor after the actual previous EndFrame return, not a second
+// absolute clock. VD deliberately keeps the steady grid without a release offset.
+[[nodiscard]] std::chrono::steady_clock::time_point djules_handover_floor(
+    std::chrono::steady_clock::time_point now,
+    std::chrono::steady_clock::time_point last_returned,
+    std::chrono::nanoseconds period) noexcept {
+    if (last_returned == std::chrono::steady_clock::time_point{} ||
+        period <= std::chrono::nanoseconds::zero()) return now;
+    return (std::max)(now, last_returned + period / 2);
 }
 
 // D26's absolute display grid: loop cost never compounds into the period.
@@ -3985,6 +3999,9 @@ XrResult layer_create_api_layer_instance_impl(
         if (XR_SUCCEEDED(get_instance_properties(created_instance, &properties))) {
             dispatch->runtime_version = properties.runtimeVersion;
             dispatch->runtime_name = properties.runtimeName;
+            dispatch->virtual_desktop_runtime = dispatch->runtime_name.find("VirtualDesktopXR") != std::string::npos;
+            dispatch->inline_unless_pipelined = dispatch->virtual_desktop_runtime ||
+                dispatch->runtime_name.find("Pimax OpenXR") != std::string::npos;
             dispatch->steamvr_runtime =
                 std::string_view(dispatch->runtime_name).find("SteamVR") !=
                 std::string_view::npos;
@@ -7517,7 +7534,8 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
         xrfg::TwoOutputSchedule fsr_schedule;
         xrfg::TwoOutputSchedule director_schedule;
         xrfg::MidpointSchedule midpoint_schedule;
-    DjulesAbsoluteSchedule djules_schedule;
+        DjulesAbsoluteSchedule djules_schedule;
+        std::chrono::steady_clock::time_point djules_last_returned{};
         for (;;) {
             std::shared_ptr<ThreeSlotFrame> selected;
             std::shared_ptr<PresenterSubmission> borrowed;
@@ -7604,8 +7622,12 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             {
                 const auto period = std::chrono::nanoseconds(state->presenter_display_period);
                 const auto now = std::chrono::steady_clock::now();
-                if (state->three_slot_director && djules_native_scheduler(*state))
-                    submission_slot = djules_schedule.claim(now, period);
+                if (state->three_slot_director && djules_native_scheduler(*state)) {
+                    if (state->dispatch->steamvr_runtime || state->dispatch->virtual_desktop_runtime)
+                        submission_slot = djules_schedule.claim(now, period);
+                    else
+                        submission_slot = djules_handover_floor(now, djules_last_returned, period);
+                }
                 else if (state->three_slot_director)
                     submission_slot = midpoint_schedule.claim(now, period, synthetic);
                 else {
@@ -7686,10 +7708,12 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             if (state->fsr_two_slot_presenter)
                 fsr_schedule.submitted(submission_slot, std::chrono::nanoseconds(state->presenter_display_period),
                     std::chrono::steady_clock::now());
-            else if (state->three_slot_director && djules_native_scheduler(*state))
+            else if (state->three_slot_director && djules_native_scheduler(*state)) {
+                djules_last_returned = std::chrono::steady_clock::now();
                 djules_schedule.submitted(submission_slot,
-                    std::chrono::nanoseconds(state->presenter_display_period), std::chrono::steady_clock::now(),
+                    std::chrono::nanoseconds(state->presenter_display_period), djules_last_returned,
                     XR_SUCCEEDED(result) ? phase_step : std::chrono::nanoseconds{});
+            }
             else if (state->three_slot_director)
                 midpoint_schedule.submitted(submission_slot,
                     std::chrono::nanoseconds(state->presenter_display_period));

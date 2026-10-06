@@ -46,6 +46,13 @@ void djules_absolute_grid_test() {
     grid.submitted(origin, nanoseconds::zero(), origin + milliseconds(1));
     check(grid.claim(origin + milliseconds(2), nanoseconds::zero()) == origin + milliseconds(2),
         "invalid period divided by zero or retained stale deadline");
+    check(djules_handover_floor(origin + milliseconds(2), origin, period) == origin + milliseconds(5),
+        "non-SteamVR floor did not hold half a period after End return");
+    check(djules_handover_floor(origin + milliseconds(7), origin, period) == origin + milliseconds(7),
+        "already paced runtime acquired an additional clock");
+    check(djules_handover_floor(origin, {}, period) == origin &&
+        djules_handover_floor(origin, origin, nanoseconds::zero()) == origin,
+        "first/invalid floor acquired stale deadline");
     std::cout << "Djules absolute grid: fixed slots, loop jitter, aligned stall recovery and no catch-up burst\n";
 }
 
