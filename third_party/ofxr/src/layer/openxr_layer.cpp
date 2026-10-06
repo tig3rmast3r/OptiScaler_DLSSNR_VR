@@ -28,6 +28,7 @@
 #include <psapi.h>
 #include <d3d11_4.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <openxr/openxr.h>
@@ -495,6 +496,13 @@ struct SessionState {
     xrfg::D3D12OpticalFlowBackend optical_flow_backend{
         xrfg::D3D12OpticalFlowBackend::fidelity_fx};
     xrfg::D3D12NvidiaOpticalFlowOptions nvidia_options{};
+    // D35: bounded opt-in allocation/adapter records; never a pacing input.
+    std::mutex video_memory_mutex;
+    Microsoft::WRL::ComPtr<IDXGIAdapter3> video_memory_adapter;
+    bool video_memory_unavailable{};
+    std::chrono::steady_clock::time_point video_memory_poll_at{};
+    std::chrono::steady_clock::time_point video_memory_first_poll{};
+
     bool nvidia_new_route{};
     bool dlss_motion_vectors{};
     xrfg::D3D12FrameGenerationMode frame_generation_mode{};
@@ -987,6 +995,107 @@ void log_completed_nvidia_gpu_timings(
 }
 
 struct SwapchainState;
+
+enum class VideoMemoryStage : std::int64_t {
+    session = 1,
+    application_swapchain = 2,
+    current_ring = 3,
+    synthetic_ring = 4,
+    interop = 5,
+    history = 6,
+    synthesizer = 7,
+    swapchain_destroyed = 8,
+    periodic = 9,
+    // The first acquire of a private swapchain: a runtime that allocates
+    // on first use rather than at creation shows up here, c= the swapchain.
+    private_first_use = 10,
+    // The staging textures of single-swapchain rings.
+    staging = 11,
+};
+
+void log_video_memory(
+    SessionState& session,
+    VideoMemoryStage stage,
+    std::uint64_t subject) noexcept {
+    try {
+        if (!xrfg::bridge_flight_logger().enabled()) {
+            return;
+        }
+        Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter;
+        {
+            std::scoped_lock lock(session.video_memory_mutex);
+            if (!session.video_memory_adapter && !session.video_memory_unavailable) {
+                LUID luid{};
+                bool found = false;
+                if (session.d3d12_device) {
+                    luid = session.d3d12_device->GetAdapterLuid();
+                    found = true;
+                } else if (session.d3d11_device) {
+                    Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device;
+                    Microsoft::WRL::ComPtr<IDXGIAdapter> device_adapter;
+                    DXGI_ADAPTER_DESC description{};
+                    if (SUCCEEDED(session.d3d11_device.As(&dxgi_device)) &&
+                        SUCCEEDED(dxgi_device->GetAdapter(&device_adapter)) &&
+                        SUCCEEDED(device_adapter->GetDesc(&description))) {
+                        luid = description.AdapterLuid;
+                        found = true;
+                    }
+                }
+                // No device yet: a later record finds one.
+                if (!found) {
+                    return;
+                }
+                Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+                if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
+                    FAILED(factory->EnumAdapterByLuid(
+                        luid, IID_PPV_ARGS(&session.video_memory_adapter)))) {
+                    session.video_memory_adapter.Reset();
+                    session.video_memory_unavailable = true;
+                    return;
+                }
+            }
+            adapter = session.video_memory_adapter;
+        }
+        if (!adapter) {
+            return;
+        }
+        DXGI_QUERY_VIDEO_MEMORY_INFO local{};
+        if (FAILED(adapter->QueryVideoMemoryInfo(
+                0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local))) {
+            return;
+        }
+        xrfg::bridge_flight_logger().event(
+            xrfg::BridgeFlightOperation::vram_usage,
+            static_cast<std::int64_t>(stage),
+            local.CurrentUsage,
+            local.Budget,
+            subject);
+    } catch (...) {
+    }
+}
+
+// swapchain_image for a D3D12 image: what the runtime actually allocated
+// against what was asked for. result= DXGI format, a= swapchain, b= width
+// <<32 | height, c= mip levels<<48 | array size<<32 | resource flags.
+void log_d3d12_image_description(XrSwapchain swapchain, ID3D12Resource* image) noexcept {
+    try {
+        if (image == nullptr ||
+            !xrfg::bridge_flight_logger().enabled()) {
+            return;
+        }
+        const D3D12_RESOURCE_DESC description = image->GetDesc();
+        xrfg::bridge_flight_logger().event(
+            xrfg::BridgeFlightOperation::swapchain_image,
+            static_cast<std::int64_t>(description.Format),
+            handle_value(swapchain),
+            (static_cast<std::uint64_t>(description.Width) << 32) |
+                description.Height,
+            (static_cast<std::uint64_t>(description.MipLevels) << 48) |
+                (static_cast<std::uint64_t>(description.DepthOrArraySize) << 32) |
+                static_cast<std::uint32_t>(description.Flags));
+    } catch (...) {
+    }
+}
 
 enum class SwapchainEligibilityReason : std::int64_t {
     ready = 0,
@@ -1813,6 +1922,7 @@ create_d3d12_frame_generation_swapchains(
             return nullptr;
         }
 
+        log_video_memory(*state->session, VideoMemoryStage::synthesizer, handle_value(state->handle));
         auto generation = std::make_shared<FrameGenerationSwapchainState>();
         adopt_current_ring(generation, current);
         adopt_synthetic_ring(generation, synthetic);
@@ -2016,6 +2126,7 @@ create_d3d11_frame_generation_swapchains(
             return nullptr;
         }
 
+        log_video_memory(*state->session, VideoMemoryStage::synthesizer, handle_value(state->handle));
         auto generation = std::make_shared<FrameGenerationSwapchainState>();
         adopt_current_ring(generation, current);
         adopt_synthetic_ring(generation, synthetic);
@@ -3019,6 +3130,7 @@ XrResult layer_create_session_impl(
         return result;
     }
     state->handle = created_session;
+    log_video_memory(*state, VideoMemoryStage::session, 0);
     // Optional instrumentation cannot fail an otherwise valid session.
     try {
         state->fps_overlay = std::make_unique<xrfg::OpenXrFpsOverlay>(
@@ -3677,6 +3789,7 @@ XrResult layer_create_swapchain_impl(
         return result;
     }
     swapchain_state->handle = created_swapchain;
+    log_video_memory(*state, VideoMemoryStage::application_swapchain, handle_value(created_swapchain));
 
     xrfg::bridge_flight_logger().event(
         xrfg::BridgeFlightOperation::swapchain_create,
@@ -3781,6 +3894,7 @@ XrResult layer_destroy_swapchain_impl(XrSwapchain swapchain) {
         std::scoped_lock lock(g_state_mutex);
         g_swapchains.erase(swapchain);
     }
+    log_video_memory(*state->session, VideoMemoryStage::swapchain_destroyed, handle_value(swapchain));
     return result;
 }
 
@@ -3951,6 +4065,7 @@ XrResult layer_enumerate_swapchain_images_impl(
             }
             resources[index] = d3d12_images[index].texture;
         }
+        log_d3d12_image_description(state->handle, resources.front());
         std::shared_ptr<xrfg::D3D12SwapchainHistory> history;
         bool resources_changed = false;
         {
@@ -4000,6 +4115,7 @@ XrResult layer_enumerate_swapchain_images_impl(
                 *release_state);
             if (SUCCEEDED(history_result)) {
                 history = std::move(candidate);
+                log_video_memory(*state->session, VideoMemoryStage::history, handle_value(state->handle));
             }
         }
         if (!reused_history) {
@@ -9417,6 +9533,26 @@ void commit_luke_pair(std::span<const ProjectionResourceMapping> mappings,
                 ? chain->last_released_capture->serial : 0;
         }
     }
+}
+
+void log_video_memory_periodically(SessionState& state) noexcept {
+    if (!xrfg::bridge_flight_logger().enabled()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < state.video_memory_poll_at) {
+        return;
+    }
+    // Every second for the first minute: what a runtime or the game does
+    // right after arming lands inside the first few seconds.
+    if (state.video_memory_first_poll == std::chrono::steady_clock::time_point{}) {
+        state.video_memory_first_poll = now;
+    }
+    state.video_memory_poll_at = now +
+        (now - state.video_memory_first_poll < std::chrono::seconds(60)
+             ? std::chrono::seconds(1)
+             : std::chrono::seconds(5));
+    log_video_memory(state, VideoMemoryStage::periodic, 0);
 }
 
 XrResult layer_end_frame_impl(

@@ -177,6 +177,7 @@ enum class BridgeFlightOperation : std::uint32_t {
     luke_render_camera,    // result=eye*100+matrix*10+row,a=guide publication,b/c=4 raw floats
     luke_temporal_pair,    // result=0,a=producer fence,b=previous capture,c=current capture; result1=destinations
     luke_temporal_pose,    // result=phase*100+view*10+pair,a=producer fence,b=capture,c=2 raw floats
+    vram_usage, // D35: stage, current adapter usage, budget, subject.
 };
 
 struct BridgeFlightToken {
