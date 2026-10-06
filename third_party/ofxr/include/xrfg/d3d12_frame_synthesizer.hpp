@@ -255,6 +255,8 @@ public:
     // S_OK means another transaction may begin; ERROR_BUSY leaves the real
     // frame to the caller without blocking the application thread.
     [[nodiscard]] HRESULT previous_submission_available() noexcept;
+    // Poll this owned output ticket, never the newest pair or a deferred copy.
+    [[nodiscard]] HRESULT ticket_available(const D3D12FrameSynthesisTicket& ticket) noexcept;
 
 
     [[nodiscard]] HRESULT wait_for_idle() noexcept;

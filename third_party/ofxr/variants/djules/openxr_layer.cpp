@@ -734,6 +734,7 @@ struct SessionState {
     std::chrono::steady_clock::time_point video_memory_first_poll{};
 
     bool nvidia_new_route{};
+    bool djules_deep_pipeline{};
     bool dlss_motion_vectors{};
     xrfg::D3D12FrameGenerationMode frame_generation_mode{};
     // Luke AFW capability is independent of the currently selected AFW mode.
@@ -4146,6 +4147,8 @@ XrResult layer_create_session_impl(
     state->optical_flow_backend = initial_control.desired.backend == 0
         ? xrfg::D3D12OpticalFlowBackend::fidelity_fx : xrfg::D3D12OpticalFlowBackend::nvidia;
     state->nvidia_new_route = initial_control.desired.backend == 2;
+    state->djules_deep_pipeline = GetPrivateProfileIntW(L"ofxr",L"deep_pipeline",1,
+        (current_layer_directory()/L"ofxr_bridge.ini").c_str())==1;
     state->nvidia_options = {
         static_cast<xrfg::D3D12NvidiaPerformancePreset>(initial_control.desired.preset),
         static_cast<xrfg::D3D12NvidiaInputScale>(initial_control.desired.scale),
@@ -6372,6 +6375,13 @@ using OwnedCompositionLayer = std::variant<
 [[nodiscard]] bool acquire_and_wait_private_image(SessionState* session,
     const std::shared_ptr<Dispatch>& dispatch, PrivateSwapchainState& image) noexcept;
 
+[[nodiscard]] bool hold_djules_synthetic(std::chrono::nanoseconds age,
+    std::chrono::nanoseconds period, bool pixels_ready, bool prior_owned_frame,
+    bool pipelined) noexcept {
+    return prior_owned_frame && !pipelined && period>std::chrono::nanoseconds::zero() &&
+        (age<period || (!pixels_ready && age<period*3));
+}
+
 struct DjulesPendingOutput {
     std::shared_ptr<FrameGenerationSwapchainState> generation;
     std::shared_ptr<DjulesOutputStaging> staging;
@@ -6424,6 +6434,7 @@ struct GeneratedFrameEndInfo {
 // A buffer position owns only this descriptor. The pixels stay in one
 // bridge-owned swapchain image until its director submission has completed.
 struct ThreeSlotFrame {
+    std::chrono::steady_clock::time_point queued_at{};
     std::uint64_t source_sequence{};
     std::uint64_t previous_sequence{};
     std::shared_ptr<GeneratedFrameEndInfo> frame;
@@ -7628,6 +7639,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
         xrfg::MidpointSchedule midpoint_schedule;
         DjulesAbsoluteSchedule djules_schedule;
         std::chrono::steady_clock::time_point djules_last_returned{};
+        std::shared_ptr<GeneratedFrameEndInfo> djules_last_owned;
         for (;;) {
             std::shared_ptr<ThreeSlotFrame> selected;
             std::shared_ptr<PresenterSubmission> borrowed;
@@ -7706,7 +7718,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             if (XR_FAILED(result)) { fail(result); break; }
             // Only the consumer is limited to headset cadence. The game's
             // WaitFrame contains no sleep and no dependency on director ticks.
-            const bool synthetic = selected ? selected->frame->synthetic
+            bool synthetic = selected ? selected->frame->synthetic
                 : borrowed->owned_frame && borrowed->owned_frame->synthetic;
             const auto pace_token = xrfg::bridge_flight_logger().begin(
                 xrfg::BridgeFlightOperation::presenter_pace);
@@ -7746,7 +7758,29 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             }
             xrfg::bridge_flight_logger().end(pace_token,
                 xrfg::BridgeFlightOperation::presenter_pace, 0);
-            const XrFrameEndInfo* source = selected ? &selected->frame->info
+            bool repeat_held=false;
+            bool drain_requested=false;
+            { std::scoped_lock lock(state->presenter_mutex); drain_requested=state->director_draining; }
+            if(selected && synthetic && state->djules_deep_pipeline && djules_native_scheduler(*state) &&
+                !drain_requested) {
+                bool ready=true, output_failed=false;
+                for(const auto& output:selected->frame->pending_outputs) {
+                    const HRESULT available=output.synthesizer->ticket_available(output.ticket);
+                    if(FAILED(available)) { fail(XR_ERROR_RUNTIME_FAILURE); output_failed=true; break; }
+                    ready &= available==S_OK;
+                }
+                if(output_failed) break;
+                repeat_held=hold_djules_synthetic(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()-selected->queued_at),
+                    std::chrono::nanoseconds(state->presenter_display_period),ready,
+                    djules_last_owned!=nullptr,state->pipelined_presenter_mode);
+                if(repeat_held) {
+                    synthetic=false;
+                    std::scoped_lock lock(state->presenter_mutex);
+                    state->presenter_inflight_frame=djules_last_owned;
+                }
+            }
+            const XrFrameEndInfo* source = repeat_held?&djules_last_owned->info : selected ? &selected->frame->info
                 : borrowed->owned_frame ? &borrowed->owned_frame->info : borrowed->borrowed_frame;
             XrFrameEndInfo end = *source;
             end.next = nullptr;
@@ -7772,14 +7806,12 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
                                     handle_value(projection->space),handle_value(projection->views[view].subImage.swapchain));
                         }
                     }
-                    join_runtime_queue_to_application(state.get(), selected
-                        ? selected->frame->app_release_value
-                        : borrowed->owned_frame ? borrowed->owned_frame->app_release_value : borrowed->app_release_value);
-                    auto* owned=selected?selected->frame.get():borrowed->owned_frame.get();
+                    auto* owned=repeat_held?djules_last_owned.get():selected?selected->frame.get():borrowed->owned_frame.get();
+                    join_runtime_queue_to_application(state.get(),owned?owned->app_release_value:borrowed->app_release_value);
                     if(owned && !handover_djules_outputs(state.get(),owned->pending_outputs)) return XR_ERROR_RUNTIME_FAILURE;
-                    phase_step = sample_djules_phase_step(state, selected && !synthetic,
+                    phase_step = sample_djules_phase_step(state, selected && !synthetic && !repeat_held,
                         selected ? selected->source_sequence : 0);
-                    return state->fps_overlay ? state->fps_overlay->end_frame(&end, synthetic)
+                    return state->fps_overlay ? state->fps_overlay->end_frame(&end, synthetic,!repeat_held)
                         : state->dispatch->end_frame(state->handle, &end);
                 });
             }
@@ -7820,7 +7852,11 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             {
                 std::scoped_lock lock(state->presenter_mutex);
                 if (selected) {
-                    static_cast<void>(state->three_slots.release_front(state->director_draining));
+                    if(!repeat_held) {
+                        if(XR_SUCCEEDED(result) && state->djules_deep_pipeline && djules_native_scheduler(*state))
+                            djules_last_owned=selected->frame;
+                        static_cast<void>(state->three_slots.release_front(state->director_draining));
+                    }
                 } else {
                     borrowed->result = result;
                     borrowed->completed = true;
@@ -7833,7 +7869,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             }
             if (state->three_slot_director)
             xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::three_slot_present,
-                synthetic ? 1 : 0, selected ? selected->source_sequence : 0,
+                repeat_held ? 2 : synthetic ? 1 : 0, selected ? selected->source_sequence : 0,
                 selected ? selected->previous_sequence : 0, end.displayTime);
             if (state->frame_capture && state->frame_capture->active()) {
                 try {
@@ -9545,6 +9581,7 @@ struct AfwSourceCapture {
     for (auto& resource : prepared.resources) {
         auto& g = resource.generation;
         if (!g.worker_generation) continue;
+        if(g.staging_generation && state->djules_deep_pipeline && djules_native_scheduler(*state)) continue;
         const auto completion_token = xrfg::bridge_flight_logger().begin(
             xrfg::BridgeFlightOperation::timing_synthesis_complete,
             source_sequence, handle_value(resource.application_swapchain));
@@ -9633,7 +9670,8 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
             const auto auxiliary_token = xrfg::bridge_flight_logger().begin(
                 xrfg::BridgeFlightOperation::timing_aux_complete,
                 job->current->source_sequence, job->current->previous_sequence);
-            if (success && job->metadata) {
+            if (success && job->metadata &&
+                !(state->djules_deep_pipeline && djules_native_scheduler(*state))) {
                 for (const auto& image : job->metadata->composition_images) {
                     success = SUCCEEDED(wait_composition_fence(image->fence.Get(), image->ready_value)) && success;
                     success = SUCCEEDED(wait_composition_fence(image->fence12.Get(), image->ready_value)) && success;
@@ -9699,7 +9737,8 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
                 break;
             }
             xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::three_slot_gpu_ready,
-                job->pair ? 1 : 0, job->current->source_sequence, job->current->previous_sequence);
+                state->djules_deep_pipeline && djules_native_scheduler(*state) ? 2 : job->pair ? 1 : 0,
+                job->current->source_sequence, job->current->previous_sequence);
             {
                 std::unique_lock lock(state->presenter_mutex);
                 job->current->frame = std::move(real);
@@ -9718,6 +9757,7 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
                         xrfg::BridgeFlightOperation::timing_slot_wait, 0,
                         job->current->source_sequence, job->current->previous_sequence);
                     auto midpoint = std::make_shared<ThreeSlotFrame>();
+                    midpoint->queued_at=job->current->queued_at;
                     midpoint->source_sequence = job->current->source_sequence;
                     midpoint->previous_sequence = job->current->previous_sequence;
                     midpoint->frame = std::move(synthetic);
@@ -10021,6 +10061,7 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
     job->mappings.assign(mappings.begin(), mappings.end());
     job->post_afw_frame = std::move(post_afw_frame);
     job->current = std::make_shared<ThreeSlotFrame>();
+    job->current->queued_at=std::chrono::steady_clock::now();
     const auto token = xrfg::bridge_flight_logger().begin(
         xrfg::BridgeFlightOperation::three_slot_buffer_wait, handle_value(state->handle));
     {

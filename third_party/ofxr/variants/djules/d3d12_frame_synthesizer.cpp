@@ -6180,6 +6180,17 @@ HRESULT D3D12FrameSynthesizer::wait_for_previous_submission(
     }
 }
 
+HRESULT D3D12FrameSynthesizer::ticket_available(const D3D12FrameSynthesisTicket& ticket) noexcept {
+    try {
+        std::scoped_lock lock(mutex_);
+        const auto value=ticket.synthetic_fence_value?ticket.synthetic_fence_value:ticket.fence_value;
+        if(!impl_ || !impl_->fence || !value || value>impl_->last_submitted_fence_value) return E_INVALIDARG;
+        const auto completed=impl_->fence->GetCompletedValue();
+        if(completed==UINT64_MAX) return DXGI_ERROR_DEVICE_REMOVED;
+        return completed>=value?S_OK:S_FALSE;
+    } catch(...) { return E_FAIL; }
+}
+
 HRESULT D3D12FrameSynthesizer::previous_submission_available() noexcept {
     try {
         std::scoped_lock lock(mutex_);

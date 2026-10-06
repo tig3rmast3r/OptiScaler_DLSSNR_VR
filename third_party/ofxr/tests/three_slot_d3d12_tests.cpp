@@ -29,6 +29,7 @@ bool fsr_queue_switch{};
 bool legacy_queue{};
 bool legacy_early_current{};
 bool midpoint_cadence{};
+bool deep_readiness{};
 bool fsr_queue_gpu_pending{};
 ComPtr<ID3D12Fence> fsr_gpu_gate;
 std::jthread fsr_gpu_watchdog;
@@ -60,16 +61,17 @@ ComPtr<ID3D12Resource> resource(unsigned slices, bool buffer = false,
     return r;
 }
 
-template<class Record> void commands(Record record) {
+template<class Record> void commands(Record record, ID3D12CommandQueue* execution_queue=nullptr) {
+    if(!execution_queue) execution_queue=session_state->d3d12_queue.Get();
     std::scoped_lock lock(test_gpu);
     ComPtr<ID3D12CommandAllocator> allocator; ComPtr<ID3D12GraphicsCommandList> list;
     hr(session_state->d3d12_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"allocator");
     hr(session_state->d3d12_device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list)),"list");
     record(list.Get()); hr(list->Close(),"close");
-    ID3D12CommandList* lists[]={list.Get()}; session_state->d3d12_queue->ExecuteCommandLists(1,lists);
+    ID3D12CommandList* lists[]={list.Get()}; execution_queue->ExecuteCommandLists(1,lists);
     ComPtr<ID3D12Fence> fence;
     hr(session_state->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"fence");
-    hr(session_state->d3d12_queue->Signal(fence.Get(),1),"signal");
+    hr(execution_queue->Signal(fence.Get(),1),"signal");
     hr(wait_composition_fence(fence.Get(),1),"test GPU completion");
 }
 void barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
@@ -107,7 +109,11 @@ unsigned pixel(ID3D12Resource* r, unsigned slice,
         D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource=readback.Get(); dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint=layout;
         list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
         barrier(list,r,D3D12_RESOURCE_STATE_COPY_SOURCE,submitted_state);
+#ifdef OFXR_DJULES_COMPARISON
+    },deep_readiness?runtime_queue(*session_state):nullptr);
+#else
     });
+#endif
     void* mapped=nullptr; hr(readback->Map(0,nullptr,&mapped),"readback");
     const unsigned value=*reinterpret_cast<unsigned*>(static_cast<unsigned char*>(mapped)+layout.Offset+64*layout.Footprint.RowPitch+128*4);
     readback->Unmap(0,nullptr); return value;
@@ -271,6 +277,10 @@ int main(int argc,char** argv) {
         auto& s=session_state;s->handle=reinterpret_cast<XrSession>(0x211);s->graphics_binding=SessionGraphicsBinding::d3d12;
         s->optical_flow_backend=xrfg::D3D12OpticalFlowBackend::nvidia;
         s->nvidia_new_route = true;
+#ifdef OFXR_DJULES_COMPARISON
+        deep_readiness=argc>1 && std::string_view(argv[1])=="deep-readiness";
+        s->djules_deep_pipeline=deep_readiness;
+#endif
         fsr_test=argc>1 && std::string_view(argv[1]).starts_with("fsr-");
         legacy_queue=argc>1 && std::string_view(argv[1]).starts_with("legacy-queue");
         legacy_early_current=argc>1 && std::string_view(argv[1])=="legacy-queue-early-b";
@@ -307,6 +317,14 @@ int main(int argc,char** argv) {
         D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
         hr(s->d3d12_device->CreateCommandQueue(&q,IID_PPV_ARGS(&s->d3d12_queue)),"application queue");
         hr(s->d3d12_device->CreateCommandQueue(&q,IID_PPV_ARGS(&s->d3d12_synthesis_queue)),"synthesis queue");
+#ifdef OFXR_DJULES_COMPARISON
+        if(deep_readiness) {
+            dispatch->steamvr_runtime=true;
+            hr(s->d3d12_device->CreateCommandQueue(&q,IID_PPV_ARGS(&s->binding_queue)),"DJ runtime binding queue");
+            hr(s->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&s->app_release_fence)),"DJ app release fence");
+            hr(s->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&s->reacquire_fence)),"DJ reacquire fence");
+        }
+#endif
         dispatch->create_swapchain=fake_create;dispatch->enumerate_swapchain_images=fake_enumerate;dispatch->destroy_swapchain=fake_destroy;
         dispatch->acquire_swapchain_image=[](XrSwapchain,const XrSwapchainImageAcquireInfo*,uint32_t* index)->XrResult{*index=0;return XR_SUCCESS;};
         dispatch->wait_swapchain_image=[](XrSwapchain,const XrSwapchainImageWaitInfo*)->XrResult{return XR_SUCCESS;};
@@ -469,8 +487,20 @@ int main(int argc,char** argv) {
         require(XR_SUCCEEDED(wait_for_synthesis_handoff(s)),"final worker");
         if(!fsr_queue_switch) require(XR_SUCCEEDED(wait_for_presenter_idle(s)),"director drain");
         stop_continuous_presenter(s);
+        unsigned repeats=0;
+        if(deep_readiness) {
+            std::vector<std::pair<unsigned,bool>> fresh;
+            for(const auto& receipt:submissions) {
+                if(!fresh.empty() && receipt==fresh.back()) {
+                    require(!receipt.second,"deep repeat reused synthetic rather than owned prior real"); ++repeats;
+                } else fresh.push_back(receipt);
+            }
+            require(repeats>0,"deep GPU fixture never exercised an owned repeat");
+            require(submissions.size()==fresh.size()+repeats,"deep physical output accounting");
+            submissions=std::move(fresh);
+        }
         const unsigned expected_count=fsr_queue_switch ? 16 : fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
-        require(submissions.size()==expected_count && waits==expected_count && begins==expected_count && ends==expected_count,"unique output/cycle count");
+        require(submissions.size()==expected_count && waits==expected_count+repeats && begins==expected_count+repeats && ends==expected_count+repeats,"unique output/cycle count");
         if(fsr_missing) {
             for(unsigned i=0;i<8;++i) require(submissions[i]==std::pair<unsigned,bool>{i+1,false},"FSR missing guide repeated/lost real");
         } else if(gap_test) {

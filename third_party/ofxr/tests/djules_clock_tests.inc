@@ -56,6 +56,19 @@ void djules_absolute_grid_test() {
     std::cout << "Djules absolute grid: fixed slots, loop jitter, aligned stall recovery and no catch-up burst\n";
 }
 
+void djules_readiness_test() {
+    using namespace std::chrono;
+    const auto p=nanoseconds(milliseconds(10));
+    check(hold_djules_synthetic(milliseconds(9),p,true,true,false),"deep synthetic lost minimum age");
+    check(!hold_djules_synthetic(milliseconds(10),p,true,true,false),"ready owned output held past deadline");
+    check(hold_djules_synthetic(milliseconds(29),p,false,true,false),"unwritten output lost readiness window");
+    check(!hold_djules_synthetic(milliseconds(30),p,false,true,false),"readiness hold exceeded three periods");
+    check(!hold_djules_synthetic(milliseconds(1),p,false,false,false),"startup repeated missing/unowned image");
+    check(!hold_djules_synthetic(milliseconds(1),p,false,true,true),"pipelined game inherited deep hold");
+    check(!hold_djules_synthetic(milliseconds(1),nanoseconds::zero(),false,true,false),"invalid period held output");
+    std::cout << "DJ deep readiness: owned repeat only, one-period age, three-period unwritten cap, pipeline guard\n";
+}
+
 void djules_inline_policy_test() {
     auto s = session();
     s->menu_enabled = true; s->nvidia_new_route = true; s->luke_afw_enabled = false;

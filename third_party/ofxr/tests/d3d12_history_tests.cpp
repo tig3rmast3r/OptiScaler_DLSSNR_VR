@@ -4106,9 +4106,18 @@ void test_djules_extra_output(D3D12WarpFixture& fixture) {
     require(operation_succeeded(history->capture(1,&tb))&&operation_succeeded(history->commit(tb)),"extra capture");
     require(synth.submit_pair(tb,views,views,0,1,&pair,{}, {},false,1.0F/3.0F,{},
         xrfg::D3D12ExtraSynthetic{0,2.0F/3.0F})==E_INVALIDARG,"same destination accepted");
-    require(operation_succeeded(synth.submit_pair(tb,views,views,0,1,&pair,{}, {},false,1.0F/3.0F,{},
-        xrfg::D3D12ExtraSynthetic{1,2.0F/3.0F})),"two-output pair");
+    ComPtr<ID3D12Fence> readiness_gate;
+    require(operation_succeeded(fixture.device()->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&readiness_gate))),"ready gate");
+    require(operation_succeeded(fixture.queue()->Wait(readiness_gate.Get(),1)),"ready queue gate");
+    const HRESULT submitted=synth.submit_pair(tb,views,views,0,1,&pair,{}, {},false,1.0F/3.0F,{},
+        xrfg::D3D12ExtraSynthetic{1,2.0F/3.0F});
+    const HRESULT pending=SUCCEEDED(submitted)?synth.ticket_available(pair):submitted;
+    readiness_gate->Signal(1); // release before every assertion/destructor
+    require(operation_succeeded(submitted),"two-output pair");
+    require(pending==S_FALSE,"unfinished owned ticket was reported ready");
     require_frame_start_gate(synth,"two-output fence");
+    require(synth.ticket_available(pair)==S_OK,"completed owned ticket was not reported ready");
+    require(synth.ticket_available({})==E_INVALIDARG,"empty readiness ticket accepted");
     const auto first=readback_pattern(fixture,s1.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET);
     const auto second=readback_pattern(fixture,s2.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET);
     require(readback_pattern(fixture,cb.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET)==pb,"3X real copy changed");
