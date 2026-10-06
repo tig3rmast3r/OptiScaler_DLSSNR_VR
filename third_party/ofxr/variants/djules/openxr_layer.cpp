@@ -3,6 +3,7 @@
 #include "xrfg/d3d11_bridge.hpp"
 #include "xrfg/d3d12_history.hpp"
 #include "djules_output_buffer.hpp"
+#include "djules_triple_release.hpp"
 #include "xrfg/two_output_schedule.hpp"
 #include "xrfg/midpoint_schedule.hpp"
 #include "xrfg/frame_capture.hpp"
@@ -736,6 +737,7 @@ struct SessionState {
     bool nvidia_new_route{};
     bool djules_deep_pipeline{};
     bool djules_triple_requested{};
+    xrfg::DjulesTripleRelease djules_triple_release;
     bool djules_triple_switchable{};
     std::chrono::steady_clock::time_point djules_triple_poll{};
     std::optional<bool> djules_triple_candidate;
@@ -6443,6 +6445,7 @@ struct GeneratedFrameEndInfo {
     std::vector<DjulesPendingOutput> pending_outputs;
     std::uint64_t app_release_value{};
     bool synthetic{};
+    bool djules_leader{};
     XrFrameEndInfo info{XR_TYPE_FRAME_END_INFO};
     std::vector<ProjectionLayerCopy> projections;
     std::vector<OwnedCompositionLayer> composition_layers;
@@ -7105,7 +7108,12 @@ void continuous_presenter_main(
                 : repeated_frame ? repeated_frame->app_release_value : 0);
             end_result = with_runtime_entry(state, [&] {
                 auto* owned=request?request->owned_frame.get():repeated_frame.get();
-                if(owned && !handover_djules_outputs(state.get(),owned->pending_outputs)) return XR_ERROR_RUNTIME_FAILURE;
+                if(owned && djules_native_scheduler(*state)) {
+                        for(const auto& image:owned->composition_images)
+                            if(image->fence12 && FAILED(runtime_queue(*state)->Wait(image->fence12.Get(),image->ready_value)))
+                                return XR_ERROR_RUNTIME_FAILURE;
+                    }
+                    if(owned && !handover_djules_outputs(state.get(),owned->pending_outputs)) return XR_ERROR_RUNTIME_FAILURE;
                 return state->fps_overlay
                     ? state->fps_overlay->end_frame(&submitted, fresh_synthetic, request != nullptr)
                     : state->dispatch->end_frame(state->handle, &submitted);
@@ -7753,7 +7761,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             {
                 const auto period = std::chrono::nanoseconds(state->presenter_display_period);
                 const auto now = std::chrono::steady_clock::now();
-                if (state->three_slot_director && djules_native_scheduler(*state)) {
+                if (djules_native_scheduler(*state) && (state->three_slot_director || state->queued_nvidia_presenter)) {
                     if (state->dispatch->steamvr_runtime || state->dispatch->virtual_desktop_runtime)
                         submission_slot = djules_schedule.claim(now, period);
                     else
@@ -7764,6 +7772,25 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
                 else {
                     auto& schedule = state->fsr_two_slot_presenter ? fsr_schedule : director_schedule;
                     submission_slot = schedule.claim(now, period);
+                }
+                const auto* probe=selected?selected->frame.get():borrowed->owned_frame.get();
+                if(djules_triple_active(*state) && probe && probe->djules_leader) {
+                    const auto deadline=submission_slot-std::chrono::milliseconds(4);
+                    if(deadline>std::chrono::steady_clock::now()) std::this_thread::sleep_until(deadline);
+                    bool ready=!probe->pending_outputs.empty();
+                    for(const auto& output:probe->pending_outputs)
+                        ready &= output.synthesizer->ticket_available(output.ticket)==S_OK;
+                    for(const auto& image:probe->composition_images)
+                        ready &= !image->fence12 || image->fence12->GetCompletedValue()>=image->ready_value;
+                    std::int64_t delay_us=-1,ceiling_us=0;unsigned late=0;
+                    { std::scoped_lock lock(state->presenter_mutex);
+                      if(state->djules_triple_release.observe(ready,period)) {
+                        delay_us=state->djules_triple_release.delay.count()/1000;
+                        ceiling_us=state->djules_triple_release.ceiling.count()/1000;
+                        late=state->djules_triple_release.last_late;
+                      } }
+                    if(delay_us>=0) xrfg::bridge_flight_logger().event(
+                        xrfg::BridgeFlightOperation::presenter_transition,801,delay_us,late,ceiling_us);
                 }
                 const auto remaining = submission_slot - std::chrono::steady_clock::now();
                 if (remaining > std::chrono::steady_clock::duration::zero()) {
@@ -7835,9 +7862,14 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
                     }
                     auto* owned=repeat_held?djules_last_owned.get():selected?selected->frame.get():borrowed->owned_frame.get();
                     join_runtime_queue_to_application(state.get(),owned?owned->app_release_value:borrowed->app_release_value);
+                    if(owned && djules_native_scheduler(*state)) {
+                        for(const auto& image:owned->composition_images)
+                            if(image->fence12 && FAILED(runtime_queue(*state)->Wait(image->fence12.Get(),image->ready_value)))
+                                return XR_ERROR_RUNTIME_FAILURE;
+                    }
                     if(owned && !handover_djules_outputs(state.get(),owned->pending_outputs)) return XR_ERROR_RUNTIME_FAILURE;
-                    phase_step = sample_djules_phase_step(state, selected && !synthetic && !repeat_held,
-                        selected ? selected->source_sequence : 0);
+                    phase_step = sample_djules_phase_step(state, !synthetic && !repeat_held && owned,
+                        selected ? selected->source_sequence : borrowed->pair_sequence);
                     return state->fps_overlay ? state->fps_overlay->end_frame(&end, synthetic,!repeat_held)
                         : state->dispatch->end_frame(state->handle, &end);
                 });
@@ -7861,7 +7893,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             if (state->fsr_two_slot_presenter)
                 fsr_schedule.submitted(submission_slot, std::chrono::nanoseconds(state->presenter_display_period),
                     std::chrono::steady_clock::now());
-            else if (state->three_slot_director && djules_native_scheduler(*state)) {
+            else if (djules_native_scheduler(*state) && (state->three_slot_director || state->queued_nvidia_presenter)) {
                 djules_last_returned = std::chrono::steady_clock::now();
                 djules_schedule.submitted(submission_slot,
                     std::chrono::nanoseconds(state->presenter_display_period), djules_last_returned,
@@ -8085,6 +8117,18 @@ void stop_continuous_presenter(
         !three_slot_generation_session(state) &&
         (state->graphics_binding == SessionGraphicsBinding::d3d11 ||
          state->graphics_binding == SessionGraphicsBinding::d3d12);
+}
+
+void delay_djules_application_release(const std::shared_ptr<SessionState>& state) {
+    std::chrono::nanoseconds delay{};
+    { std::scoped_lock lock(state->presenter_mutex);
+      if(djules_triple_active(*state)) delay=state->djules_triple_release.delay; }
+    if(delay>std::chrono::nanoseconds::zero()) {
+        std::unique_lock lock(state->presenter_mutex);
+        state->presenter_condition.wait_until(lock,std::chrono::steady_clock::now()+delay,[&] {
+            return state->presenter_stop_requested || XR_FAILED(state->presenter_failure) || !state->menu_enabled;
+        });
+    }
 }
 
 // Holds the application until the presenter has run a whole pair since it was
@@ -9631,7 +9675,7 @@ struct AfwSourceCapture {
     for (auto& resource : prepared.resources) {
         auto& g = resource.generation;
         if (!g.worker_generation) continue;
-        if(g.staging_generation && djules_deep_active(*state)) continue;
+        if(g.staging_generation && (djules_deep_active(*state)||djules_triple_active(*state))) continue;
         const auto completion_token = xrfg::bridge_flight_logger().begin(
             xrfg::BridgeFlightOperation::timing_synthesis_complete,
             source_sequence, handle_value(resource.application_swapchain));
@@ -9721,7 +9765,7 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
                 xrfg::BridgeFlightOperation::timing_aux_complete,
                 job->current->source_sequence, job->current->previous_sequence);
             if (success && job->metadata &&
-                !(djules_deep_active(*state))) {
+                !(djules_deep_active(*state)||djules_triple_active(*state))) {
                 for (const auto& image : job->metadata->composition_images) {
                     success = SUCCEEDED(wait_composition_fence(image->fence.Get(), image->ready_value)) && success;
                     success = SUCCEEDED(wait_composition_fence(image->fence12.Get(), image->ready_value)) && success;
@@ -9766,6 +9810,7 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
                     synthetic_info.pending_outputs=std::move(pending_synthetic.pending_outputs);
                     synthetic_info.synthetic = true;
                     synthetic_info.composition_images = job->metadata->composition_images;
+                    synthetic_info.djules_leader=job->triple;
                     if (success) synthetic = make_presenter_owned_frame(std::move(synthetic_info));
                     success = success && synthetic != nullptr;
                     if(success && job->triple) {
@@ -9798,7 +9843,7 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
                 break;
             }
             xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::three_slot_gpu_ready,
-                djules_deep_active(*state) ? 2 : job->pair ? 1 : 0,
+                (djules_deep_active(*state)||djules_triple_active(*state)) ? 2 : job->pair ? 1 : 0,
                 job->current->source_sequence, job->current->previous_sequence);
             {
                 std::unique_lock lock(state->presenter_mutex);
@@ -11167,6 +11212,7 @@ HRESULT reconcile_depth_history_for_route(SwapchainState& chain) {
         std::scoped_lock content(state->presenter_content_mutex);
         std::scoped_lock lock(state->presenter_mutex);
         state->djules_triple_requested=target;
+        state->djules_triple_release={};
         state->three_slots.configure(djules_triple_director(*state)?3:2);
         state->application_served_serial=state->presenter_frame_serial;
         state->presenter_last_frame.reset();
@@ -11334,7 +11380,8 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
     state->control_reconfigure_required = FAILED(result);
     state->menu_enabled = SUCCEEDED(result) && control.desired.enabled;
     { std::scoped_lock lock(state->presenter_mutex);
-      state->three_slots.configure(djules_triple_director(*state)?3:2); }
+      state->three_slots.configure(djules_triple_director(*state)?3:2);
+      state->djules_triple_release={}; }
 
     if (state->fps_overlay) state->fps_overlay->reset_metrics();
     xrfg::embedded::applied(state->control_id, control.revision, state->menu_enabled, result);
@@ -12152,6 +12199,7 @@ XrResult layer_end_frame_impl(
             state->previous_projection = current_snapshot;
             state->generation_failure_streak = 0;
         }
+        if(XR_SUCCEEDED(handoff)) { frame_call_lock.unlock(); delay_djules_application_release(state); }
         return handoff;
     }
     if (use_continuous_presenter && !state->luke_afw_enabled) {
@@ -12426,6 +12474,7 @@ XrResult layer_end_frame_impl(
     current_generated.app_release_value = generated_release_value;
     extra_generated.app_release_value = generated_release_value;
     first_generated.synthetic = pair_ready;
+    first_generated.djules_leader=extra_ready;
     std::shared_ptr<GeneratedFrameEndInfo> presenter_current_frame,presenter_extra_frame;
     if (use_continuous_presenter &&
         (prepared.kind == PreparedGenerationKind::prime || pair_ready)) {
@@ -12737,6 +12786,7 @@ XrResult layer_end_frame_impl(
         // thread must not be shut out of xrWaitFrame while this waits.
         frame_call_lock.unlock();
         wait_for_presenter_pair(state);
+        delay_djules_application_release(state);
         return result;
     }
 

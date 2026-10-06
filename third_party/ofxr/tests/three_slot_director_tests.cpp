@@ -1485,6 +1485,23 @@ int main(int argc, char** argv) {
         check(!timing->djules_triple_requested && timing->three_slots.empty(),"2X shape reset");
         check(XR_SUCCEEDED(switch_djules_multiplier(timing,true)),"switch 3X");
         check(timing->djules_triple_requested && timing->three_slots.empty(),"3X shape reset");
+        xrfg::DjulesTripleRelease release;
+        const auto window=[&](unsigned late) {
+            for(unsigned i=0;i<30;++i) release.observe(i>=late,std::chrono::milliseconds(10));
+        };
+        window(30);
+        check(release.delay.count()==0 && release.ceiling==std::chrono::milliseconds(20),"startup clamped ceiling");
+        for(unsigned i=0;i<5;++i) window(0);
+        check(release.delay==std::chrono::milliseconds(10),"clean-window raise");
+        window(2);
+        check(release.delay==std::chrono::milliseconds(7) && release.hold==10,"late-window retreat");
+        for(unsigned i=0;i<10;++i) window(0);
+        check(release.delay==std::chrono::milliseconds(7),"ceiling hold");
+        window(0);
+        check(release.delay==std::chrono::milliseconds(9),"ceiling recovery");
+        timing->djules_triple_release=release;
+        check(XR_SUCCEEDED(switch_djules_multiplier(timing,false)),"controller switch");
+        check(timing->djules_triple_release.delay.count()==0,"controller survived shape switch");
     }
 #endif
     auto state = session();
