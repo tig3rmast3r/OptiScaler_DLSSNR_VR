@@ -1453,6 +1453,8 @@ void refused_frame_recovery_test() {
     std::cout << "Content refusal: four errors on legacy/director borrowed frames and owned-slot recovery\n";
 }
 
+#include "depth_history_tests.inc"
+
 int main(int argc, char** argv) {
     auto state = session();
     try {
@@ -1479,6 +1481,7 @@ int main(int argc, char** argv) {
         state->luke_afw_enabled = false;
         if (argc > 1) {
             const auto mode = std::string_view(argv[1]);
+            if(mode == "depth-history") { depth_history_test(); return 0; }
             if(mode == "luke-afw-slot") { gpu_pipeline(true, false, false, false, false, true); return 0; }
             if(mode == "post-afw-packet") { gpu_pipeline(true, false, false, false, false, false, true); return 0; }
             if(mode == "luke-inline-diagnostic") { luke_inline_diagnostic_test(); return 0; }

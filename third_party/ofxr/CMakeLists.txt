@@ -568,6 +568,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             xrfg_core xrfg_d3d12_history xrfg_bridge_flight_logger
             xrfg_fps_overlay xrfg_implicit_layer psapi xrfg_frame_capture)
         add_test(NAME xrfg_three_slot_director_tests COMMAND xrfg_three_slot_director_tests)
+        add_test(NAME xrfg_depth_history_routes COMMAND xrfg_three_slot_director_tests depth-history)
         add_test(NAME xrfg_luke_admission COMMAND xrfg_three_slot_director_tests luke-unit)
         add_test(NAME xrfg_luke_inline_diagnostic COMMAND xrfg_three_slot_director_tests luke-inline-diagnostic)
         add_test(NAME xrfg_luke_afw_output_slot COMMAND xrfg_three_slot_director_tests luke-afw-slot)

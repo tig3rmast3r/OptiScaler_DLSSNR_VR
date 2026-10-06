@@ -3975,17 +3975,22 @@ XrResult layer_enumerate_swapchain_images_impl(
                 GenerationQuarantineReason::d3d12_images_changed,
                 handle_value(state->handle));
         }
+        const auto release_state = required_release_state(*state);
+        const bool depth_only = release_state == D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        // D24 (djules V405-V406): projection synthesis never reads a depth
+        // swapchain's color-history ring. Keep the reference allocation intact.
+        // Actual OptiScaler depth guides and runtime images remain independent.
+        const bool omit_depth_history = depth_only && state->session->nvidia_new_route;
         const bool reused_history =
-            !resources_changed && history && history->initialized();
+            !omit_depth_history && !resources_changed && history && history->initialized();
         if (!reused_history) {
             history.reset();
         }
-        const auto release_state = required_release_state(*state);
         const bool protected_content =
             (state->create_info.createFlags & XR_SWAPCHAIN_CREATE_PROTECTED_CONTENT_BIT) != 0;
         HRESULT history_result = S_OK;
         bool history_attempted = false;
-        if (!history && release_state && !protected_content) {
+        if (!history && release_state && !omit_depth_history && !protected_content) {
             history_attempted = true;
             auto candidate = std::make_shared<xrfg::D3D12SwapchainHistory>();
             history_result = candidate->initialize(
@@ -4030,6 +4035,9 @@ XrResult layer_enumerate_swapchain_images_impl(
         } else if (protected_content) {
             eligibility_reason = SwapchainEligibilityReason::protected_content;
             eligibility_detail = state->create_info.createFlags;
+        } else if (depth_only && omit_depth_history) {
+            eligibility_reason = SwapchainEligibilityReason::depth_only;
+            eligibility_detail = state->create_info.usageFlags;
         } else if (!history) {
             eligibility_reason = SwapchainEligibilityReason::history_initialize_failed;
             eligibility_detail = history_attempted
@@ -9141,6 +9149,32 @@ void consume_application_frame(
     state->pending_frames.erase(state->pending_frames.begin(), std::next(frame));
 }
 
+// Native depth history follows the selected comparison route even when the
+// application does not enumerate its images again after a menu switch.
+// Caller holds call_mutex, mutex and the session GPU transaction lock.
+HRESULT reconcile_depth_history_for_route(SwapchainState& chain) {
+    if (chain.session->graphics_binding != SessionGraphicsBinding::d3d12 ||
+        required_release_state(chain) != D3D12_RESOURCE_STATE_DEPTH_WRITE) return S_OK;
+    if (chain.session->nvidia_new_route) {
+        if (chain.d3d12_history) {
+            const auto result = chain.d3d12_history->wait_for_idle();
+            if (FAILED(result)) return result;
+            chain.last_released_capture.reset();
+            chain.d3d12_history.reset();
+        }
+        return S_OK;
+    }
+    if (chain.d3d12_history || chain.enumerated_d3d12_images.empty() ||
+        (chain.create_info.createFlags & XR_SWAPCHAIN_CREATE_PROTECTED_CONTENT_BIT)) return S_OK;
+    std::vector<ID3D12Resource*> resources;
+    for (const auto& image : chain.enumerated_d3d12_images) resources.push_back(image.Get());
+    auto history = std::make_shared<xrfg::D3D12SwapchainHistory>();
+    const auto result = history->initialize(chain.session->d3d12_device.Get(),
+        chain.session->d3d12_queue.Get(), resources, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    if (SUCCEEDED(result)) chain.d3d12_history = std::move(history);
+    return result;
+}
+
 // Called with frame ownership and presenter content excluded. No GUI thread
 // touches GPU objects; no new captures may enter during this transaction.
 void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
@@ -9183,6 +9217,10 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
         state->luke_afw_enabled;
     for (const auto& chain : swapchains) {
         std::unique_lock lock(chain->mutex);
+        if (changed) {
+            result = reconcile_depth_history_for_route(*chain);
+            if (FAILED(result)) break;
+        }
         // djules75 a99413d: control revisions must respect the same eligibility,
         // previous-refusal and session-budget gates as deferred generation.
         const bool eligible = chain->generation_eligible_pending &&
