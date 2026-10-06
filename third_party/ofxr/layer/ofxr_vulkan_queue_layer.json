@@ -1,0 +1,19 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_OFXR_queue",
+    "type": "GLOBAL",
+    "library_path": ".\\OFXR_vulkan_queue_layer.dll",
+    "api_version": "1.3.0",
+    "implementation_version": "223",
+    "description": "OFXR per-device Vulkan queue serialization",
+    "functions": {
+      "vkGetInstanceProcAddr": "OFXR_vkGetInstanceProcAddr",
+      "vkGetDeviceProcAddr": "OFXR_vkGetDeviceProcAddr",
+      "vkNegotiateLoaderLayerInterfaceVersion": "OFXR_vkNegotiateLoaderLayerInterfaceVersion"
+    },
+    "disable_environment": {
+      "OFXR_DISABLE_VULKAN_QUEUE_LAYER": "1"
+    }
+  }
+}

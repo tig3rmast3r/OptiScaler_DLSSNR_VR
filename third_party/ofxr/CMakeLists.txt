@@ -315,6 +315,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         src/common/fsr_frame_generation.cpp
         src/d3d11/d3d11_d3d12_interop.cpp
         src/d3d11/d3d11_bridge.cpp
+        src/vulkan/vulkan_session_bridge.cpp
         src/d3d11/d3d11_color_identity.cpp
         src/d3d12/d3d12_history.cpp
         src/d3d12/d3d12_fsr_frame_generator.cpp
@@ -343,6 +344,18 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             "${XRFG_FIDELITYFX_INCLUDE_DIR}"
             "${XRFG_FIDELITYFX_API_INCLUDE_DIR}"
             "${XRFG_NVIDIA_OPTICAL_FLOW_INCLUDE_DIR}")
+    set(XRFG_VULKAN_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../external/vulkan/include")
+    if(NOT EXISTS "${XRFG_VULKAN_INCLUDE_DIR}/vulkan/vk_layer.h")
+        message(FATAL_ERROR "Initialize the pinned OptiScaler Vulkan-Headers submodule")
+    endif()
+    target_include_directories(xrfg_d3d12_history PUBLIC "${XRFG_VULKAN_INCLUDE_DIR}")
+    add_library(OFXR_vulkan_queue_layer SHARED src/vulkan_layer/vulkan_queue_layer.cpp)
+    target_include_directories(OFXR_vulkan_queue_layer PRIVATE "${XRFG_VULKAN_INCLUDE_DIR}")
+    target_compile_features(OFXR_vulkan_queue_layer PRIVATE cxx_std_20)
+    target_compile_definitions(OFXR_vulkan_queue_layer PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN VK_NO_PROTOTYPES)
+    if(MSVC)
+        target_compile_options(OFXR_vulkan_queue_layer PRIVATE /W4 /permissive- /EHsc)
+    endif()
     target_compile_features(xrfg_d3d12_history PUBLIC cxx_std_20)
     target_compile_options(xrfg_d3d12_history PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/ffx_private_symbols.h")
     target_link_libraries(xrfg_d3d12_history PUBLIC
