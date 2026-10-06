@@ -489,8 +489,15 @@ int main(int argc,char** argv) {
             require(output_times.size()==submissions.size(), "midpoint runtime receipts");
             for(unsigned i=1;i<submissions.size();++i)
                 if(submissions[i-1].second && !submissions[i].second)
+#ifdef OFXR_DJULES_COMPARISON
+                    // This fixture's native runtime is neither SteamVR nor VD:
+                    // final D26 uses its wait plus a half-period floor (8.33/2).
+                    require(output_times[i]-output_times[i-1]>=std::chrono::milliseconds(4),
+                        "djules non-SteamVR handover violated the half-period floor");
+#else
                     require(output_times[i]-output_times[i-1]>=std::chrono::milliseconds(6),
                         "real endpoint stole a delayed midpoint interval");
+#endif
         }
         if(fsr_queue_gpu_pending) require(fsr_wait_before_gpu_complete,
             "FSR consumer CPU-waited before entering XR with pending GPU work");

@@ -1860,6 +1860,12 @@ XrResult wait_presenter_runtime_frame(const std::shared_ptr<SessionState>& state
         (state.single_threaded_d3d11 || state.split_frame_loop);
 }
 
+[[nodiscard]] bool djules_inline_runtime(const SessionState& state) noexcept {
+    return state.nvidia_new_route && !state.luke_afw_enabled &&
+        state.frame_generation_mode == xrfg::D3D12FrameGenerationMode::ofxr &&
+        state.dispatch->inline_unless_pipelined && !state.pipelined_presenter_mode;
+}
+
 // frame_call_mutex protects the application thread shape. Observe the first
 // EndFrame too, so a split loop cannot promote before its next application Wait.
 void observe_application_frame_thread(SessionState& state, bool ending) noexcept {
@@ -7766,7 +7772,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
     std::shared_ptr<GeneratedFrameEndInfo> seed_frame,
     bool preserve_virtual_timeline) noexcept {
     try {
-        if (presenter_forbidden(*state)) return false;
+        if (presenter_forbidden(*state) || djules_inline_runtime(*state)) return false;
         std::scoped_lock lock(state->presenter_mutex);
         if (state->presenter_active) {
             return true;
@@ -7906,7 +7912,7 @@ void stop_continuous_presenter(
 
 [[nodiscard]] bool three_slot_generation_session(
     const std::shared_ptr<SessionState>& state) noexcept {
-    return !presenter_forbidden(*state) && state->menu_enabled && state->frame_generation_mode !=
+    return !presenter_forbidden(*state) && !djules_inline_runtime(*state) && state->menu_enabled && state->frame_generation_mode !=
                xrfg::D3D12FrameGenerationMode::fsr3 &&
            state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
            state->nvidia_new_route &&
@@ -7922,7 +7928,7 @@ void stop_continuous_presenter(
 }
 
 [[nodiscard]] bool queued_nvidia_session(const std::shared_ptr<SessionState>& state) noexcept {
-    return !presenter_forbidden(*state) && !state->luke_afw_enabled && state->menu_enabled &&
+    return !presenter_forbidden(*state) && !djules_inline_runtime(*state) && !state->luke_afw_enabled && state->menu_enabled &&
         state->frame_generation_mode == xrfg::D3D12FrameGenerationMode::ofxr &&
         state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
         !three_slot_generation_session(state) &&
@@ -10747,6 +10753,11 @@ struct InternalCycleResult {
 [[nodiscard]] bool inline_pair_lands_in_one_scanout(
     const std::shared_ptr<SessionState>& state,
     std::chrono::steady_clock::duration gap) noexcept {
+    if (djules_inline_runtime(*state)) {
+        std::scoped_lock lock(state->mutex);
+        state->bunched_pair_streak = 0;
+        return false;
+    }
     constexpr std::uint32_t kBunchedPairPromotionStreak = 30;
     constexpr std::int64_t kBunchedNumerator = 3;
     constexpr std::int64_t kBunchedDenominator = 4;

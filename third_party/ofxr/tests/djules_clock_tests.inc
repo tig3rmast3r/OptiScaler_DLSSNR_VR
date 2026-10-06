@@ -56,6 +56,31 @@ void djules_absolute_grid_test() {
     std::cout << "Djules absolute grid: fixed slots, loop jitter, aligned stall recovery and no catch-up burst\n";
 }
 
+void djules_inline_policy_test() {
+    auto s = session();
+    s->menu_enabled = true; s->nvidia_new_route = true; s->luke_afw_enabled = false;
+    s->graphics_binding = SessionGraphicsBinding::d3d12;
+    s->frame_generation_mode = xrfg::D3D12FrameGenerationMode::ofxr;
+    s->optical_flow_backend = xrfg::D3D12OpticalFlowBackend::nvidia;
+    s->dispatch->inline_unless_pipelined = true;
+    s->minimum_runtime_display_period = 10'000'000;
+    check(djules_inline_runtime(*s) && !three_slot_generation_session(s) && !queued_nvidia_session(s),
+        "VD/Pimax non-pipelined session acquired unsolicited director");
+    for (int i=0;i<60;++i)
+        check(!inline_pair_lands_in_one_scanout(s, std::chrono::microseconds(10)),
+            "stall-dependent bunched detector promoted VD/Pimax");
+    check(!presenter_forbidden(*s), "runtime policy blocked genuine overlapping-Wait detection");
+    s->pipelined_presenter_mode = true;
+    check(!djules_inline_runtime(*s) && queued_nvidia_session(s),
+        "genuinely pipelined VD/Pimax could not acquire frame-call owner");
+    s->pipelined_presenter_mode = false;
+    s->nvidia_new_route = false;
+    check(!djules_inline_runtime(*s), "reference inherited optional inline runtime policy");
+    s->nvidia_new_route = true; s->luke_afw_enabled = true;
+    check(!djules_inline_runtime(*s) && three_slot_generation_session(s), "AFW lost accepted director");
+    std::cout << "DJ VD/Pimax: fixed inline shape, genuine pipeline override, reference/AFW guards\n";
+}
+
 void djules_display_clock_test() {
     auto s = session();
     s->presenter_active = false;
