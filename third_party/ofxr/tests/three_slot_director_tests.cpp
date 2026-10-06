@@ -1458,6 +1458,7 @@ void refused_frame_recovery_test() {
 }
 
 #include "depth_history_tests.inc"
+#include "vulkan_bridge_contract_tests.inc"
 
 int main(int argc, char** argv) {
     auto state = session();
@@ -1485,6 +1486,7 @@ int main(int argc, char** argv) {
         state->luke_afw_enabled = false;
         if (argc > 1) {
             const auto mode = std::string_view(argv[1]);
+            if (mode == "vulkan-contract") { vulkan_bridge_contract_test(); return 0; }
             if(mode == "depth-history") { depth_history_test(); return 0; }
             if(mode == "luke-afw-slot") { gpu_pipeline(true, false, false, false, false, true); return 0; }
             if(mode == "post-afw-packet") { gpu_pipeline(true, false, false, false, false, false, true); return 0; }

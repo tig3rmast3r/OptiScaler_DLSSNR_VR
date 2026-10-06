@@ -184,6 +184,8 @@ enum class BridgeFlightOperation : std::uint32_t {
     view_configuration,
     projection_view_rect,
     process_excluded,
+    vulkan_negotiation,
+    vulkan_bridge,
 };
 
 struct BridgeFlightToken {

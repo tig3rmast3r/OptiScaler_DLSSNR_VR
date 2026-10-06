@@ -1,3 +1,5 @@
+#define XR_USE_GRAPHICS_API_VULKAN
+#include "xrfg/vulkan_session_bridge.hpp"
 #include "xrfg/d3d11_bridge.hpp"
 #include "xrfg/d3d12_history.hpp"
 #include "xrfg/three_slot_buffer.hpp"
@@ -141,7 +143,181 @@ template <typename Handle>
     return code | (options.bidirectional ? 0x100U : 0U) | scale_code;
 }
 
+// The runtime's Vulkan entry points, by the names the layer gives them. The
+// enable2 variants share the signatures of the originals.
+using PFN_GetVulkanExtensions = PFN_xrGetVulkanInstanceExtensionsKHR;
+using PFN_CreateVulkanInstance = PFN_xrCreateVulkanInstanceKHR;
+using PFN_CreateVulkanDevice = PFN_xrCreateVulkanDeviceKHR;
+using PFN_GetVulkanGraphicsDevice = PFN_xrGetVulkanGraphicsDeviceKHR;
+using PFN_GetVulkanGraphicsDevice2 = PFN_xrGetVulkanGraphicsDevice2KHR;
+using PFN_GetVulkanGraphicsRequirements = PFN_xrGetVulkanGraphicsRequirementsKHR;
+
+struct VulkanNegotiationDispatch {
+    PFN_GetVulkanExtensions get_instance_extensions{};
+    PFN_GetVulkanExtensions get_device_extensions{};
+    PFN_CreateVulkanInstance create_instance{};
+    PFN_CreateVulkanDevice create_device{};
+    PFN_GetVulkanGraphicsDevice get_graphics_device{};
+    PFN_GetVulkanGraphicsDevice2 get_graphics_device2{};
+    PFN_GetVulkanGraphicsRequirements get_graphics_requirements{};
+    PFN_GetVulkanGraphicsRequirements get_graphics_requirements2{};
+};
+
+// The Vulkan extensions an interop with D3D12 would need, as bits; the
+// numbering is the one BridgeFlightOperation::vulkan_negotiation documents.
+[[nodiscard]] std::uint64_t vulkan_interop_extension_bit(
+    std::string_view name) noexcept {
+    constexpr std::array<std::string_view, 11> kNames{
+        "VK_KHR_external_memory_win32",
+        "VK_KHR_external_semaphore_win32",
+        "VK_KHR_external_memory",
+        "VK_KHR_external_semaphore",
+        "VK_KHR_timeline_semaphore",
+        "VK_KHR_dedicated_allocation",
+        "VK_KHR_get_memory_requirements2",
+        "VK_KHR_win32_keyed_mutex",
+        "VK_KHR_external_memory_capabilities",
+        "VK_KHR_external_semaphore_capabilities",
+        "VK_KHR_get_physical_device_properties2",
+    };
+    for (std::size_t index = 0; index < kNames.size(); ++index) {
+        if (name == kNames[index]) {
+            return 1ULL << index;
+        }
+    }
+    return 0;
+}
+
+struct VulkanExtensionSummary {
+    std::uint64_t count{};
+    std::uint64_t bits{};
+};
+
+// The runtime's answer to xrGetVulkan*ExtensionsKHR: one space-separated
+// string.
+[[nodiscard]] VulkanExtensionSummary summarize_vulkan_extension_string(
+    std::string_view list) noexcept {
+    VulkanExtensionSummary summary{};
+    std::size_t start = 0;
+    while (start < list.size()) {
+        const std::size_t end = list.find(' ', start);
+        const std::string_view name = list.substr(
+            start,
+            end == std::string_view::npos ? list.size() - start : end - start);
+        if (!name.empty()) {
+            ++summary.count;
+            summary.bits |= vulkan_interop_extension_bit(name);
+        }
+        if (end == std::string_view::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return summary;
+}
+
+[[nodiscard]] VulkanExtensionSummary summarize_vulkan_extension_array(
+    const char* const* names,
+    std::uint32_t count) noexcept {
+    VulkanExtensionSummary summary{};
+    if (names == nullptr) {
+        return summary;
+    }
+    for (std::uint32_t index = 0; index < count; ++index) {
+        if (names[index] != nullptr) {
+            ++summary.count;
+            summary.bits |= vulkan_interop_extension_bit(names[index]);
+        }
+    }
+    return summary;
+}
+
+[[nodiscard]] std::uint64_t pack_negotiation_results(
+    XrResult xr_result,
+    VkResult vk_result) noexcept {
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(xr_result))
+            << 32) |
+        static_cast<std::uint32_t>(vk_result);
+}
+
+void log_vulkan_negotiation(
+    std::int64_t selector,
+    std::uint64_t a,
+    std::uint64_t b = 0,
+    std::uint64_t c = 0) noexcept {
+    xrfg::bridge_flight_logger().event(
+        xrfg::BridgeFlightOperation::vulkan_negotiation, selector, a, b, c);
+}
+
+// Whether the application's Vulkan device can take part in a D3D12 interop,
+// asked of the device itself: with XR_KHR_vulkan_enable the application
+// creates the device, so the list it was handed says what it was asked to
+// enable, not what it did. A device returns no entry point for a command of
+// an extension it did not enable.
+//   11  a= commands the device returned: bit 0 vkGetMemoryWin32HandleKHR,
+//       1 vkGetSemaphoreWin32HandleKHR, 2 vkImportSemaphoreWin32HandleKHR,
+//       3 vkGetSemaphoreCounterValueKHR, 4 vkGetSemaphoreCounterValue
+//   12  a= the same interop extension bits, for what the physical device
+//       supports at all; b= how many device extensions it lists
+void probe_vulkan_interop_support(
+    const XrGraphicsBindingVulkanKHR& binding) noexcept {
+    try {
+        const HMODULE vulkan = GetModuleHandleW(L"vulkan-1.dll");
+        if (vulkan == nullptr || binding.device == VK_NULL_HANDLE) {
+            log_vulkan_negotiation(11, 0, 0, 1);
+            return;
+        }
+        const auto get_device_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+            GetProcAddress(vulkan, "vkGetDeviceProcAddr"));
+        const auto get_instance_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+            GetProcAddress(vulkan, "vkGetInstanceProcAddr"));
+        if (get_device_proc != nullptr) {
+            constexpr std::array<const char*, 5> kCommands{
+                "vkGetMemoryWin32HandleKHR",
+                "vkGetSemaphoreWin32HandleKHR",
+                "vkImportSemaphoreWin32HandleKHR",
+                "vkGetSemaphoreCounterValueKHR",
+                "vkGetSemaphoreCounterValue",
+            };
+            std::uint64_t live = 0;
+            for (std::size_t index = 0; index < kCommands.size(); ++index) {
+                if (get_device_proc(binding.device, kCommands[index]) != nullptr) {
+                    live |= 1ULL << index;
+                }
+            }
+            log_vulkan_negotiation(11, live);
+        }
+        if (get_instance_proc != nullptr && binding.instance != VK_NULL_HANDLE &&
+            binding.physicalDevice != VK_NULL_HANDLE) {
+            const auto enumerate =
+                reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+                    get_instance_proc(
+                        binding.instance, "vkEnumerateDeviceExtensionProperties"));
+            std::uint32_t extension_count = 0;
+            if (enumerate != nullptr &&
+                enumerate(binding.physicalDevice, nullptr, &extension_count,
+                          nullptr) == VK_SUCCESS &&
+                extension_count > 0) {
+                std::vector<VkExtensionProperties> extensions(extension_count);
+                if (enumerate(binding.physicalDevice, nullptr, &extension_count,
+                              extensions.data()) >= VK_SUCCESS) {
+                    std::uint64_t supported = 0;
+                    for (std::uint32_t index = 0; index < extension_count; ++index) {
+                        supported |= vulkan_interop_extension_bit(
+                            extensions[index].extensionName);
+                    }
+                    log_vulkan_negotiation(12, supported, extension_count);
+                }
+            }
+        }
+    } catch (...) {
+    }
+}
+
 struct Dispatch {
+    bool vulkan_bridge{};
+    VulkanNegotiationDispatch vulkan{};
+    PFN_xrEnumerateSwapchainFormats enumerate_swapchain_formats{};
     // The D3D11 bridge (SessionState::d3d11_bridge): set when the ini asks
     // for it, the application enabled XR_KHR_D3D11_enable, and the layer
     // could add XR_KHR_D3D12_enable to the instance. The runtime's D3D12
@@ -423,6 +599,10 @@ enum class GenerationQuarantineReason : std::int64_t {
 #endif
 
 struct SessionState {
+    struct VulkanBridge { xrfg::VulkanSessionBinding binding{}; };
+    std::unique_ptr<VulkanBridge> vulkan_bridge;
+    xrfg::VulkanSessionBinding vulkan_binding{};
+
     std::mutex logged_view_rects_mutex;
     std::unordered_map<XrSwapchain, std::array<std::optional<std::array<std::uint64_t, 3>>, 4>> logged_view_rects;
     std::unique_ptr<xrfg::SteamVrDelivery> steamvr_delivery;
@@ -1162,6 +1342,7 @@ void log_swapchain_eligibility(
     std::uint64_t auxiliary = 0) noexcept;
 
 struct SwapchainState {
+    std::shared_ptr<xrfg::VulkanBridgeSwapchain> vulkan_bridge;
     // On a bridged D3D11 session (SessionState::d3d11_bridge): the shared
     // textures the application renders into and the copies into the
     // runtime's images. enumerated_d3d12_images are then the shared
@@ -1524,6 +1705,12 @@ void drain_swapchain_gpu(const std::shared_ptr<SwapchainState>& state) noexcept 
             if (SUCCEEDED(result)) {
                 result = bridge_result;
             }
+        }
+        std::shared_ptr<xrfg::VulkanBridgeSwapchain> vulkan_bridge;
+        { std::scoped_lock lock(state->mutex); vulkan_bridge = state->vulkan_bridge; }
+        if (vulkan_bridge) {
+            const HRESULT drained = vulkan_bridge->wait_for_idle();
+            if (SUCCEEDED(result)) result = drained;
         }
         xrfg::bridge_flight_logger().end(
             flight_token,
@@ -2785,6 +2972,311 @@ XrResult resolve_global_function(const char* name, PFN_xrVoidFunction* function)
     return XR_SUCCESS;
 }
 
+[[nodiscard]] std::string augment_vulkan_extension_list(
+    std::string_view list,
+    bool device_list,
+    std::uint64_t* appended_bits) {
+    std::string augmented(list);
+    const VulkanExtensionSummary present =
+        summarize_vulkan_extension_string(list);
+    const auto append = [&](std::string_view name) {
+        const std::uint64_t bit = vulkan_interop_extension_bit(name);
+        if ((present.bits & bit) != 0) {
+            return;
+        }
+        if (!augmented.empty()) {
+            augmented.push_back(' ');
+        }
+        augmented.append(name);
+        *appended_bits |= bit;
+    };
+    if (device_list) {
+        append("VK_KHR_external_semaphore_win32");
+    } else {
+        append("VK_KHR_external_semaphore_capabilities");
+    }
+    return augmented;
+}
+
+XrResult get_vulkan_extensions_recorded(
+    PFN_GetVulkanExtensions next,
+    std::int64_t selector,
+    XrInstance instance,
+    XrSystemId system_id,
+    std::uint32_t capacity,
+    std::uint32_t* count,
+    char* buffer) {
+    if (next == nullptr) {
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+    if (count == nullptr) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    // Read the runtime's whole list whatever the application asked for, so
+    // the size query and the fill call both answer for the augmented list.
+    std::uint32_t runtime_count = 0;
+    XrResult result = next(instance, system_id, 0, &runtime_count, nullptr);
+    if (XR_FAILED(result) || runtime_count == 0) {
+        return next(instance, system_id, capacity, count, buffer);
+    }
+    std::string runtime_list(runtime_count, '\0');
+    result = next(
+        instance, system_id, runtime_count, &runtime_count, runtime_list.data());
+    if (XR_FAILED(result)) {
+        return next(instance, system_id, capacity, count, buffer);
+    }
+    runtime_list.resize(runtime_count > 0 ? runtime_count - 1 : 0);
+    std::uint64_t appended_bits = 0;
+    const bool enabled = GetPrivateProfileIntW(L"ofxr", L"vulkan_bridge", 1,
+        (current_layer_directory() / L"ofxr_bridge.ini").c_str()) == 1;
+    const std::string augmented = enabled
+        ? augment_vulkan_extension_list(runtime_list, selector == 3, &appended_bits)
+        : runtime_list;
+    *count = static_cast<std::uint32_t>(augmented.size() + 1);
+    if (capacity == 0) {
+        return XR_SUCCESS;
+    }
+    if (buffer == nullptr || capacity < *count) {
+        return XR_ERROR_SIZE_INSUFFICIENT;
+    }
+    std::memcpy(buffer, augmented.c_str(), augmented.size() + 1);
+    // Only the call that fills the buffer is recorded; the size query before
+    // it would record the same list twice.
+    const VulkanExtensionSummary summary =
+        summarize_vulkan_extension_string(runtime_list);
+    log_vulkan_negotiation(
+        selector, summary.count, summary.bits, runtime_list.size());
+    log_vulkan_negotiation(10, static_cast<std::uint64_t>(selector), appended_bits);
+    return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layer_get_vulkan_instance_extensions(
+    XrInstance instance,
+    XrSystemId system_id,
+    std::uint32_t capacity,
+    std::uint32_t* count,
+    char* buffer) {
+    return guard_c_api_boundary([&]() -> XrResult {
+        const auto dispatch = find_dispatch(instance);
+        return get_vulkan_extensions_recorded(
+            dispatch ? dispatch->vulkan.get_instance_extensions : nullptr,
+            2, instance, system_id, capacity, count, buffer);
+    });
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layer_get_vulkan_device_extensions(
+    XrInstance instance,
+    XrSystemId system_id,
+    std::uint32_t capacity,
+    std::uint32_t* count,
+    char* buffer) {
+    return guard_c_api_boundary([&]() -> XrResult {
+        const auto dispatch = find_dispatch(instance);
+        return get_vulkan_extensions_recorded(
+            dispatch ? dispatch->vulkan.get_device_extensions : nullptr,
+            3, instance, system_id, capacity, count, buffer);
+    });
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layer_create_vulkan_instance(
+    XrInstance instance,
+    const XrVulkanInstanceCreateInfoKHR* create_info,
+    VkInstance* vulkan_instance,
+    VkResult* vulkan_result) {
+    return guard_c_api_boundary([&]() -> XrResult {
+        const auto dispatch = find_dispatch(instance);
+        if (!dispatch || dispatch->vulkan.create_instance == nullptr) {
+            return XR_ERROR_FUNCTION_UNSUPPORTED;
+        }
+        const XrResult result = dispatch->vulkan.create_instance(
+            instance, create_info, vulkan_instance, vulkan_result);
+        VulkanExtensionSummary summary{};
+        if (create_info != nullptr && create_info->vulkanCreateInfo != nullptr) {
+            summary = summarize_vulkan_extension_array(
+                create_info->vulkanCreateInfo->ppEnabledExtensionNames,
+                create_info->vulkanCreateInfo->enabledExtensionCount);
+        }
+        log_vulkan_negotiation(
+            4, summary.count, summary.bits,
+            pack_negotiation_results(
+                result, vulkan_result != nullptr ? *vulkan_result : VK_SUCCESS));
+        return result;
+    });
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layer_create_vulkan_device(
+    XrInstance instance,
+    const XrVulkanDeviceCreateInfoKHR* create_info,
+    VkDevice* vulkan_device,
+    VkResult* vulkan_result) {
+    return guard_c_api_boundary([&]() -> XrResult {
+        const auto dispatch = find_dispatch(instance);
+        if (!dispatch || dispatch->vulkan.create_device == nullptr) {
+            return XR_ERROR_FUNCTION_UNSUPPORTED;
+        }
+        const XrResult result = dispatch->vulkan.create_device(
+            instance, create_info, vulkan_device, vulkan_result);
+        const VkDeviceCreateInfo* device_info =
+            create_info != nullptr ? create_info->vulkanCreateInfo : nullptr;
+        VulkanExtensionSummary summary{};
+        if (device_info != nullptr) {
+            summary = summarize_vulkan_extension_array(
+                device_info->ppEnabledExtensionNames,
+                device_info->enabledExtensionCount);
+        }
+        log_vulkan_negotiation(
+            5, summary.count, summary.bits,
+            pack_negotiation_results(
+                result, vulkan_result != nullptr ? *vulkan_result : VK_SUCCESS));
+        if (device_info != nullptr && device_info->pQueueCreateInfos != nullptr) {
+            for (std::uint32_t index = 0;
+                 index < device_info->queueCreateInfoCount;
+                 ++index) {
+                const auto& queue = device_info->pQueueCreateInfos[index];
+                log_vulkan_negotiation(
+                    6, queue.queueFamilyIndex, queue.queueCount);
+            }
+        }
+        return result;
+    });
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layer_get_vulkan_graphics_device(
+    XrInstance instance,
+    XrSystemId system_id,
+    VkInstance vulkan_instance,
+    VkPhysicalDevice* physical_device) {
+    return guard_c_api_boundary([&]() -> XrResult {
+        const auto dispatch = find_dispatch(instance);
+        if (!dispatch || dispatch->vulkan.get_graphics_device == nullptr) {
+            return XR_ERROR_FUNCTION_UNSUPPORTED;
+        }
+        log_vulkan_negotiation(7, 1);
+        return dispatch->vulkan.get_graphics_device(
+            instance, system_id, vulkan_instance, physical_device);
+    });
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layer_get_vulkan_graphics_device2(
+    XrInstance instance,
+    const XrVulkanGraphicsDeviceGetInfoKHR* get_info,
+    VkPhysicalDevice* physical_device) {
+    return guard_c_api_boundary([&]() -> XrResult {
+        const auto dispatch = find_dispatch(instance);
+        if (!dispatch || dispatch->vulkan.get_graphics_device2 == nullptr) {
+            return XR_ERROR_FUNCTION_UNSUPPORTED;
+        }
+        log_vulkan_negotiation(7, 2);
+        return dispatch->vulkan.get_graphics_device2(
+            instance, get_info, physical_device);
+    });
+}
+
+XrResult get_vulkan_requirements_recorded(
+    PFN_GetVulkanGraphicsRequirements next,
+    std::uint64_t which,
+    XrInstance instance,
+    XrSystemId system_id,
+    XrGraphicsRequirementsVulkanKHR* requirements) {
+    if (next == nullptr) {
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+    const XrResult result = next(instance, system_id, requirements);
+    if (XR_SUCCEEDED(result) && requirements != nullptr) {
+        log_vulkan_negotiation(
+            8, which, requirements->minApiVersionSupported,
+            requirements->maxApiVersionSupported);
+    }
+    return result;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layer_get_vulkan_graphics_requirements(
+    XrInstance instance,
+    XrSystemId system_id,
+    XrGraphicsRequirementsVulkanKHR* requirements) {
+    return guard_c_api_boundary([&]() -> XrResult {
+        const auto dispatch = find_dispatch(instance);
+        return get_vulkan_requirements_recorded(
+            dispatch ? dispatch->vulkan.get_graphics_requirements : nullptr,
+            1, instance, system_id, requirements);
+    });
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layer_get_vulkan_graphics_requirements2(
+    XrInstance instance,
+    XrSystemId system_id,
+    XrGraphicsRequirementsVulkanKHR* requirements) {
+    return guard_c_api_boundary([&]() -> XrResult {
+        const auto dispatch = find_dispatch(instance);
+        return get_vulkan_requirements_recorded(
+            dispatch ? dispatch->vulkan.get_graphics_requirements2 : nullptr,
+            2, instance, system_id, requirements);
+    });
+}
+
+
+// A bridged Vulkan session's runtime is D3D12 and lists DXGI formats; the
+// application asked a Vulkan session and reads VkFormats. Each DXGI format
+// with a Vulkan equivalent is shown once, in the runtime's order.
+XRAPI_ATTR XrResult XRAPI_CALL layer_enumerate_swapchain_formats(
+    XrSession session,
+    std::uint32_t format_capacity_input,
+    std::uint32_t* format_count_output,
+    std::int64_t* formats) {
+    return guard_c_api_boundary([&]() -> XrResult {
+        const auto state = find_session(session);
+        if (!state || state->dispatch->enumerate_swapchain_formats == nullptr) {
+            return XR_ERROR_HANDLE_INVALID;
+        }
+        if (!state->vulkan_bridge) {
+            return state->dispatch->enumerate_swapchain_formats(
+                session, format_capacity_input, format_count_output, formats);
+        }
+        if (format_count_output == nullptr) {
+            return XR_ERROR_VALIDATION_FAILURE;
+        }
+        std::uint32_t runtime_count = 0;
+        XrResult result = state->dispatch->enumerate_swapchain_formats(
+            session, 0, &runtime_count, nullptr);
+        if (XR_FAILED(result)) {
+            return result;
+        }
+        std::vector<std::int64_t> runtime_formats(runtime_count);
+        if (runtime_count > 0) {
+            result = state->dispatch->enumerate_swapchain_formats(
+                session, runtime_count, &runtime_count, runtime_formats.data());
+            if (XR_FAILED(result)) {
+                return result;
+            }
+            runtime_formats.resize(runtime_count);
+        }
+        std::vector<std::int64_t> translated;
+        for (const std::int64_t format : runtime_formats) {
+            const VkFormat vulkan_format =
+                xrfg::vulkan_format_for_dxgi(static_cast<DXGI_FORMAT>(format));
+            if (vulkan_format == VK_FORMAT_UNDEFINED ||
+                std::find(translated.begin(), translated.end(),
+                          static_cast<std::int64_t>(vulkan_format)) != translated.end()) {
+                continue;
+            }
+            translated.push_back(static_cast<std::int64_t>(vulkan_format));
+        }
+        *format_count_output = static_cast<std::uint32_t>(translated.size());
+        if (format_capacity_input == 0) {
+            return XR_SUCCESS;
+        }
+        if (formats == nullptr) {
+            return XR_ERROR_VALIDATION_FAILURE;
+        }
+        if (format_capacity_input < translated.size()) {
+            return XR_ERROR_SIZE_INSUFFICIENT;
+        }
+        std::copy(translated.begin(), translated.end(), formats);
+        return XR_SUCCESS;
+    });
+}
+
+
 XrResult layer_get_instance_proc_addr_impl(
     XrInstance instance,
     const char* name,
@@ -2814,6 +3306,34 @@ XrResult layer_get_instance_proc_addr_impl(
         return XR_SUCCESS;
     }
 
+    if (std::strcmp(name, "xrEnumerateSwapchainFormats") == 0) {
+        return expose_intercept(dispatch, dispatch->enumerate_swapchain_formats,
+            layer_enumerate_swapchain_formats, function);
+    }
+    if (std::strcmp(name, "xrGetVulkanInstanceExtensionsKHR") == 0) {
+        return expose_intercept(dispatch, dispatch->vulkan.get_instance_extensions, layer_get_vulkan_instance_extensions, function);
+    }
+    if (std::strcmp(name, "xrGetVulkanDeviceExtensionsKHR") == 0) {
+        return expose_intercept(dispatch, dispatch->vulkan.get_device_extensions, layer_get_vulkan_device_extensions, function);
+    }
+    if (std::strcmp(name, "xrCreateVulkanInstanceKHR") == 0) {
+        return expose_intercept(dispatch, dispatch->vulkan.create_instance, layer_create_vulkan_instance, function);
+    }
+    if (std::strcmp(name, "xrCreateVulkanDeviceKHR") == 0) {
+        return expose_intercept(dispatch, dispatch->vulkan.create_device, layer_create_vulkan_device, function);
+    }
+    if (std::strcmp(name, "xrGetVulkanGraphicsDeviceKHR") == 0) {
+        return expose_intercept(dispatch, dispatch->vulkan.get_graphics_device, layer_get_vulkan_graphics_device, function);
+    }
+    if (std::strcmp(name, "xrGetVulkanGraphicsDevice2KHR") == 0) {
+        return expose_intercept(dispatch, dispatch->vulkan.get_graphics_device2, layer_get_vulkan_graphics_device2, function);
+    }
+    if (std::strcmp(name, "xrGetVulkanGraphicsRequirementsKHR") == 0) {
+        return expose_intercept(dispatch, dispatch->vulkan.get_graphics_requirements, layer_get_vulkan_graphics_requirements, function);
+    }
+    if (std::strcmp(name, "xrGetVulkanGraphicsRequirements2KHR") == 0) {
+        return expose_intercept(dispatch, dispatch->vulkan.get_graphics_requirements2, layer_get_vulkan_graphics_requirements2, function);
+    }
     if (std::strcmp(name, "xrDestroyInstance") == 0) {
         return expose_intercept(dispatch, dispatch->destroy_instance, layer_destroy_instance, function);
     }
@@ -3010,12 +3530,16 @@ XrResult layer_create_api_layer_instance_impl(
     const XrInstanceCreateInfo* const negotiated_info = forwarded_create_info;
     bool bridge_extension_added = false;
     bool bridge_requested_by_ini = false;
+    bool vulkan_bridge_requested_by_ini = false;
+    bool asked_vulkan = false;
     bool asked_d3d11 = false;
     bool asked_d3d12 = false;
     try {
         for (std::uint32_t index = 0; index < create_info->enabledExtensionCount; ++index) {
             const char* const extension = create_info->enabledExtensionNames[index];
             if (extension == nullptr) continue;
+            if (std::string_view(extension) == "XR_KHR_vulkan_enable" ||
+                std::string_view(extension) == "XR_KHR_vulkan_enable2") asked_vulkan = true;
             if (std::string_view(extension) == "XR_KHR_D3D11_enable") asked_d3d11 = true;
             if (std::string_view(extension) == "XR_KHR_D3D12_enable") asked_d3d12 = true;
         }
@@ -3025,7 +3549,10 @@ XrResult layer_create_api_layer_instance_impl(
         // on the binding it sees.
         bridge_requested_by_ini =
             GetPrivateProfileIntW(L"ofxr", L"d3d11_bridge", 1, (current_layer_directory() / L"ofxr_bridge.ini").c_str()) == 1;
-        if (asked_d3d11 && !asked_d3d12 && bridge_requested_by_ini) {
+        vulkan_bridge_requested_by_ini = GetPrivateProfileIntW(L"ofxr", L"vulkan_bridge", 1,
+            (current_layer_directory() / L"ofxr_bridge.ini").c_str()) == 1;
+        if (!asked_d3d12 && ((asked_d3d11 && bridge_requested_by_ini) ||
+                            (asked_vulkan && vulkan_bridge_requested_by_ini))) {
             PFN_xrEnumerateInstanceExtensionProperties enumerate_extensions = nullptr;
             bool runtime_has_d3d12 = false;
             if (XR_SUCCEEDED(next_get_instance_proc_addr(
@@ -3156,6 +3683,32 @@ XrResult layer_create_api_layer_instance_impl(
             bridge_requested_by_ini ? 1 : 0,
             (bridge_extension_added ? 1ULL : 0ULL) |
                 (dispatch->d3d11_bridge ? 2ULL : 0ULL));
+
+    static_cast<void>(load_function(next_get_instance_proc_addr, created_instance,
+        "xrEnumerateSwapchainFormats", dispatch->enumerate_swapchain_formats));
+    static_cast<void>(load_function(next_get_instance_proc_addr, created_instance,
+        "xrGetVulkanInstanceExtensionsKHR", dispatch->vulkan.get_instance_extensions));
+    static_cast<void>(load_function(next_get_instance_proc_addr, created_instance,
+        "xrGetVulkanDeviceExtensionsKHR", dispatch->vulkan.get_device_extensions));
+    static_cast<void>(load_function(next_get_instance_proc_addr, created_instance,
+        "xrCreateVulkanInstanceKHR", dispatch->vulkan.create_instance));
+    static_cast<void>(load_function(next_get_instance_proc_addr, created_instance,
+        "xrCreateVulkanDeviceKHR", dispatch->vulkan.create_device));
+    static_cast<void>(load_function(next_get_instance_proc_addr, created_instance,
+        "xrGetVulkanGraphicsDeviceKHR", dispatch->vulkan.get_graphics_device));
+    static_cast<void>(load_function(next_get_instance_proc_addr, created_instance,
+        "xrGetVulkanGraphicsDevice2KHR", dispatch->vulkan.get_graphics_device2));
+    static_cast<void>(load_function(next_get_instance_proc_addr, created_instance,
+        "xrGetVulkanGraphicsRequirementsKHR", dispatch->vulkan.get_graphics_requirements));
+    static_cast<void>(load_function(next_get_instance_proc_addr, created_instance,
+        "xrGetVulkanGraphicsRequirements2KHR", dispatch->vulkan.get_graphics_requirements2));
+    if (vulkan_bridge_requested_by_ini && asked_vulkan && d3d12_on_instance) {
+        dispatch->vulkan_bridge = dispatch->get_d3d12_graphics_requirements != nullptr ||
+            load_function(next_get_instance_proc_addr, created_instance,
+                "xrGetD3D12GraphicsRequirementsKHR", dispatch->get_d3d12_graphics_requirements);
+        xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::vulkan_bridge,
+            dispatch->vulkan_bridge ? 0 : -1, asked_vulkan, bridge_extension_added, 0);
+    }
 
     dispatch->instance = created_instance;
     bool application_enabled_clock_conversion = false;
@@ -3341,6 +3894,10 @@ XrResult layer_create_session_impl(
                 break;
             }
             if (next->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) {
+                const auto* binding = reinterpret_cast<const XrGraphicsBindingVulkanKHR*>(next);
+                state->vulkan_binding = {binding->instance, binding->physicalDevice,
+                    binding->device, binding->queueFamilyIndex, binding->queueIndex};
+                probe_vulkan_interop_support(*binding);
                 state->graphics_binding = SessionGraphicsBinding::vulkan;
                 binding_structure_type = next->type;
                 break;
@@ -3422,6 +3979,73 @@ XrResult layer_create_session_impl(
         } else {
             xrfg::bridge_flight_logger().event(
                 xrfg::BridgeFlightOperation::d3d11_bridge,
+                XR_FAILED(requirements_result)
+                    ? static_cast<std::int64_t>(requirements_result)
+                    : static_cast<std::int64_t>(device_result),
+                0,
+                XR_FAILED(requirements_result) ? 1 : 2,
+                0);
+        }
+    }
+
+    // The Vulkan bridge: see SessionState::vulkan_bridge. The same
+    // substitution as the D3D11 bridge's, on a D3D12 device of the layer's
+    // for the adapter the Vulkan physical device reports. Anything that
+    // fails leaves the Vulkan binding as the application made it, on its native Vulkan runtime; no obsolete mirror fallback.
+    const void* vulkan_binding_next = nullptr;
+    if (create_info != nullptr) {
+        for (auto* next = static_cast<const XrBaseInStructure*>(create_info->next);
+             next != nullptr; next = next->next) {
+            if (next->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) {
+                vulkan_binding_next = next->next;
+            }
+        }
+    }
+    if (dispatch->vulkan_bridge && GetPrivateProfileIntW(L"ofxr", L"vulkan_bridge", 1,
+            (current_layer_directory() / L"ofxr_bridge.ini").c_str()) == 1 &&
+        xrfg::vulkan_queue_serialized(state->vulkan_binding) &&
+        dispatch->get_d3d12_graphics_requirements != nullptr &&
+        state->graphics_binding == SessionGraphicsBinding::vulkan &&
+        create_info != nullptr &&
+        state->vulkan_binding.device != VK_NULL_HANDLE) {
+        XrGraphicsRequirementsD3D12KHR requirements{
+            XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR};
+        const XrResult requirements_result =
+            dispatch->get_d3d12_graphics_requirements(
+                instance, create_info->systemId, &requirements);
+        Microsoft::WRL::ComPtr<ID3D12Device> bridge_device;
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> bridge_queue;
+        HRESULT device_result = E_FAIL;
+        if (XR_SUCCEEDED(requirements_result)) {
+            device_result = xrfg::create_d3d12_device_for_vulkan(
+                state->vulkan_binding,
+                bridge_device.ReleaseAndGetAddressOf(),
+                bridge_queue.ReleaseAndGetAddressOf());
+        }
+        if (XR_SUCCEEDED(requirements_result) && SUCCEEDED(device_result) &&
+            bridge_device && bridge_queue) {
+            auto bridge = std::make_unique<SessionState::VulkanBridge>();
+            bridge->binding = state->vulkan_binding;
+            state->vulkan_bridge = std::move(bridge);
+            state->d3d12_device = std::move(bridge_device);
+            state->d3d12_queue = std::move(bridge_queue);
+            state->graphics_binding = SessionGraphicsBinding::d3d12;
+            state->graphics_binding_capabilities |= 256ULL;
+            bridge_binding.device = state->d3d12_device.Get();
+            bridge_binding.queue = state->d3d12_queue.Get();
+            bridge_binding.next = vulkan_binding_next;
+            substituted_info = *create_info;
+            substituted_info.next = &bridge_binding;
+            forwarded_info = &substituted_info;
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::vulkan_bridge,
+                1,
+                0,
+                0,
+                static_cast<std::uint64_t>(requirements.adapterLuid.LowPart));
+        } else {
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::vulkan_bridge,
                 XR_FAILED(requirements_result)
                     ? static_cast<std::int64_t>(requirements_result)
                     : static_cast<std::int64_t>(device_result),
@@ -4103,12 +4727,52 @@ XrResult layer_create_swapchain_impl(
     // single-sample create info, which is what the runtime's images are.
     XrSwapchainCreateInfo bridged_create_info{};
     const XrSwapchainCreateInfo* runtime_create_info = create_info;
-    if (state->d3d11_bridge &&
+    if ((state->d3d11_bridge || state->vulkan_bridge) &&
         (create_info->createFlags & XR_SWAPCHAIN_CREATE_PROTECTED_CONTENT_BIT))
         return XR_ERROR_FEATURE_UNSUPPORTED;
     if (state->d3d11_bridge && create_info->sampleCount > 1) {
         bridged_create_info = *create_info;
         bridged_create_info.sampleCount = 1;
+        runtime_create_info = &bridged_create_info;
+    }
+    // Bridged Vulkan: the application's format is a VkFormat and the
+    // runtime's session is D3D12, so the create info the runtime sees
+    // carries the DXGI equivalent, and so does everything below, which is
+    // what the runtime's images are. A format with no equivalent is refused
+    // the way a runtime refuses one it does not list; so is multisampled
+    // colour, which the bridge does not resolve.
+    if (state->vulkan_bridge) {
+        const auto vulkan_format = static_cast<VkFormat>(create_info->format);
+        const bool depth =
+            (create_info->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+        const DXGI_FORMAT dxgi_format = depth
+            ? xrfg::dxgi_depth_format_for_vulkan(vulkan_format)
+            : xrfg::dxgi_format_for_vulkan(vulkan_format);
+        if (dxgi_format == DXGI_FORMAT_UNKNOWN ||
+            (!depth && create_info->sampleCount > 1)) {
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::vulkan_bridge,
+                4,
+                static_cast<std::uint64_t>(create_info->format),
+                create_info->usageFlags,
+                create_info->sampleCount);
+            return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+        }
+        bridged_create_info = *create_info;
+        bridged_create_info.format = static_cast<std::int64_t>(dxgi_format);
+        // A Vulkan application need not render into the swapchain image:
+        // OpenComposite copies the game's own texture in, so No Man's Sky's
+        // swapchains carry only TRANSFER_DST. The runtime's image and the
+        // shared texture are colour attachments whatever was asked, which
+        // is what makes the swapchain a colour one to every path below.
+        if (!depth) {
+            bridged_create_info.usageFlags |= XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        }
+        // The runtime's depth images are never written (depth_private), so
+        // they are the cheapest shape that creates.
+        if (depth) {
+            bridged_create_info.sampleCount = 1;
+        }
         runtime_create_info = &bridged_create_info;
     }
     auto swapchain_state = std::make_shared<SwapchainState>(state, *runtime_create_info);
@@ -4244,6 +4908,77 @@ XrResult layer_create_swapchain_impl(
         }
         std::scoped_lock lock(swapchain_state->mutex);
         swapchain_state->bridge = std::move(bridge);
+    } else if (state->vulkan_bridge) {
+        // Bridge it now, as for D3D11: the application's enumeration is
+        // answered from the bridge's imported images.
+        std::uint32_t runtime_count = 0;
+        std::vector<XrSwapchainImageD3D12KHR> runtime_images;
+        XrResult bridge_result = state->dispatch->enumerate_swapchain_images(
+            created_swapchain, 0, &runtime_count, nullptr);
+        if (XR_SUCCEEDED(bridge_result) && runtime_count > 0) {
+            runtime_images.assign(
+                runtime_count,
+                XrSwapchainImageD3D12KHR{XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+            bridge_result = state->dispatch->enumerate_swapchain_images(
+                created_swapchain, runtime_count, &runtime_count,
+                reinterpret_cast<XrSwapchainImageBaseHeader*>(runtime_images.data()));
+        }
+        HRESULT shared_result = E_FAIL;
+        std::uint32_t failure_stage = 0;
+        auto bridge = std::make_shared<xrfg::VulkanBridgeSwapchain>();
+        if (XR_SUCCEEDED(bridge_result) && runtime_count > 0) {
+            std::vector<ID3D12Resource*> resources;
+            for (const XrSwapchainImageD3D12KHR& image : runtime_images) {
+                resources.push_back(image.texture);
+            }
+            xrfg::VulkanBridgeSwapchainDescription requested{};
+            requested.requested_format = static_cast<VkFormat>(create_info->format);
+            requested.width = create_info->width;
+            requested.height = create_info->height;
+            requested.array_size = create_info->arraySize;
+            requested.mip_levels = create_info->mipCount;
+            requested.sample_count = create_info->sampleCount;
+            requested.unordered_access =
+                (create_info->usageFlags & XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT) != 0;
+            requested.depth_stencil =
+                (create_info->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+            shared_result = bridge->initialize(
+                state->vulkan_bridge->binding,
+                state->d3d12_device.Get(),
+                state->d3d12_queue.Get(),
+                resources,
+                requested,
+                &failure_stage);
+        }
+        if (XR_FAILED(bridge_result) || FAILED(shared_result)) {
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::vulkan_bridge,
+                XR_FAILED(bridge_result)
+                    ? static_cast<std::int64_t>(bridge_result)
+                    : static_cast<std::int64_t>(shared_result),
+                handle_value(created_swapchain),
+                failure_stage,
+                static_cast<std::uint64_t>(create_info->format));
+            {
+                std::scoped_lock lock(g_state_mutex);
+                g_swapchains.erase(created_swapchain);
+            }
+            state->dispatch->destroy_swapchain(created_swapchain);
+            return XR_ERROR_RUNTIME_FAILURE;
+        }
+        xrfg::bridge_flight_logger().event(
+            xrfg::BridgeFlightOperation::vulkan_bridge,
+            2,
+            handle_value(created_swapchain),
+            (static_cast<std::uint64_t>(bridge->path()) << 32) | runtime_count,
+            (static_cast<std::uint64_t>(bridge->shared_format()) << 32) |
+                static_cast<std::uint64_t>(static_cast<std::uint32_t>(create_info->format)));
+        if (bridge->path() == xrfg::VulkanBridgePath::depth_private) {
+            state->has_private_depth_swapchain.store(true, std::memory_order_release);
+            swapchain_state->private_depth = true;
+        }
+        std::scoped_lock lock(swapchain_state->mutex);
+        swapchain_state->vulkan_bridge = std::move(bridge);
     }
     *swapchain = created_swapchain;
     if (active_color_reconfiguration) {
@@ -4311,7 +5046,7 @@ XrResult layer_destroy_swapchain_impl(XrSwapchain swapchain) {
     destroy_frame_generation_swapchains(state);
     const XrResult result = state->session->dispatch->destroy_swapchain(swapchain);
     if (XR_SUCCEEDED(result)) {
-        { std::scoped_lock lock(state->mutex); state->bridge.reset(); }
+        { std::scoped_lock lock(state->mutex); state->bridge.reset(); state->vulkan_bridge.reset(); }
         { std::scoped_lock lock(state->session->logged_view_rects_mutex); state->session->logged_view_rects.erase(swapchain); }
         std::scoped_lock lock(g_state_mutex);
         g_swapchains.erase(swapchain);
@@ -4336,13 +5071,40 @@ XrResult layer_enumerate_swapchain_images_impl(
     PresenterResourceLifetimeGuard presenter_guard(state->session);
     std::scoped_lock call_lock(state->call_mutex);
     std::shared_ptr<xrfg::D3D11BridgeSwapchain> bridge;
+    std::shared_ptr<xrfg::VulkanBridgeSwapchain> vulkan_bridge;
     {
         std::scoped_lock lock(state->mutex);
         bridge = state->bridge;
+        vulkan_bridge = state->vulkan_bridge;
     }
     std::vector<ID3D12Resource*> bridged_resources;
     XrResult result = XR_SUCCESS;
-    if (bridge) {
+    if (vulkan_bridge) {
+        // The application gets the bridge's imported Vulkan images, never
+        // the runtime's D3D12 ones; the D3D12 bookkeeping below sees the
+        // shared textures, which is what history captures from.
+        const auto vulkan_views = vulkan_bridge->vulkan_images();
+        const auto count = static_cast<std::uint32_t>(vulkan_views.size());
+        if (image_count_output == nullptr) {
+            return XR_ERROR_VALIDATION_FAILURE;
+        }
+        *image_count_output = count;
+        if (image_capacity_input == 0 || images == nullptr) {
+            return XR_SUCCESS;
+        }
+        if (image_capacity_input < count) {
+            return XR_ERROR_SIZE_INSUFFICIENT;
+        }
+        auto* vulkan_images = reinterpret_cast<XrSwapchainImageVulkanKHR*>(images);
+        for (std::uint32_t index = 0; index < count; ++index) {
+            if (vulkan_images[index].type != XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR) {
+                return XR_ERROR_VALIDATION_FAILURE;
+            }
+            vulkan_images[index].image = vulkan_views[index];
+        }
+        const auto shared = vulkan_bridge->shared_images();
+        bridged_resources.assign(shared.begin(), shared.end());
+    } else if (bridge) {
         // The application gets the bridge's D3D11 textures, never the
         // runtime's D3D12 images; the D3D12 bookkeeping below sees the
         // shared textures, which is what history captures from.
@@ -4509,10 +5271,10 @@ XrResult layer_enumerate_swapchain_images_impl(
 
         std::vector<ID3D12Resource*> resources(count);
         auto* d3d12_images = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images);
-        if (bridge) {
+        if (bridge || vulkan_bridge) {
             resources = bridged_resources;
         }
-        for (std::uint32_t index = 0; index < count && !bridge; ++index) {
+        for (std::uint32_t index = 0; index < count && !bridge && !vulkan_bridge; ++index) {
             if (d3d12_images[index].type != XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR ||
                 d3d12_images[index].texture == nullptr) {
                 log_swapchain_eligibility(
@@ -4722,6 +5484,8 @@ XrResult layer_wait_swapchain_image_impl(
             const auto image = state->acquired_indices[state->waited_count++];
             if (state->bridge && FAILED(state->bridge->before_write(image)))
                 return XR_ERROR_RUNTIME_FAILURE;
+            if (state->vulkan_bridge && FAILED(state->vulkan_bridge->before_write(image)))
+                return XR_ERROR_RUNTIME_FAILURE;
         }
     }
     return result;
@@ -4875,10 +5639,12 @@ XrResult release_swapchain_with_identity(
     std::optional<std::uint32_t> candidate_index;
     std::shared_ptr<xrfg::D3D12SwapchainHistory> history;
     std::shared_ptr<xrfg::D3D11BridgeSwapchain> bridge;
+    std::shared_ptr<xrfg::VulkanBridgeSwapchain> vulkan_bridge;
     std::shared_ptr<xrfg::D3D11D3D12SwapchainInterop> d3d11_interop;
     {
         std::scoped_lock lock(state->mutex);
         bridge = state->bridge;
+        vulkan_bridge = state->vulkan_bridge;
         if (state->ownership_tracking_valid && state->waited_count > 0 &&
             !state->acquired_indices.empty()) {
             candidate_index = state->acquired_indices.front();
@@ -4902,6 +5668,15 @@ XrResult release_swapchain_with_identity(
                 handle_value(state->handle),
                 *candidate_index,
                 static_cast<std::uint64_t>(static_cast<std::uint32_t>(copy_result)));
+        }
+    }
+
+    if (vulkan_bridge && candidate_index) {
+        const HRESULT copied = vulkan_bridge->release(*candidate_index);
+        if (FAILED(copied)) {
+            xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::vulkan_bridge,
+                copied, handle_value(state->handle), *candidate_index, 3);
+            return XR_ERROR_RUNTIME_FAILURE;
         }
     }
 
@@ -5105,6 +5880,9 @@ XrResult release_swapchain_with_identity(
         // capture - is queued; the next acquire of this image waits for it.
         static_cast<void>(bridge->mark_read(*candidate_index));
     }
+
+    if (vulkan_bridge && candidate_index && FAILED(vulkan_bridge->mark_read(*candidate_index)))
+        return XR_ERROR_RUNTIME_FAILURE;
 
     XrResult result = XR_ERROR_RUNTIME_FAILURE;
     try {
