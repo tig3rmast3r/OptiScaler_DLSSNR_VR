@@ -32,6 +32,7 @@ bool midpoint_cadence{};
 bool deep_readiness{};
 bool triple_core{};
 bool triple_inline{};
+bool triple_switch{};
 bool fsr_queue_gpu_pending{};
 ComPtr<ID3D12Fence> fsr_gpu_gate;
 std::jthread fsr_gpu_watchdog;
@@ -282,7 +283,8 @@ int main(int argc,char** argv) {
 #ifdef OFXR_DJULES_COMPARISON
         deep_readiness=argc>1 && std::string_view(argv[1])=="deep-readiness";
         s->djules_deep_pipeline=deep_readiness;
-        triple_core=argc>1 && std::string_view(argv[1])=="triple-core";
+        triple_switch=argc>1 && std::string_view(argv[1])=="triple-switch";
+        triple_core=triple_switch || (argc>1 && std::string_view(argv[1])=="triple-core");
         triple_inline=argc>1 && std::string_view(argv[1])=="triple-inline";
         s->djules_triple_requested=triple_core||triple_inline;
         if(triple_inline) { dispatch->virtual_desktop_runtime=true; dispatch->inline_unless_pipelined=true; }
@@ -368,6 +370,10 @@ int main(int argc,char** argv) {
             require(s->three_slot_director && s->synthesis_thread.joinable(),"native did not enter three lanes");
         }
         for(unsigned n=1;n<=8;++n) {
+#ifdef OFXR_DJULES_COMPARISON
+            if(triple_switch && (n==5 || n==7))
+                require(XR_SUCCEEDED(switch_djules_multiplier(s,n==7)),"live GPU multiplier switch");
+#endif
             require(XR_SUCCEEDED(wait_for_synthesis_handoff(s)),"worker rendezvous");
             if(midpoint_cadence && n>2)
                 std::this_thread::sleep_for(std::chrono::milliseconds(3));
@@ -401,7 +407,7 @@ int main(int argc,char** argv) {
             if(n==1){fill(fixed->enumerated_d3d12_images[0].Get(),55,120);release(fixed,!triple_inline && !legacy_queue);}
             XrFrameState prediction{XR_TYPE_FRAME_STATE};
             require(XR_SUCCEEDED(layer_wait_frame_impl(s->handle,nullptr,&prediction)),"producer wait");
-            require(prediction.predictedDisplayPeriod==((triple_core||triple_inline)?24999999 : legacy_queue && n>1 ? 16666666 : 8333333),"advertised period");
+            require(prediction.predictedDisplayPeriod==(triple_switch && (n==5 || n==6)?8333333 : (triple_core||triple_inline)?24999999 : legacy_queue && n>1 ? 16666666 : 8333333),"advertised period");
             require(XR_SUCCEEDED(layer_begin_frame_impl(s->handle,nullptr)),"producer begin");
             if(fsr_queue_gpu_pending && n==3) {
                 require(XR_SUCCEEDED(wait_for_presenter_idle(s)), "pending GPU test drain");
@@ -508,7 +514,7 @@ int main(int argc,char** argv) {
             require(submissions.size()==fresh.size()+repeats,"deep physical output accounting");
             submissions=std::move(fresh);
         }
-        const unsigned expected_count=(triple_core||triple_inline)?22:fsr_queue_switch ? 16 : fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
+        const unsigned expected_count=triple_switch?17:(triple_core||triple_inline)?22:fsr_queue_switch ? 16 : fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
         require(submissions.size()==expected_count && waits==expected_count+repeats && begins==expected_count+repeats && ends==expected_count+repeats,"unique output/cycle count");
         if(fsr_missing) {
             for(unsigned i=0;i<8;++i) require(submissions[i]==std::pair<unsigned,bool>{i+1,false},"FSR missing guide repeated/lost real");
@@ -528,6 +534,16 @@ int main(int argc,char** argv) {
                     ++next_real;
                 } else require(submissions[i].second,"promotion synthetic order");
             }
+        } else if(triple_switch) {
+            std::vector<std::pair<unsigned,bool>> expected;
+            for(unsigned n=1;n<=8;++n) {
+                if(n>1 && n!=5 && n!=7) {
+                    expected.emplace_back(n,true);
+                    if(n!=6) expected.emplace_back(n,true);
+                }
+                expected.emplace_back(n,false);
+            }
+            require(submissions==expected,"live shape lost, repeated or reordered an owned output");
         } else if(triple_core||triple_inline) {
             for(unsigned i=0;i<7;++i) {
                 require(submissions[3*i]==std::pair<unsigned,bool>{i+1,false},"3X real order");

@@ -736,7 +736,8 @@ struct SessionState {
 
     bool nvidia_new_route{};
     bool djules_deep_pipeline{};
-    bool djules_triple_requested{};
+    std::atomic_bool djules_triple_requested{};
+    std::atomic_uint64_t djules_configuration_epoch{};
     xrfg::DjulesTripleRelease djules_triple_release;
     bool djules_triple_switchable{};
     std::chrono::steady_clock::time_point djules_triple_poll{};
@@ -7675,6 +7676,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
         DjulesAbsoluteSchedule djules_schedule;
         std::chrono::steady_clock::time_point djules_last_returned{};
         std::shared_ptr<GeneratedFrameEndInfo> djules_last_owned;
+        auto configuration_epoch=state->djules_configuration_epoch.load();
         for (;;) {
             std::shared_ptr<ThreeSlotFrame> selected;
             std::shared_ptr<PresenterSubmission> borrowed;
@@ -7812,6 +7814,11 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             }
             xrfg::bridge_flight_logger().end(pace_token,
                 xrfg::BridgeFlightOperation::presenter_pace, 0);
+            const auto epoch=state->djules_configuration_epoch.load();
+            if(epoch!=configuration_epoch) {
+                djules_last_owned.reset(); djules_schedule={}; djules_last_returned={};
+                configuration_epoch=epoch;
+            }
             bool repeat_held=false;
             bool drain_requested=false;
             { std::scoped_lock lock(state->presenter_mutex); drain_requested=state->director_draining; }
@@ -11212,6 +11219,7 @@ HRESULT reconcile_depth_history_for_route(SwapchainState& chain) {
         std::scoped_lock content(state->presenter_content_mutex);
         std::scoped_lock lock(state->presenter_mutex);
         state->djules_triple_requested=target;
+        ++state->djules_configuration_epoch;
         state->djules_triple_release={};
         state->three_slots.configure(djules_triple_director(*state)?3:2);
         state->application_served_serial=state->presenter_frame_serial;
@@ -11379,6 +11387,7 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
     state->control_revision = control.revision;
     state->control_reconfigure_required = FAILED(result);
     state->menu_enabled = SUCCEEDED(result) && control.desired.enabled;
+    ++state->djules_configuration_epoch;
     { std::scoped_lock lock(state->presenter_mutex);
       state->three_slots.configure(djules_triple_director(*state)?3:2);
       state->djules_triple_release={}; }
