@@ -185,6 +185,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     set(XRFG_FSR_CINEMA_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/fsr_cinema_pixel_shader.hpp")
     set(XRFG_CINEMA_FLATTEN_VERTEX_HEADER "${XRFG_GENERATED_SHADER_DIR}/cinema_flatten_vertex_shader.hpp")
     set(XRFG_CINEMA_FLATTEN_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/cinema_flatten_pixel_shader.hpp")
+    set(XRFG_NVIDIA_LUMA_INPUT_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_pack_luma_input_shader.hpp")
     set(XRFG_NVIDIA_PACK_INPUT_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_pack_flow_input_shader.hpp")
     set(XRFG_NVIDIA_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_synthesize_midpoint_pixel_shader.hpp")
     set(XRFG_NVIDIA_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_bidirectional_synthesize_midpoint_pixel_shader.hpp")
@@ -205,6 +206,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             "${XRFG_CINEMA_FLATTEN_VERTEX_HEADER}"
             "${XRFG_CINEMA_FLATTEN_PIXEL_HEADER}"
             "${XRFG_NVIDIA_PACK_INPUT_HEADER}"
+            "${XRFG_NVIDIA_LUMA_INPUT_HEADER}"
             "${XRFG_NVIDIA_SYNTHESIZE_PIXEL_HEADER}"
             "${XRFG_NVIDIA_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}"
             "${XRFG_NVIDIA_FAST_SYNTHESIZE_PIXEL_HEADER}"
@@ -244,6 +246,10 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_FSR_CINEMA_PIXEL_HEADER}" /Vn g_xrfg_fsr_cinema_pixel_shader
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/fsr_cinema_projection.hlsl"
+        COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E PackNvidiaFlowInput
+            /D XRFG_NVIDIA_LUMA_INPUT=1 /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
+            /Fh "${XRFG_NVIDIA_LUMA_INPUT_HEADER}" /Vn g_xrfg_nvidia_pack_luma_input_shader
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E PackNvidiaFlowInput
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_NVIDIA_PACK_INPUT_HEADER}" /Vn g_xrfg_nvidia_pack_flow_input_shader
@@ -307,6 +313,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         "${XRFG_FSR_CINEMA_VERTEX_HEADER}"
         "${XRFG_FSR_CINEMA_PIXEL_HEADER}"
         "${XRFG_NVIDIA_PACK_INPUT_HEADER}"
+        "${XRFG_NVIDIA_LUMA_INPUT_HEADER}"
         "${XRFG_NVIDIA_SYNTHESIZE_PIXEL_HEADER}"
         "${XRFG_NVIDIA_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}"
         "${XRFG_NVIDIA_FAST_SYNTHESIZE_PIXEL_HEADER}"

@@ -131,6 +131,7 @@ struct D3D12NvidiaOpticalFlowOptions {
     D3D12OpticalFlowInputScale input_scale{
         D3D12OpticalFlowInputScale::half};
     bool bidirectional{};
+    bool grayscale_input{}; // Optional optimization; reference stays BGRA8.
     D3D12OpticalFlowInputEncoding input_encoding{
         D3D12OpticalFlowInputEncoding::reference_linear};
 };

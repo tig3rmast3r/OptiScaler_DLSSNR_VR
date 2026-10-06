@@ -7,8 +7,13 @@ Texture2D<uint> ForwardAuxiliary : register(t5);
 Texture2DArray<float2> GameMotionVectors : register(t6);
 Texture2DArray<float4> SceneOnlyFrame : register(t7);
 RWTexture2D<float4> PackedColor : register(u0);
+#ifdef XRFG_NVIDIA_LUMA_INPUT
+RWTexture2D<float> NvidiaPreviousColor : register(u1);
+RWTexture2D<float> NvidiaCurrentColor : register(u2);
+#else
 RWTexture2D<float4> NvidiaPreviousColor : register(u1);
 RWTexture2D<float4> NvidiaCurrentColor : register(u2);
+#endif
 
 struct CameraMapping {
     float4 TargetToSourceRotation;
@@ -390,8 +395,14 @@ void PackNvidiaFlowInput(uint3 thread_id : SV_DispatchThreadID) {
         current_color = CurrentFrame.Load(
             int4(int2(thread_id.xy), int(slice), 0));
     }
+#ifdef XRFG_NVIDIA_LUMA_INPUT
+    const float3 weights = float3(0.2126, 0.7152, 0.0722);
+    NvidiaPreviousColor[thread_id.xy] = dot(pack_flow_input_color(previous_color).rgb, weights);
+    NvidiaCurrentColor[thread_id.xy] = dot(pack_flow_input_color(current_color).rgb, weights);
+#else
     NvidiaPreviousColor[thread_id.xy] = pack_flow_input_color(previous_color);
     NvidiaCurrentColor[thread_id.xy] = pack_flow_input_color(current_color);
+#endif
 }
 
 float2 load_backward_flow_clamped(

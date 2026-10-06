@@ -22,6 +22,7 @@
 #include "nvidia_fast_synthesize_midpoint_pixel_shader.hpp"
 #include "nvidia_fast_bidirectional_synthesize_midpoint_pixel_shader.hpp"
 #include "nvidia_pack_flow_input_shader.hpp"
+#include "nvidia_pack_luma_input_shader.hpp"
 #include "nvidia_synthesize_midpoint_pixel_shader.hpp"
 #include "pack_flow_input_shader.hpp"
 #include "reproject_generated_pixel_shader.hpp"
@@ -923,6 +924,8 @@ struct D3D12FrameSynthesizer::Impl {
     ComPtr<ID3D12Resource> cinema_flat_color;
     ComPtr<ID3D12DescriptorHeap> cinema_flat_rtv_heap;
     ComPtr<ID3D12PipelineState> nvidia_pack_pipeline;
+    ComPtr<ID3D12PipelineState> nvidia_luma_pack_pipeline;
+    DXGI_FORMAT nvidia_input_format{DXGI_FORMAT_B8G8R8A8_UNORM};
     ComPtr<ID3D12PipelineState> nvidia_graphics_pipeline;
     ComPtr<ID3D12PipelineState> nvidia_bidirectional_graphics_pipeline;
     ComPtr<ID3D12Resource> packed_color;
@@ -1215,6 +1218,12 @@ struct D3D12FrameSynthesizer::Impl {
         if (FAILED(result)) {
             return result;
         }
+
+        compute_description.CS = {g_xrfg_nvidia_pack_luma_input_shader,
+            sizeof(g_xrfg_nvidia_pack_luma_input_shader)};
+        result = device->CreateComputePipelineState(&compute_description,
+            IID_PPV_ARGS(nvidia_luma_pack_pipeline.GetAddressOf()));
+        if (FAILED(result)) return result;
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics_description{};
         graphics_description.pRootSignature = root_signature.Get();
@@ -1641,7 +1650,7 @@ struct D3D12FrameSynthesizer::Impl {
             kNvidiaFlowBlockSize;
         const D3D12_HEAP_PROPERTIES heap_properties =
             default_heap_properties(node_mask);
-        const D3D12_RESOURCE_DESC input_description = texture2d_description(
+        D3D12_RESOURCE_DESC input_description = texture2d_description(
             packed_width,
             packed_height,
             DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -1694,10 +1703,18 @@ struct D3D12FrameSynthesizer::Impl {
             if (FAILED(result) || context == nullptr) {
                 return FAILED(result) ? result : E_FAIL;
             }
+            if (eye_index == 0) {
+                nvidia_input_format = nvidia_options.grayscale_input &&
+                    nvidia_surface_format_supported(context, NV_OF_BUFFER_USAGE_INPUT, DXGI_FORMAT_R8_UNORM)
+                    ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+                initialization.inputBufferFormat = nvidia_input_format == DXGI_FORMAT_R8_UNORM
+                    ? NV_OF_BUFFER_FORMAT_GRAYSCALE8 : NV_OF_BUFFER_FORMAT_ABGR8;
+                input_description.Format = nvidia_input_format;
+            }
             if (!nvidia_surface_format_supported(
                     context,
                     NV_OF_BUFFER_USAGE_INPUT,
-                    DXGI_FORMAT_B8G8R8A8_UNORM) ||
+                    nvidia_input_format) ||
                 !nvidia_surface_format_supported(
                     context,
                     NV_OF_BUFFER_USAGE_OUTPUT,
@@ -2062,7 +2079,7 @@ struct D3D12FrameSynthesizer::Impl {
                             cpu_start,
                             base + 5,
                             descriptor_increment));
-                    uav_description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    uav_description.Format = nvidia_input_format;
                     device->CreateUnorderedAccessView(
                         nullptr,
                         nullptr,
@@ -4171,7 +4188,8 @@ struct D3D12FrameSynthesizer::Impl {
         slot.command_list->SetComputeRootSignature(root_signature.Get());
         const D3D12_GPU_DESCRIPTOR_HANDLE gpu_start =
             slot.descriptor_heap->GetGPUDescriptorHandleForHeapStart();
-        slot.command_list->SetPipelineState(nvidia_pack_pipeline.Get());
+        slot.command_list->SetPipelineState(nvidia_input_format == DXGI_FORMAT_R8_UNORM
+            ? nvidia_luma_pack_pipeline.Get() : nvidia_pack_pipeline.Get());
 
         SynthesisParameters parameters{};
         parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction) |

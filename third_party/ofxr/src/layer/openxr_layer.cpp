@@ -2952,7 +2952,7 @@ XrResult layer_create_session_impl(
         static_cast<xrfg::D3D12NvidiaPerformancePreset>(initial_control.desired.preset),
         static_cast<xrfg::D3D12NvidiaInputScale>(initial_control.desired.scale),
         initial_control.desired.backward,
-        xrfg::flow_encoding_for_route(state->nvidia_new_route)};
+        state->nvidia_new_route, xrfg::flow_encoding_for_route(state->nvidia_new_route)};
     state->menu_enabled = initial_control.desired.enabled;
     state->frame_generation_mode = static_cast<xrfg::D3D12FrameGenerationMode>(initial_control.desired.frame_generation);
     state->dlss_motion_vectors = initial_control.desired.motion_vectors == 1 ||
@@ -9199,7 +9199,7 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
     const xrfg::D3D12NvidiaOpticalFlowOptions options{
         static_cast<xrfg::D3D12NvidiaPerformancePreset>(control.desired.preset),
         static_cast<xrfg::D3D12NvidiaInputScale>(control.desired.scale), control.desired.backward,
-        xrfg::flow_encoding_for_route(nvidia_new_route)};
+        nvidia_new_route, xrfg::flow_encoding_for_route(nvidia_new_route)};
     const bool changed = state->control_reconfigure_required || backend != state->optical_flow_backend ||
         options.preset != state->nvidia_options.preset ||
         options.input_scale != state->nvidia_options.input_scale ||
