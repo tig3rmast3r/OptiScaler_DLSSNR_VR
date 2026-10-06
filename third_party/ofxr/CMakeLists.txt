@@ -682,6 +682,10 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         add_test(
             NAME xrfg_layer_negotiation
             COMMAND xrfg_layer_smoke ${XRFG_TEST_LAYER_DLL})
+        add_test(NAME xrfg_layer_process_exclusion COMMAND "${CMAKE_COMMAND}"
+            "-DSMOKE=$<TARGET_FILE:xrfg_layer_smoke>" "-DLAYER=${XRFG_TEST_LAYER_DLL}"
+            "-DSCRATCH=${CMAKE_CURRENT_BINARY_DIR}/process-exclusion-fixture"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/layer_process_exclusion.cmake")
 
         add_executable(xrfg_layer_call_chain tests/layer_call_chain.cpp)
         target_include_directories(xrfg_layer_call_chain PRIVATE

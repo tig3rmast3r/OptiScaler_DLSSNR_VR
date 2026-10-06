@@ -4,8 +4,14 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace xrfg::implicit_layer {
+inline constexpr wchar_t kDefaultExcludedProcesses[] = L"PimaxHome-Win64-Shipping.exe";
+[[nodiscard]] std::vector<std::wstring> read_excluded_processes(const std::filesystem::path&) noexcept;
+[[nodiscard]] bool executable_is_excluded(std::wstring_view, const std::vector<std::wstring>&) noexcept;
+[[nodiscard]] std::wstring current_executable_name() noexcept;
+
 
 // One manual-reset kernel event per arm. Old readers retain their own event;
 // re-arming cannot accidentally reactivate a session that was already stopped.

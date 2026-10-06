@@ -11727,6 +11727,25 @@ extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoade
             return XR_ERROR_INITIALIZATION_FAILED;
         }
 
+        // A refusal here is the one way to keep the layer out of a process
+        // entirely: the loader drops an implicit layer whose negotiation
+        // fails and carries on without it, so an excluded process has no
+        // hook, no history and no private swapchain from this layer.
+        const std::wstring executable =
+            xrfg::implicit_layer::current_executable_name();
+        if (xrfg::implicit_layer::executable_is_excluded(
+                executable,
+                xrfg::implicit_layer::read_excluded_processes(
+                    current_layer_directory()))) {
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::process_excluded,
+                0,
+                executable.size(),
+                0,
+                0);
+            return XR_ERROR_INITIALIZATION_FAILED;
+        }
+
         layer_request->layerInterfaceVersion = XR_CURRENT_LOADER_API_LAYER_VERSION;
         layer_request->layerApiVersion = kLayerApiVersion;
         layer_request->getInstanceProcAddr = layer_get_instance_proc_addr;

@@ -10,6 +10,83 @@
 #include <algorithm>
 
 namespace xrfg::implicit_layer {
+std::vector<std::wstring> read_excluded_processes(
+    const std::filesystem::path& module_directory) noexcept {
+    std::vector<std::wstring> names;
+    try {
+        std::wstring value = kDefaultExcludedProcesses;
+        if (!module_directory.empty()) {
+            const auto ini_path = module_directory / L"ofxr_bridge.ini";
+            // A sentinel default tells an absent key from an empty one.
+            std::array<wchar_t, 2048> buffer{};
+            const DWORD count = GetPrivateProfileStringW(
+                L"ofxr", L"excluded_processes", L"\x01",
+                buffer.data(), static_cast<DWORD>(buffer.size()), ini_path.c_str());
+            const std::wstring_view read(buffer.data(), count);
+            if (read != L"\x01") {
+                value.assign(read);
+            }
+        }
+        std::wstring current;
+        const auto flush = [&]() {
+            while (!current.empty() && (current.back() == L' ' || current.back() == L'\t')) {
+                current.pop_back();
+            }
+            std::size_t start = 0;
+            while (start < current.size() && (current[start] == L' ' || current[start] == L'\t')) {
+                ++start;
+            }
+            if (start < current.size()) {
+                names.emplace_back(current.substr(start));
+            }
+            current.clear();
+        };
+        for (wchar_t character : value) {
+            if (character == L';' || character == L',') {
+                flush();
+            } else {
+                current.push_back(character);
+            }
+        }
+        flush();
+    } catch (...) {
+        names.clear();
+    }
+    return names;
+}
+
+bool executable_is_excluded(
+    std::wstring_view executable,
+    const std::vector<std::wstring>& excluded) noexcept {
+    try {
+        for (const std::wstring& name : excluded) {
+            if (name.size() == executable.size() &&
+                CompareStringOrdinal(
+                    name.data(), static_cast<int>(name.size()),
+                    executable.data(), static_cast<int>(executable.size()),
+                    TRUE) == CSTR_EQUAL) {
+                return true;
+            }
+        }
+    } catch (...) {
+    }
+    return false;
+}
+
+std::wstring current_executable_name() noexcept {
+    try {
+        std::array<wchar_t, 32768> buffer{};
+        const DWORD length = GetModuleFileNameW(
+            nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0 || length >= buffer.size()) {
+            return {};
+        }
+        return std::filesystem::path(std::wstring(buffer.data(), length)).filename().wstring();
+    } catch (...) {
+        return {};
+    }
+}
+
 namespace {
 
 [[nodiscard]] std::wstring registry_error(
