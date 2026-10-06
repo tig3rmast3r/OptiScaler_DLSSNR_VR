@@ -469,6 +469,9 @@ struct SessionState {
     bool pipelined_presenter_mode{};
     bool pipelined_presenter_start_requested{};
     bool presenter_start_requested{};
+    bool runtime_frame_waited_unbegun{}; // frame_call_mutex
+    bool application_begin_needs_wait{}; // frame_call_mutex
+    std::optional<XrFrameState> presenter_adopted_frame; // presenter_mutex
     bool single_threaded_d3d11{}; // D08: runtime calls cannot move to another thread.
     bool split_frame_loop{}; // D09: targeted direct-D3D11 driver workaround.
     DWORD application_wait_thread_id{};
@@ -1366,6 +1369,24 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
 void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept;
 [[nodiscard]] XrResult wait_for_synthesis_handoff(
     const std::shared_ptr<SessionState>& state) noexcept;
+
+// A promoted frame owner inherits an already-forwarded, unbegun runtime
+// wait exactly once. Issuing another wait first would deadlock pipelined games.
+XrResult wait_presenter_runtime_frame(const std::shared_ptr<SessionState>& state,
+    const XrFrameWaitInfo* wait, XrFrameState* frame) {
+    {
+        std::scoped_lock lock(state->presenter_mutex);
+        if (state->presenter_adopted_frame) {
+            *frame = *state->presenter_adopted_frame;
+            state->presenter_adopted_frame.reset();
+            frame->next = nullptr;
+            xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::presenter_transition,
+                500, frame->predictedDisplayTime, frame->predictedDisplayPeriod, frame->shouldRender);
+            return XR_SUCCESS;
+        }
+    }
+    return state->dispatch->wait_frame(state->handle, wait, frame);
+}
 
 [[nodiscard]] bool presenter_forbidden(const SessionState& state) noexcept {
     return state.graphics_binding == SessionGraphicsBinding::d3d11 &&
@@ -3307,6 +3328,7 @@ void reset_frame_bookkeeping(const std::shared_ptr<SessionState>& state) {
         state->presenter_start_requested = false;
         state->split_frame_loop = false;
         state->application_wait_thread_id = state->application_end_thread_id = 0;
+        state->runtime_frame_waited_unbegun = state->application_begin_needs_wait = false;
         state->last_inline_frame_state = XrFrameState{XR_TYPE_FRAME_STATE};
         state->last_inline_frame_state_valid = false;
         state->generation_steady_state_established = false;
@@ -3668,6 +3690,7 @@ XrResult layer_wait_frame_impl(
             state->last_inline_frame_state_valid = true;
             state->last_application_wait_elapsed = application_wait_elapsed;
             forwarded_application_wait = true;
+            state->runtime_frame_waited_unbegun = true;
         }
     }
     if (XR_SUCCEEDED(result) && frame_state != nullptr) {
@@ -3754,9 +3777,23 @@ XrResult layer_begin_frame_impl(
         } else if (state->pipelined_presenter_mode) {
             result = XR_ERROR_RUNTIME_FAILURE;
         } else {
-            result = with_runtime_entry(state, [&] {
+            XrResult replacement_result = XR_SUCCESS;
+            if (state->application_begin_needs_wait) {
+                XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};
+                XrFrameState replacement{XR_TYPE_FRAME_STATE};
+                replacement_result = state->dispatch->wait_frame(session, &wait, &replacement);
+                if (XR_SUCCEEDED(replacement_result)) {
+                    state->application_begin_needs_wait = false;
+                    state->last_inline_frame_state = replacement;
+                    state->last_inline_frame_state.next = nullptr;
+                    state->last_inline_frame_state_valid = true;
+                    state->runtime_frame_waited_unbegun = true;
+                }
+            }
+            result = XR_FAILED(replacement_result) ? replacement_result : with_runtime_entry(state, [&] {
                 return state->dispatch->begin_frame(session, begin_info);
             });
+            if (XR_SUCCEEDED(result)) state->runtime_frame_waited_unbegun = false;
         }
     } catch (...) {
         if (state->application_wait_pending_begin) {
@@ -5233,10 +5270,7 @@ void continuous_presenter_main(
         const auto wait_token = xrfg::bridge_flight_logger().begin(
             xrfg::BridgeFlightOperation::internal_wait_frame,
             handle_value(state->handle));
-        const XrResult wait_result = state->dispatch->wait_frame(
-            state->handle,
-            &wait_info,
-            &frame_state);
+        const XrResult wait_result = wait_presenter_runtime_frame(state, &wait_info, &frame_state);
         xrfg::bridge_flight_logger().end(
             wait_token,
             xrfg::BridgeFlightOperation::internal_wait_frame,
@@ -6051,7 +6085,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             XrFrameState prediction{XR_TYPE_FRAME_STATE};
             auto token = xrfg::bridge_flight_logger().begin(
                 xrfg::BridgeFlightOperation::internal_wait_frame, handle_value(state->handle));
-            XrResult result = state->dispatch->wait_frame(state->handle, &wait, &prediction);
+            XrResult result = wait_presenter_runtime_frame(state, &wait, &prediction);
             xrfg::bridge_flight_logger().end(token, xrfg::BridgeFlightOperation::internal_wait_frame,
                 result, prediction.predictedDisplayTime, prediction.predictedDisplayPeriod,
                 prediction.shouldRender);
@@ -6218,6 +6252,12 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
         std::scoped_lock lock(state->presenter_mutex);
         if (state->presenter_active) {
             return true;
+        }
+        state->presenter_adopted_frame.reset();
+        if (state->runtime_frame_waited_unbegun && state->last_inline_frame_state_valid) {
+            state->presenter_adopted_frame = state->last_inline_frame_state;
+            state->presenter_adopted_frame->next = nullptr;
+            state->runtime_frame_waited_unbegun = false;
         }
         state->presenter_submissions.clear();
         state->presenter_last_frame.reset();
@@ -8866,8 +8906,7 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
             [display_time](const PendingApplicationFrame& candidate) {
                 return candidate.display_time == display_time;
             });
-        if (frame != state->pending_frames.end() &&
-            std::next(frame) == state->pending_frames.end()) {
+        if (frame != state->pending_frames.end()) {
             return *frame;
         }
         // Native Stereo Fix may rewrite displayTime. A begun frame with no
@@ -9008,7 +9047,8 @@ struct InternalCycleResult {
     const std::shared_ptr<SessionState>& state,
     const XrFrameEndInfo& current_end_info,
     std::uint64_t frame_serial = 0,
-    const PreparedProjectionFrame* prepared = nullptr) {
+    const PreparedProjectionFrame* prepared = nullptr,
+    std::optional<XrFrameState> adopted_frame = std::nullopt) {
     InternalCycleResult output{};
     if (state->dispatch->wait_frame == nullptr ||
         state->dispatch->begin_frame == nullptr ||
@@ -9022,10 +9062,9 @@ struct InternalCycleResult {
         xrfg::BridgeFlightOperation::internal_wait_frame,
         handle_value(state->handle));
     const auto wait_started = std::chrono::steady_clock::now();
-    const XrResult wait_result = state->dispatch->wait_frame(
-        state->handle,
-        &wait_info,
-        &frame_state);
+    const XrResult wait_result = adopted_frame
+        ? (frame_state = *adopted_frame, frame_state.next = nullptr, XR_SUCCESS)
+        : state->dispatch->wait_frame(state->handle, &wait_info, &frame_state);
     output.wait_elapsed = std::chrono::steady_clock::now() - wait_started;
     output.predicted_display_period = frame_state.predictedDisplayPeriod;
     output.display_time = frame_state.predictedDisplayTime;
@@ -10702,8 +10741,14 @@ XrResult layer_end_frame_impl(
                     : nullptr));
         }
     }
+    std::optional<XrFrameState> adopted_frame;
+    if (state->runtime_frame_waited_unbegun && state->last_inline_frame_state_valid) {
+        adopted_frame = state->last_inline_frame_state;
+        state->runtime_frame_waited_unbegun = false;
+        state->application_begin_needs_wait = true;
+    }
     const InternalCycleResult current_cycle =
-        submit_current_cycle(state, current_generated.info, frame_serial, &prepared);
+        submit_current_cycle(state, current_generated.info, frame_serial, &prepared, adopted_frame);
     // How far apart the runtime actually received the two frames of this
     // pair: from the synthetic's hand-over completing to the real frame's.
     const auto inline_pair_gap = std::chrono::steady_clock::now() -
