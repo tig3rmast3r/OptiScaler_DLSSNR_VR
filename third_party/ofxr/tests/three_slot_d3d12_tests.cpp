@@ -30,6 +30,7 @@ bool legacy_queue{};
 bool legacy_early_current{};
 bool midpoint_cadence{};
 bool deep_readiness{};
+bool triple_core{};
 bool fsr_queue_gpu_pending{};
 ComPtr<ID3D12Fence> fsr_gpu_gate;
 std::jthread fsr_gpu_watchdog;
@@ -110,7 +111,7 @@ unsigned pixel(ID3D12Resource* r, unsigned slice,
         list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
         barrier(list,r,D3D12_RESOURCE_STATE_COPY_SOURCE,submitted_state);
 #ifdef OFXR_DJULES_COMPARISON
-    },deep_readiness?runtime_queue(*session_state):nullptr);
+    },(deep_readiness||triple_core)?runtime_queue(*session_state):nullptr);
 #else
     });
 #endif
@@ -280,6 +281,8 @@ int main(int argc,char** argv) {
 #ifdef OFXR_DJULES_COMPARISON
         deep_readiness=argc>1 && std::string_view(argv[1])=="deep-readiness";
         s->djules_deep_pipeline=deep_readiness;
+        triple_core=argc>1 && std::string_view(argv[1])=="triple-core";
+        s->djules_triple_requested=triple_core;
 #endif
         fsr_test=argc>1 && std::string_view(argv[1]).starts_with("fsr-");
         legacy_queue=argc>1 && std::string_view(argv[1]).starts_with("legacy-queue");
@@ -318,7 +321,7 @@ int main(int argc,char** argv) {
         hr(s->d3d12_device->CreateCommandQueue(&q,IID_PPV_ARGS(&s->d3d12_queue)),"application queue");
         hr(s->d3d12_device->CreateCommandQueue(&q,IID_PPV_ARGS(&s->d3d12_synthesis_queue)),"synthesis queue");
 #ifdef OFXR_DJULES_COMPARISON
-        if(deep_readiness) {
+        if(deep_readiness||triple_core) {
             dispatch->steamvr_runtime=true;
             hr(s->d3d12_device->CreateCommandQueue(&q,IID_PPV_ARGS(&s->binding_queue)),"DJ runtime binding queue");
             hr(s->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&s->app_release_fence)),"DJ app release fence");
@@ -392,7 +395,7 @@ int main(int argc,char** argv) {
             if(n==1){fill(fixed->enumerated_d3d12_images[0].Get(),55,120);release(fixed,!legacy_queue);}
             XrFrameState prediction{XR_TYPE_FRAME_STATE};
             require(XR_SUCCEEDED(layer_wait_frame_impl(s->handle,nullptr,&prediction)),"producer wait");
-            require(prediction.predictedDisplayPeriod==(legacy_queue && n>1 ? 16666666 : 8333333),"advertised period");
+            require(prediction.predictedDisplayPeriod==(triple_core?24999999 : legacy_queue && n>1 ? 16666666 : 8333333),"advertised period");
             require(XR_SUCCEEDED(layer_begin_frame_impl(s->handle,nullptr)),"producer begin");
             if(fsr_queue_gpu_pending && n==3) {
                 require(XR_SUCCEEDED(wait_for_presenter_idle(s)), "pending GPU test drain");
@@ -499,7 +502,7 @@ int main(int argc,char** argv) {
             require(submissions.size()==fresh.size()+repeats,"deep physical output accounting");
             submissions=std::move(fresh);
         }
-        const unsigned expected_count=fsr_queue_switch ? 16 : fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
+        const unsigned expected_count=triple_core?22:fsr_queue_switch ? 16 : fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
         require(submissions.size()==expected_count && waits==expected_count+repeats && begins==expected_count+repeats && ends==expected_count+repeats,"unique output/cycle count");
         if(fsr_missing) {
             for(unsigned i=0;i<8;++i) require(submissions[i]==std::pair<unsigned,bool>{i+1,false},"FSR missing guide repeated/lost real");
@@ -518,6 +521,12 @@ int main(int argc,char** argv) {
                     require(submissions[i]==std::pair<unsigned,bool>{next_real+1,false},"promotion real endpoint order");
                     ++next_real;
                 } else require(submissions[i].second,"promotion synthetic order");
+            }
+        } else if(triple_core) {
+            for(unsigned i=0;i<7;++i) {
+                require(submissions[3*i]==std::pair<unsigned,bool>{i+1,false},"3X real order");
+                require(submissions[3*i+1]==std::pair<unsigned,bool>{i+2,true} &&
+                    submissions[3*i+2]==std::pair<unsigned,bool>{i+2,true},"3X independent synthetic deliveries");
             }
         } else for(unsigned i=0;i<7;++i){require(submissions[2*i]==std::pair<unsigned,bool>{i+1,false},"real order");require(submissions[2*i+1].second,"synthetic order");}
         require(submissions.back()==std::pair<unsigned,bool>{8,false},"last real");require(correct,"stale/cross-eye/auxiliary pixels");

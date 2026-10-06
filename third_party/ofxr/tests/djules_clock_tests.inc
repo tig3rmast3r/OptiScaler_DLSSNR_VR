@@ -56,6 +56,23 @@ void djules_absolute_grid_test() {
     std::cout << "Djules absolute grid: fixed slots, loop jitter, aligned stall recovery and no catch-up burst\n";
 }
 
+void djules_triple_buffer_test() {
+    xrfg::DjulesOutputBuffer<int> buffer; buffer.configure(3);
+    check(buffer.capacity()==4 && buffer.push_real(1),"3X prime capacity");
+    for(int i=0;i<3;++i) check(buffer.shift_empty(),"3X prime shift");
+    check(buffer.slot(0)->value==1 && !buffer.releasable(),"3X lost retained endpoint");
+    check(buffer.push_real(2) && !buffer.can_accept_real(),"3X admission unbounded");
+    check(!buffer.push_synthetic_pair(11,12),"3X replaced in-flight A before End acknowledgement");
+    check(buffer.release_front() && buffer.push_synthetic_pair(11,12),"3X pair did not follow A End");
+    check(buffer.slot(0)->value==11 && buffer.release_front() &&
+        buffer.slot(0)->value==12 && buffer.release_front(),"3X first/second synthetic order");
+    check(buffer.slot(0)->value==2 && !buffer.releasable() && buffer.can_accept_real(),"3X B was repeated or lost before C admission");
+    check(buffer.push_real(3) && buffer.release_front() && buffer.push_synthetic_pair(21,22),"3X next-pair ownership");
+    buffer.clear(); buffer.configure(2);
+    check(buffer.capacity()==3 && buffer.push_real(4) && buffer.shift_empty() && buffer.shift_empty(),"2X comparison capacity changed");
+    std::cout << "DJ 3X: bounded four descriptors, A/S1/S2/B FIFO, End acknowledgements, 2X invariant\n";
+}
+
 void djules_readiness_test() {
     using namespace std::chrono;
     const auto p=nanoseconds(milliseconds(10));
