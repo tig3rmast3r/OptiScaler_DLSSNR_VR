@@ -1460,6 +1460,7 @@ void refused_frame_recovery_test() {
 #include "depth_history_tests.inc"
 #include "vulkan_bridge_contract_tests.inc"
 #include "djules_binding_queue_tests.inc"
+#include "djules_clock_tests.inc"
 
 int main(int argc, char** argv) {
     auto state = session();
@@ -1490,6 +1491,7 @@ int main(int argc, char** argv) {
             if (mode == "vulkan-contract") { vulkan_bridge_contract_test(); return 0; }
 #ifdef OFXR_DJULES_COMPARISON
             if (mode == "binding-queue") { djules_binding_queue_test(); return 0; }
+            if (mode == "display-clock") { djules_display_clock_test(); return 0; }
 #endif
             if(mode == "depth-history") { depth_history_test(); return 0; }
             if(mode == "luke-afw-slot") { gpu_pipeline(true, false, false, false, false, true); return 0; }

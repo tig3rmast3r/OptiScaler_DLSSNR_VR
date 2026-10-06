@@ -1117,6 +1117,33 @@ void drain_binding_queue(SessionState* state) noexcept {
 }
 
 
+[[nodiscard]] bool djules_native_scheduler(const SessionState& state) noexcept {
+    return state.nvidia_new_route && !state.luke_afw_enabled &&
+        state.frame_generation_mode == xrfg::D3D12FrameGenerationMode::ofxr &&
+        state.optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
+        state.graphics_binding == SessionGraphicsBinding::d3d12;
+}
+
+// D26 clock-source step only: a runtime prediction may already describe a
+// throttled application cadence. SteamVR's actual HMD period owns the display
+// cadence once available. Absolute phase/deadline policy follows separately.
+[[nodiscard]] bool adopt_djules_display_period(SessionState& state,
+    std::optional<std::chrono::nanoseconds> measured) noexcept {
+    if (!djules_native_scheduler(state) || !state.dispatch->steamvr_runtime ||
+        !measured || measured->count() < 2'000'000 || measured->count() > 50'000'000) return false;
+    std::scoped_lock lock(state.presenter_mutex);
+    const auto prior = state.presenter_display_period;
+    if (prior == measured->count()) return false;
+    state.presenter_display_period = measured->count();
+    xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::presenter_clock_anchor,
+        26, static_cast<std::uint64_t>(prior), static_cast<std::uint64_t>(measured->count()), 1);
+    return true;
+}
+void refresh_djules_display_period(const std::shared_ptr<SessionState>& state) noexcept {
+    if (!djules_native_scheduler(*state) || !state->dispatch->steamvr_runtime || !state->steamvr_delivery) return;
+    static_cast<void>(adopt_djules_display_period(*state, state->steamvr_delivery->display_period()));
+}
+
 // Observer only: compositor records never feed this variant's pacing policy.
 // Poll on the application frame thread, at most four times a second, and only
 // while diagnostics are enabled. Session establishment remains the D33 gate.
@@ -6467,6 +6494,7 @@ void fail_pending_presenter_submissions_locked(
 void pace_presenter_submission(
     const std::shared_ptr<SessionState>& state) noexcept {
     try {
+        refresh_djules_display_period(state);
         const auto entered = std::chrono::steady_clock::now();
         std::int64_t behind_us = 0;
         std::chrono::nanoseconds remaining{0};
@@ -7495,6 +7523,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
                      prediction.predictedDisplayPeriod < state->presenter_display_period))
                     state->presenter_display_period = prediction.predictedDisplayPeriod;
             }
+            refresh_djules_display_period(state);
             state->presenter_condition.notify_all();
             XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
             token = xrfg::bridge_flight_logger().begin(
