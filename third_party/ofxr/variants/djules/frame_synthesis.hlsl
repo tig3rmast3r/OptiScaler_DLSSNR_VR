@@ -373,6 +373,27 @@ void PackFlowInput(uint3 thread_id : SV_DispatchThreadID) {
     PackedColor[thread_id.xy] = pack_flow_input_color(current_color);
 }
 
+// The view whose target rectangle holds this pixel, for the pack, which runs
+// per slice rather than per view. An array swapchain gives each view its own
+// slice with the same rectangle, so among the views that contain the pixel
+// the one on this slice wins; a double-wide has disjoint rectangles on one
+// slice. 2 when no view claims the pixel.
+uint pack_view_for_pixel(float2 target_coordinate, uint slice) {
+    uint view = 2u;
+    [unroll] for (uint v = 0; v < 2; ++v) {
+        float4 rect = PreviousMappings[v].TargetRect;
+        float2 minimum = rect.xy - 0.5;
+        float2 maximum = rect.xy + rect.zw - 0.5;
+        bool inside = rect.z > 0.0 && rect.w > 0.0 &&
+            target_coordinate.x >= minimum.x && target_coordinate.y >= minimum.y &&
+            target_coordinate.x <= maximum.x && target_coordinate.y <= maximum.y;
+        if (inside && (view == 2u || v == slice)) {
+            view = v;
+        }
+    }
+    return view;
+}
+
 [numthreads(8, 8, 1)]
 void PackNvidiaFlowInput(uint3 thread_id : SV_DispatchThreadID) {
     if (thread_id.x >= PackedWidth || thread_id.y >= PackedHeight) {
@@ -383,7 +404,38 @@ void PackNvidiaFlowInput(uint3 thread_id : SV_DispatchThreadID) {
     float4 current_color = float4(0.0, 0.0, 0.0, 1.0);
     uint slice = Slice;
     bool downscaled = PackedWidth < Width || PackedHeight < Height;
-    if (slice < ArraySize && downscaled) {
+    // The previous frame reaches the engine warped into the current camera
+    // through the OpenXR pose delta, so what it estimates is the residual
+    // scene motion rather than the head rotation with the scene motion on
+    // top. Head turns no longer exceed its search, its cost no longer reads
+    // "large displacement" everywhere under rotation, and the previous
+    // pair's vectors (temporal hints) stay small and correlated. The
+    // composition reads the previous endpoint through the same mapping, so
+    // the two agree by construction. Where this camera sees beyond the
+    // previous frame the input is black; the composition already treats
+    // those pixels as uncovered.
+    if ((SynthesisFlags & 4u) != 0u && slice < ArraySize) {
+        float2 target_coordinate = downscaled
+            ? (float2(thread_id.xy) + 0.5) / flow_input_scale() - 0.5
+            : float2(thread_id.xy);
+        if (target_coordinate.x < float(Width) &&
+            target_coordinate.y < float(Height)) {
+            uint view_index = pack_view_for_pixel(target_coordinate, slice);
+            if (view_index < 2u) {
+                CameraSample previous = sample_previous_target(
+                    target_coordinate, slice, view_index);
+                if (previous.valid >= 0.5) {
+                    previous_color = previous.color;
+                }
+            } else {
+                previous_color =
+                    bilinear_previous_source(target_coordinate, slice);
+            }
+            current_color = downscaled
+                ? bilinear_current_source(target_coordinate, slice)
+                : CurrentFrame.Load(int4(int2(thread_id.xy), int(slice), 0));
+        }
+    } else if (slice < ArraySize && downscaled) {
         float2 source_coordinate =
             (float2(thread_id.xy) + 0.5) / flow_input_scale() - 0.5;
         previous_color = bilinear_previous_source(source_coordinate, slice);
@@ -509,13 +561,18 @@ float2 forward_flow_for_pixel(
     float2 pixel,
     uint slice,
     uint view_index,
-    float value_scale) {
+    float value_scale,
+    // True where the previous input was warped into the current camera in
+    // the pack: its pixels then lie in the target rectangle, not the source.
+    bool warped_previous) {
     float2 input_scale = flow_input_scale();
     float2 packed_coordinate = flow_input_coordinate(pixel);
     float2 flow_coordinate =
         (packed_coordinate + 0.5) / float(FlowBlockSize) - 0.5;
     FlowGridBounds bounds = flow_grid_bounds(
-        PreviousMappings[view_index].SourceRect,
+        warped_previous
+            ? PreviousMappings[view_index].TargetRect
+            : PreviousMappings[view_index].SourceRect,
         slice);
     float2 bounded = clamp(
         flow_coordinate,
@@ -598,12 +655,15 @@ float nvidia_cost_for_pixel(float2 pixel, uint slice, uint view_index) {
 float nvidia_forward_cost_for_pixel(
     float2 pixel,
     uint slice,
-    uint view_index) {
+    uint view_index,
+    bool warped_previous) {
     float2 packed_coordinate = flow_input_coordinate(pixel);
     int2 coordinate = int2(round(
         (packed_coordinate + 0.5) / float(FlowBlockSize) - 0.5));
     FlowGridBounds bounds = flow_grid_bounds(
-        PreviousMappings[view_index].SourceRect,
+        warped_previous
+            ? PreviousMappings[view_index].TargetRect
+            : PreviousMappings[view_index].SourceRect,
         slice);
     return float(ForwardAuxiliary.Load(int3(clamp(
         coordinate,
@@ -626,7 +686,8 @@ float rgb_error(float4 a, float4 b) {
 // Fast can report a plausible low-cost match on a different repeated edge.
 // Validate against the ORIGINAL endpoints, not just two already-warped samples:
 // those can both hit the same unrelated dark/bright patch and agree perfectly.
-float fast_endpoint_confidence(float2 pixel, float2 backward, uint slice) {
+float fast_endpoint_confidence(
+    float2 pixel, float2 backward, uint slice, bool warped_previous) {
     static const float2 offsets[5] = {
         float2(0, 0), float2(-2, 0), float2(2, 0),
         float2(0, -2), float2(0, 2)
@@ -636,13 +697,27 @@ float fast_endpoint_confidence(float2 pixel, float2 backward, uint slice) {
     [unroll] for (uint i = 0; i < 5; ++i) {
         float2 current = pixel + offsets[i];
         float2 previous = current + backward;
-        if (!coordinate_inside_rect(current, PreviousMappings[ViewIndex].TargetRect) ||
-            !coordinate_inside_rect(previous, PreviousMappings[ViewIndex].SourceRect)) {
+        if (!coordinate_inside_rect(current, PreviousMappings[ViewIndex].TargetRect)) {
             valid = false;
+        }
+        float4 previous_color;
+        if (warped_previous) {
+            // The previous endpoint is a target coordinate: read it through
+            // the mapping, as the pack did when it built the engine's input.
+            CameraSample sample = sample_previous_target(previous, slice, ViewIndex);
+            if (sample.valid < 0.5) {
+                valid = false;
+            }
+            previous_color = sample.color;
+        } else {
+            if (!coordinate_inside_rect(previous, PreviousMappings[ViewIndex].SourceRect)) {
+                valid = false;
+            }
+            previous_color = bilinear_previous_source(previous, slice);
         }
         error = max(error, rgb_error(
             bilinear_current_source(current, slice),
-            bilinear_previous_source(previous, slice)));
+            previous_color));
     }
     return valid ? 1.0 - smoothstep(8.0 / 255.0, 48.0 / 255.0, error) : 0.0;
 }
@@ -685,7 +760,12 @@ float4 synthesize_midpoint(
     bool use_nvidia_cost,
     bool use_nvidia_bidirectional,
     bool validate_fast,
-    bool use_game_motion_pipeline) {
+    bool use_game_motion_pipeline,
+    // The NVIDIA pack warps the previous frame into the current camera, so
+    // its flow is the residual already and every previous endpoint is a
+    // target coordinate. FidelityFX keeps its own unwarped history, so its
+    // flow still carries the pose term and it is subtracted here.
+    bool input_pose_compensated) {
     float4 output_color = float4(0.0, 0.0, 0.0, 1.0);
     uint2 integer_pixel = uint2(input.position.xy);
     bool in_bounds = integer_pixel.x < Width && integer_pixel.y < Height &&
@@ -767,8 +847,9 @@ float4 synthesize_midpoint(
                             ViewIndex,
                             flow_value_scale,
                             use_nvidia_cost);
-                    float2 pose_backward = previous_coverage.coordinate - pixel;
-                    float2 residual_backward = raw_backward - pose_backward;
+                    float2 residual_backward = input_pose_compensated
+                        ? raw_backward
+                        : raw_backward - (previous_coverage.coordinate - pixel);
                     previous_sample = sample_previous_target(
                         pixel + residual_backward * synthesis_fraction(), Slice, ViewIndex);
                     current_sample = sample_current_target(
@@ -795,18 +876,22 @@ float4 synthesize_midpoint(
                         float cost_confidence = 1.0;
                         if (repeated_capture_flag() == 0) {
                             if (validate_fast) {
-                                confidence *= fast_endpoint_confidence(pixel, raw_backward, Slice);
+                                confidence *= fast_endpoint_confidence(
+                                    pixel, raw_backward, Slice, input_pose_compensated);
                             }
                             if (use_nvidia_bidirectional) {
                                 float2 previous_coordinate = pixel + raw_backward;
                                 if (coordinate_inside_rect(
                                         previous_coordinate,
-                                        PreviousMappings[ViewIndex].SourceRect)) {
+                                        input_pose_compensated
+                                            ? PreviousMappings[ViewIndex].TargetRect
+                                            : PreviousMappings[ViewIndex].SourceRect)) {
                                     float2 raw_forward = forward_flow_for_pixel(
                                         previous_coordinate,
                                         Slice,
                                         ViewIndex,
-                                        flow_value_scale);
+                                        flow_value_scale,
+                                        input_pose_compensated);
                                     float cycle_error = length(
                                         raw_backward + raw_forward);
                                     consistency_confidence =
@@ -819,7 +904,8 @@ float4 synthesize_midpoint(
                                         nvidia_forward_cost_for_pixel(
                                             previous_coordinate,
                                             Slice,
-                                            ViewIndex));
+                                            ViewIndex,
+                                            input_pose_compensated));
                                     cost_confidence = saturate(
                                         1.0 - maximum_cost / 255.0);
                                 } else {
@@ -854,31 +940,31 @@ float4 synthesize_midpoint(
 }
 
 float4 SynthesizeMidpointPS(FullscreenVertex input) : SV_Target {
-    return synthesize_midpoint(input, 1.0, false, false, false, false);
+    return synthesize_midpoint(input, 1.0, false, false, false, false, false);
 }
 
 float4 SynthesizeGameMotionMidpointPS(FullscreenVertex input) : SV_Target {
-    return synthesize_midpoint(input, 1.0, false, false, false, true);
+    return synthesize_midpoint(input, 1.0, false, false, false, true, false);
 }
 
+// The NVIDIA variants read flow in signed S10.5 fixed point, and from a
+// previous input the pack warped into the current camera (PackNvidiaFlowInput).
 float4 SynthesizeNvidiaMidpointPS(FullscreenVertex input) : SV_Target {
-    // NVIDIA OFA stores flow in signed S10.5 fixed point.
-    return synthesize_midpoint(input, 1.0 / 32.0, true, false, false, false);
+    return synthesize_midpoint(input, 1.0 / 32.0, true, false, false, false, (SynthesisFlags & 4u) != 0u);
 }
 
 float4 SynthesizeNvidiaBidirectionalMidpointPS(
     FullscreenVertex input) : SV_Target {
-    // NVIDIA OFA stores flow in signed S10.5 fixed point.
-    return synthesize_midpoint(input, 1.0 / 32.0, true, true, false, false);
+    return synthesize_midpoint(input, 1.0 / 32.0, true, true, false, false, (SynthesisFlags & 4u) != 0u);
 }
 
 float4 SynthesizeNvidiaFastMidpointPS(FullscreenVertex input) : SV_Target {
-    return synthesize_midpoint(input, 1.0 / 32.0, true, false, true, false);
+    return synthesize_midpoint(input, 1.0 / 32.0, true, false, true, false, (SynthesisFlags & 4u) != 0u);
 }
 
 float4 SynthesizeNvidiaFastBidirectionalMidpointPS(
     FullscreenVertex input) : SV_Target {
-    return synthesize_midpoint(input, 1.0 / 32.0, true, true, true, false);
+    return synthesize_midpoint(input, 1.0 / 32.0, true, true, true, false, (SynthesisFlags & 4u) != 0u);
 }
 
 float4 ReprojectGeneratedPS(FullscreenVertex input) : SV_Target {

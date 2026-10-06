@@ -134,6 +134,7 @@ struct D3D12NvidiaOpticalFlowOptions {
     bool grayscale_input{}; // Optional optimization; reference stays BGRA8.
     D3D12OpticalFlowInputEncoding input_encoding{
         D3D12OpticalFlowInputEncoding::reference_linear};
+    bool pose_compensated_input{}; // Optional djules input/composition contract.
 };
 
 // Owns a rolling exclusive history lease. Each resource supports at most two

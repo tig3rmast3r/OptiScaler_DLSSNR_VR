@@ -4029,7 +4029,8 @@ struct D3D12FrameSynthesizer::Impl {
 
         SynthesisParameters parameters{};
         parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction) |
-            flow_input_flags(view_format, nvidia_options.input_encoding);
+            flow_input_flags(view_format, nvidia_options.input_encoding) |
+            (backend == D3D12OpticalFlowBackend::nvidia && nvidia_options.pose_compensated_input ? 4U : 0U);
         parameters.width = static_cast<UINT>(image_description.Width);
         parameters.height = image_description.Height;
         parameters.array_size = image_description.DepthOrArraySize;
@@ -4193,7 +4194,8 @@ struct D3D12FrameSynthesizer::Impl {
 
         SynthesisParameters parameters{};
         parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction) |
-            flow_input_flags(view_format, nvidia_options.input_encoding);
+            flow_input_flags(view_format, nvidia_options.input_encoding) |
+            (backend == D3D12OpticalFlowBackend::nvidia && nvidia_options.pose_compensated_input ? 4U : 0U);
         parameters.width = static_cast<UINT>(image_description.Width);
         parameters.height = image_description.Height;
         parameters.array_size = image_description.DepthOrArraySize;
@@ -4622,7 +4624,8 @@ struct D3D12FrameSynthesizer::Impl {
 
         SynthesisParameters parameters{};
         parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction) |
-            flow_input_flags(view_format, nvidia_options.input_encoding);
+            flow_input_flags(view_format, nvidia_options.input_encoding) |
+            (backend == D3D12OpticalFlowBackend::nvidia && nvidia_options.pose_compensated_input ? 4U : 0U);
         parameters.width = static_cast<UINT>(image_description.Width);
         parameters.height = image_description.Height;
         parameters.array_size = image_description.DepthOrArraySize;
@@ -4896,6 +4899,8 @@ struct D3D12FrameSynthesizer::Impl {
 
         SynthesisParameters parameters{};
         parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction);
+        if (backend == D3D12OpticalFlowBackend::nvidia && nvidia_options.pose_compensated_input)
+            parameters.synthesis_flags |= 4U;
         parameters.width = static_cast<UINT>(image_description.Width);
         parameters.height = image_description.Height;
         parameters.array_size = image_description.DepthOrArraySize;
