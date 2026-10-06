@@ -181,6 +181,8 @@ enum class BridgeFlightOperation : std::uint32_t {
     d3d11_bridge,
     steamvr_delivery_attach,
     steamvr_delivery,
+    view_configuration,
+    projection_view_rect,
 };
 
 struct BridgeFlightToken {

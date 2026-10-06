@@ -32,6 +32,8 @@ constexpr std::uint64_t kMegabyte = 1024ull * 1024ull;
     BridgeFlightOperation operation) noexcept {
     switch (operation) {
     case BridgeFlightOperation::steamvr_delivery_attach: return "steamvr_delivery_attach";
+    case BridgeFlightOperation::view_configuration: return "view_configuration";
+    case BridgeFlightOperation::projection_view_rect: return "projection_view_rect";
     case BridgeFlightOperation::steamvr_delivery: return "steamvr_delivery";
     case BridgeFlightOperation::d3d11_bridge: return "d3d11_bridge";
     case BridgeFlightOperation::vram_usage: return "vram_usage";

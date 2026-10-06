@@ -423,6 +423,8 @@ enum class GenerationQuarantineReason : std::int64_t {
 #endif
 
 struct SessionState {
+    std::mutex logged_view_rects_mutex;
+    std::unordered_map<XrSwapchain, std::array<std::optional<std::array<std::uint64_t, 3>>, 4>> logged_view_rects;
     std::unique_ptr<xrfg::SteamVrDelivery> steamvr_delivery;
     std::uint32_t application_frames_submitted{};
     // The D3D11 bridge. The application bound D3D11; the runtime was handed
@@ -865,6 +867,7 @@ struct PrivateSwapchainState {
     XrSwapchain handle{XR_NULL_HANDLE};
     PrivateOwnershipPhase phase{PrivateOwnershipPhase::idle};
     std::uint32_t acquired_index{};
+    bool first_use_logged{};
 };
 
 // A buffered pair owns one current and one synthetic private swapchain. An
@@ -1925,6 +1928,7 @@ create_d3d12_frame_generation_swapchains(
             destroy_current_ring(dispatch, &current);
             return nullptr;
         }
+        log_video_memory(*state->session, VideoMemoryStage::current_ring, handle_value(state->handle));
         if (!create_current_ring(state, private_info, &synthetic, &refusal)) {
             if (failure_reason != nullptr) {
                 *failure_reason =
@@ -1939,6 +1943,7 @@ create_d3d12_frame_generation_swapchains(
             return nullptr;
         }
 
+        log_video_memory(*state->session, VideoMemoryStage::synthetic_ring, handle_value(state->handle));
         auto synthesizer = std::make_shared<xrfg::D3D12FrameSynthesizer>();
         const xrfg::D3D12OpticalFlowBackend backend =
             state->session->optical_flow_backend;
@@ -2102,6 +2107,7 @@ create_d3d11_frame_generation_swapchains(
             destroy_private();
             return nullptr;
         }
+        log_video_memory(*state->session, VideoMemoryStage::current_ring, handle_value(state->handle));
         if (!create_current_ring(state, private_info, &synthetic, &refusal)) {
             if (failure_reason != nullptr) {
                 *failure_reason =
@@ -2115,6 +2121,7 @@ create_d3d11_frame_generation_swapchains(
             return nullptr;
         }
 
+        log_video_memory(*state->session, VideoMemoryStage::synthetic_ring, handle_value(state->handle));
         auto interop =
             std::make_shared<xrfg::D3D11D3D12SwapchainInterop>();
         xrfg::D3D11InteropInitializationStage interop_failure_stage =
@@ -2146,6 +2153,7 @@ create_d3d11_frame_generation_swapchains(
             return nullptr;
         }
 
+        log_video_memory(*state->session, VideoMemoryStage::interop, handle_value(state->handle));
         auto history = std::make_shared<xrfg::D3D12SwapchainHistory>();
         xrfg::D3D12HistoryInitializationStage history_failure_stage =
             xrfg::D3D12HistoryInitializationStage::complete;
@@ -2169,6 +2177,7 @@ create_d3d11_frame_generation_swapchains(
             return nullptr;
         }
 
+        log_video_memory(*state->session, VideoMemoryStage::history, handle_value(state->handle));
         auto synthesizer = std::make_shared<xrfg::D3D12FrameSynthesizer>();
         const xrfg::D3D12OpticalFlowBackend backend =
             session->optical_flow_backend;
@@ -2887,6 +2896,44 @@ XrResult layer_get_instance_proc_addr_impl(
     return dispatch->get_instance_proc_addr(instance, name, function);
 }
 
+// view_configuration, once per view at session creation.
+void log_view_configuration(
+    const Dispatch& dispatch, XrInstance instance, XrSystemId system_id) noexcept {
+    try {
+        if (!xrfg::bridge_flight_logger().enabled() || system_id == XR_NULL_SYSTEM_ID) {
+            return;
+        }
+        PFN_xrEnumerateViewConfigurationViews enumerate = nullptr;
+        if (!load_function(
+                dispatch.get_instance_proc_addr, instance,
+                "xrEnumerateViewConfigurationViews", enumerate)) {
+            return;
+        }
+        std::array<XrViewConfigurationView, 4> views{};
+        for (auto& view : views) {
+            view.type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+        }
+        std::uint32_t count = 0;
+        if (XR_FAILED(enumerate(
+                instance, system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                static_cast<std::uint32_t>(views.size()), &count, views.data()))) {
+            return;
+        }
+        for (std::uint32_t index = 0; index < std::min<std::uint32_t>(count, 4); ++index) {
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::view_configuration,
+                index,
+                (static_cast<std::uint64_t>(views[index].recommendedImageRectWidth) << 32) |
+                    views[index].recommendedImageRectHeight,
+                (static_cast<std::uint64_t>(views[index].maxImageRectWidth) << 32) |
+                    views[index].maxImageRectHeight,
+                views[index].recommendedSwapchainSampleCount);
+        }
+    } catch (...) {
+    }
+}
+
+
 XrResult layer_create_api_layer_instance_impl(
     const XrInstanceCreateInfo* create_info,
     const XrApiLayerCreateInfo* layer_info,
@@ -3392,6 +3439,8 @@ XrResult layer_create_session_impl(
     state->handle = created_session;
     state->steamvr_delivery = std::make_unique<xrfg::SteamVrDelivery>(dispatch->steamvr_runtime);
     log_video_memory(*state, VideoMemoryStage::session, 0);
+    log_view_configuration(*dispatch, instance, create_info ? create_info->systemId : XR_NULL_SYSTEM_ID);
+
     // Optional instrumentation cannot fail an otherwise valid session.
     try {
         state->fps_overlay = std::make_unique<xrfg::OpenXrFpsOverlay>(
@@ -4263,6 +4312,7 @@ XrResult layer_destroy_swapchain_impl(XrSwapchain swapchain) {
     const XrResult result = state->session->dispatch->destroy_swapchain(swapchain);
     if (XR_SUCCEEDED(result)) {
         { std::scoped_lock lock(state->mutex); state->bridge.reset(); }
+        { std::scoped_lock lock(state->session->logged_view_rects_mutex); state->session->logged_view_rects.erase(swapchain); }
         std::scoped_lock lock(g_state_mutex);
         g_swapchains.erase(swapchain);
     }
@@ -7578,6 +7628,10 @@ struct ProjectionResourceDestination {
             return false;
         }
         image.phase = PrivateOwnershipPhase::waited;
+        if (!image.first_use_logged && session != nullptr) {
+            image.first_use_logged = true;
+            log_video_memory(*session, VideoMemoryStage::private_first_use, handle_value(image.handle));
+        }
         return true;
     } catch (...) {
         return false;
@@ -9973,6 +10027,44 @@ void commit_luke_pair(std::span<const ProjectionResourceMapping> mappings,
     }
 }
 
+// projection_view_rect, for every view whose rectangle or array index
+// differs from the last record for its swapchain.
+void log_projection_view_rects(
+    SessionState& state, const ProjectionSnapshot& snapshot) noexcept {
+    try {
+        if (!xrfg::bridge_flight_logger().enabled()) {
+            return;
+        }
+        std::scoped_lock lock(state.logged_view_rects_mutex);
+        for (const auto& layer : snapshot.layers) {
+            for (std::size_t view_index = 0; view_index < layer.views.size(); ++view_index) {
+                const XrSwapchainSubImage& sub_image = layer.views[view_index].subImage;
+                const std::array<std::uint64_t, 3> rect{
+                    static_cast<std::uint64_t>(sub_image.imageArrayIndex),
+                    (static_cast<std::uint64_t>(static_cast<std::uint32_t>(sub_image.imageRect.offset.x)) << 32) |
+                        static_cast<std::uint32_t>(sub_image.imageRect.offset.y),
+                    (static_cast<std::uint64_t>(static_cast<std::uint32_t>(sub_image.imageRect.extent.width)) << 32) |
+                        static_cast<std::uint32_t>(sub_image.imageRect.extent.height)};
+                if (view_index >= 4) continue;
+                if (!state.logged_view_rects.contains(sub_image.swapchain) && state.logged_view_rects.size() >= 64) continue;
+                auto& last = state.logged_view_rects[sub_image.swapchain][view_index];
+                if (last && *last == rect) {
+                    continue;
+                }
+                last = rect;
+                xrfg::bridge_flight_logger().event(
+                    xrfg::BridgeFlightOperation::projection_view_rect,
+                    static_cast<std::int64_t>((rect[0] << 8) | (view_index & 0xFFU)),
+                    handle_value(sub_image.swapchain),
+                    rect[1],
+                    rect[2]);
+            }
+        }
+    } catch (...) {
+    }
+}
+
+
 void log_video_memory_periodically(SessionState& state) noexcept {
     if (!xrfg::bridge_flight_logger().enabled()) {
         return;
@@ -10387,6 +10479,7 @@ XrResult layer_end_frame_impl(
     ProjectionMappingResult resource_mappings{};
     if (has_projection) {
         resource_mappings = build_projection_resource_mappings(current_snapshot);
+        log_projection_view_rects(*state, current_snapshot);
     } else {
         resource_mappings.reason = ProjectionMappingReason::no_projection_views;
     }
