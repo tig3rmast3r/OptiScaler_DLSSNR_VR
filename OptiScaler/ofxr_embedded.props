@@ -7,7 +7,7 @@
       <GenerateMapFile>true</GenerateMapFile>
       <MapFileName>$(OutDir)OptiScaler.map</MapFileName>
       <AdditionalLibraryDirectories>$(SolutionDir)build-ofxr\Release;$(SolutionDir)external\FidelityFX-SDK\sdk\bin\ffx_sdk;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>XR_APILAYER_XRFrameBridge_diagnostic.lib;xrfg_d3d12_history.lib;xrfg_fps_overlay.lib;xrfg_implicit_layer.lib;xrfg_bridge_flight_logger.lib;xrfg_frame_capture.lib;xrfg_core.lib;ofxr_ffx_backend_dx12_x64.lib;ofxr_ffx_opticalflow_x64.lib;advapi32.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>XR_APILAYER_XRFrameBridge_diagnostic.lib;xrfg_d3d12_history.lib;xrfg_fps_overlay.lib;xrfg_steamvr_delivery.lib;xrfg_implicit_layer.lib;xrfg_bridge_flight_logger.lib;xrfg_frame_capture.lib;xrfg_core.lib;ofxr_ffx_backend_dx12_x64.lib;ofxr_ffx_opticalflow_x64.lib;advapi32.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent><Command></Command></PostBuildEvent>
     <PreBuildEvent><Command></Command></PreBuildEvent>

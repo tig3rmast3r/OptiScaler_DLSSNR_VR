@@ -179,6 +179,8 @@ enum class BridgeFlightOperation : std::uint32_t {
     luke_temporal_pose,    // result=phase*100+view*10+pair,a=producer fence,b=capture,c=2 raw floats
     vram_usage, // D35: stage, current adapter usage, budget, subject.
     d3d11_bridge,
+    steamvr_delivery_attach,
+    steamvr_delivery,
 };
 
 struct BridgeFlightToken {

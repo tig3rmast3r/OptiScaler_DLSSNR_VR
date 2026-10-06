@@ -9,6 +9,7 @@
 #include <optional>
 
 namespace xrfg {
+class SteamVrDelivery;
 
 // Owns only its VIEW space and small color swapchain. Never modifies a game
 // image, temporal history, game space, optical-flow job, or frame schedule.
@@ -23,7 +24,8 @@ public:
     // Uploads at most 4 Hz; no explicit GPU fence wait, image-wait timeout zero.
     void application_frame(const XrFrameEndInfo* info) noexcept;
     void set_afw_active(bool active) noexcept;
-    [[nodiscard]] XrResult end_frame(const XrFrameEndInfo* info, bool synthetic);
+    void set_delivery_source(SteamVrDelivery* delivery) noexcept;
+    [[nodiscard]] XrResult end_frame(const XrFrameEndInfo* info, bool synthetic, bool new_content = true);
     void reset_metrics() noexcept;
     // Terminal for this session. Keep resources alive until normal teardown;
     // stop adding the quad or uploading textures immediately.

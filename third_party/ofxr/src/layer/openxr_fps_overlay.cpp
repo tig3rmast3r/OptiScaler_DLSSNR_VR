@@ -1,4 +1,5 @@
 #include "xrfg/openxr_fps_overlay.hpp"
+#include "xrfg/steamvr_delivery.hpp"
 #include <openxr/openxr_platform.h>
 #include <windows.h>
 #include <wrl/client.h>
@@ -46,6 +47,7 @@ struct OpenXrFpsOverlay::Impl {
     std::filesystem::path ini;
     std::mutex mutex;
     FpsCounter counter;
+    SteamVrDelivery* delivery{}; // Session-owned; overlay retires first.
     bool afw_active{};
     FpsOverlayPosition position{FpsOverlayPosition::upper_right};
     std::int64_t next_refresh{};
@@ -316,6 +318,12 @@ struct OpenXrFpsOverlay::Impl {
         quad.size = {placement.width, placement.height};
         auto snapshot = counter.snapshot(now);
         snapshot.afw_active = afw_active;
+        if (delivery) {
+            if (const auto measured = delivery->delivered_fps(now)) {
+                snapshot.delivered_fps = *measured;
+                snapshot.delivered_valid = true;
+            }
+        }
         upload(snapshot);
     }
 };
@@ -338,6 +346,10 @@ void OpenXrFpsOverlay::application_frame(const XrFrameEndInfo* info) noexcept {
 void OpenXrFpsOverlay::set_afw_active(bool active) noexcept {
     std::scoped_lock lock(impl_->mutex);
     impl_->afw_active = active;
+}
+void OpenXrFpsOverlay::set_delivery_source(SteamVrDelivery* delivery) noexcept {
+    std::scoped_lock lock(impl_->mutex);
+    impl_->delivery = delivery;
 }
 void OpenXrFpsOverlay::reset_metrics() noexcept {
     std::scoped_lock lock(impl_->mutex);
@@ -366,7 +378,7 @@ std::optional<OverlayPlacement> OpenXrFpsOverlay::marker_placement() const noexc
     return impl_->placement;
 }
 
-XrResult OpenXrFpsOverlay::end_frame(const XrFrameEndInfo* info, bool synthetic) {
+XrResult OpenXrFpsOverlay::end_frame(const XrFrameEndInfo* info, bool synthetic, bool new_content) {
     std::scoped_lock lock(impl_->mutex);
     std::array<const XrCompositionLayerBaseHeader*, 128> layers{};
     XrFrameEndInfo composed{};
@@ -382,7 +394,7 @@ XrResult OpenXrFpsOverlay::end_frame(const XrFrameEndInfo* info, bool synthetic)
         submitted = &composed;
     }
     const auto result = impl_->downstream_end(impl_->session, submitted);
-    if (result == XR_SUCCESS && nonempty) impl_->counter.submitted(now_ns(), synthetic);
+    if (result == XR_SUCCESS && nonempty) impl_->counter.submitted(now_ns(), synthetic, new_content);
     return result;
 }
 

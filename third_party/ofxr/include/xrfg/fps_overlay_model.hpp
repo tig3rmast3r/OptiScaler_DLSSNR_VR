@@ -15,13 +15,15 @@ struct FpsSnapshot {
     float submitted_fps{};
     bool active{};
     bool afw_active{};
+    float delivered_fps{};
+    bool delivered_valid{};
 };
 
 // Caller serializes access. Fixed storage, monotonic wall-clock measurements;
 // successful downstream submissions are NOT evidence of physical scanout.
 class FpsCounter {
 public:
-    void submitted(std::int64_t now_ns, bool synthetic) noexcept;
+    void submitted(std::int64_t now_ns, bool synthetic, bool new_content = true) noexcept;
     [[nodiscard]] FpsSnapshot snapshot(std::int64_t now_ns) const noexcept;
     void reset() noexcept { *this = {}; }
 private:

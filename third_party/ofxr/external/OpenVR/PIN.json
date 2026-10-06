@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/ValveSoftware/openvr",
+  "ref": "v2.5.1",
+  "header_url": "https://raw.githubusercontent.com/ValveSoftware/openvr/v2.5.1/headers/openvr.h",
+  "sha256": "94e5545370159c85f87cd6e15dd3739f7c919fc7a6e869f5e4ed463533a07ed0",
+  "license": "licenses/OpenVR-BSD-3-Clause.txt",
+  "runtime_binary": "Not vendored; dynamically loads the runtime already installed by SteamVR"
+}

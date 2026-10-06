@@ -24,6 +24,7 @@
 #include "xrfg/two_frame_capture.hpp"
 #include <atomic>
 #include "xrfg/openxr_fps_overlay.hpp"
+#include "xrfg/steamvr_delivery.hpp"
 
 #include <windows.h>
 #include <psapi.h>
@@ -422,6 +423,8 @@ enum class GenerationQuarantineReason : std::int64_t {
 #endif
 
 struct SessionState {
+    std::unique_ptr<xrfg::SteamVrDelivery> steamvr_delivery;
+    std::uint32_t application_frames_submitted{};
     // The D3D11 bridge. The application bound D3D11; the runtime was handed
     // a D3D12 session on the layer's own device, so from here on the session
     // is a D3D12 one (graphics_binding, d3d12_device, d3d12_queue) and
@@ -3189,6 +3192,7 @@ XrResult layer_destroy_instance_impl(XrInstance instance) {
         destroy_frame_generation_swapchains(swapchain_state);
     }
 
+    bool last_instance = false;
     const XrResult result = dispatch->destroy_instance(instance);
     if (XR_SUCCEEDED(result)) {
         std::scoped_lock lock(g_state_mutex);
@@ -3207,10 +3211,12 @@ XrResult layer_destroy_instance_impl(XrInstance instance) {
             }
         }
         g_instances.erase(instance);
+        last_instance = g_instances.empty();
         std::erase_if(g_observed_spaces, [&](const auto& entry) {
             return entry.second.dispatch && entry.second.dispatch->instance == instance;
         });
     }
+    if (last_instance) xrfg::SteamVrDelivery::release_process_connection();
     return result;
 }
 
@@ -3384,6 +3390,7 @@ XrResult layer_create_session_impl(
         return result;
     }
     state->handle = created_session;
+    state->steamvr_delivery = std::make_unique<xrfg::SteamVrDelivery>(dispatch->steamvr_runtime);
     log_video_memory(*state, VideoMemoryStage::session, 0);
     // Optional instrumentation cannot fail an otherwise valid session.
     try {
@@ -3392,6 +3399,7 @@ XrResult layer_create_session_impl(
             dispatch->get_instance_proc_addr, dispatch->end_frame,
             state->d3d12_device.Get(), state->d3d12_queue.Get(),
             state->d3d11_device.Get(), current_layer_directory() / L"ofxr_bridge.ini");
+        state->fps_overlay->set_delivery_source(state->steamvr_delivery.get());
     } catch (...) {}
     if (state->graphics_binding == SessionGraphicsBinding::d3d11 &&
         (state->graphics_binding_capabilities & 3ULL) == 3ULL) {
@@ -5840,7 +5848,7 @@ void continuous_presenter_main(
             downstream_end_started = std::chrono::steady_clock::now();
             end_result = with_runtime_entry(state, [&] {
                 return state->fps_overlay
-                    ? state->fps_overlay->end_frame(&submitted, fresh_synthetic)
+                    ? state->fps_overlay->end_frame(&submitted, fresh_synthetic, request != nullptr)
                     : state->dispatch->end_frame(state->handle, &submitted);
             });
             // The synthetic has reached the runtime, so its current copy can
@@ -10117,6 +10125,10 @@ XrResult layer_end_frame_impl(
     }
     PrivateDepthStrip private_depth_storage;
     end_info = strip_private_depth(*state, end_info, private_depth_storage);
+    if (state->steamvr_delivery && end_info && end_info->layerCount &&
+        state->application_frames_submitted < 100 &&
+        ++state->application_frames_submitted == 100)
+        state->steamvr_delivery->mark_established();
     const auto application_end_now = std::chrono::steady_clock::now();
     const bool frame_had_overlapping_wait =
         state->application_frame_has_overlapping_wait;

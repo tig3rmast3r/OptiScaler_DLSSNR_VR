@@ -33,7 +33,8 @@ FpsCounter::Bucket& FpsCounter::bucket(std::int64_t now) noexcept {
     return entry;
 }
 
-void FpsCounter::submitted(std::int64_t now, bool synthetic) noexcept {
+void FpsCounter::submitted(std::int64_t now, bool synthetic, bool new_content) noexcept {
+    if (!new_content) return;
     auto& entry = bucket(now);
     ++entry.output;
     if (synthetic) last_synthetic_ns_ = now;
@@ -120,7 +121,8 @@ std::vector<std::uint32_t> rasterize_fps_overlay(
         : snapshot.afw_active ? color(50, 140, 255)
                               : color(64, 235, 112);
     const unsigned scale = std::min(width / 24, height / 12);
-    const float rate = std::isfinite(snapshot.submitted_fps) ? snapshot.submitted_fps : 0.0f;
+    const float measured = snapshot.delivered_valid ? snapshot.delivered_fps : snapshot.submitted_fps;
+    const float rate = std::isfinite(measured) ? measured : 0.0f;
     char text[4]{};
     const auto length = static_cast<unsigned>(std::snprintf(text, sizeof(text), "%d",
         static_cast<int>(std::clamp(rate, 0.0f, 999.0f) + 0.5f)));

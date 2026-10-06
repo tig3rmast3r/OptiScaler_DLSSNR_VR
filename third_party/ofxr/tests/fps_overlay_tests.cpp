@@ -28,6 +28,17 @@ int main(int argc, char** argv) {
         counter.reset();
         counter.submitted(4'000'000'000, false);
         require(!counter.snapshot(4'050'000'000).active, "prime/repeat must not be green");
+        FpsCounter unique;
+        for (int i = 0; i < 144; ++i) {
+            const auto t = static_cast<std::int64_t>(i) * 1'000'000'000 / 144;
+            unique.submitted(t, i % 2 == 0, i < 78);
+        }
+        require(std::abs(unique.snapshot(999'999'999).submitted_fps - 78) < 0.1f,
+            "66 repeated submissions must not inflate 78 new outputs to 144");
+        unique.submitted(2'000'000'000, true, false);
+        require(!unique.snapshot(2'000'000'000).active, "repeated synthetic must not extend green status");
+        require(rasterize_fps_overlay(24, 12, {144, true, false, 78, true}, false) ==
+            rasterize_fps_overlay(24, 12, {78, true}, false), "fresh delivered count must override submissions");
         for (auto position : {FpsOverlayPosition::off, FpsOverlayPosition::upper_left,
             FpsOverlayPosition::upper_right, FpsOverlayPosition::lower_left, FpsOverlayPosition::lower_right}) {
             require(parse_overlay_position(overlay_position_name(position)) == position, "position round trip");
