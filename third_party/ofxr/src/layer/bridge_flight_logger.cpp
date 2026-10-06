@@ -163,6 +163,19 @@ constexpr std::uint64_t kMegabyte = 1024ull * 1024ull;
     return "unknown";
 }
 
+[[nodiscard]] bool startup_operation(BridgeFlightOperation operation, std::int64_t result) noexcept {
+    return (operation == BridgeFlightOperation::logger && result > 0) ||
+        operation == BridgeFlightOperation::runtime_identity ||
+        operation == BridgeFlightOperation::session_binding ||
+        operation == BridgeFlightOperation::presenter_clock_capability ||
+        operation == BridgeFlightOperation::view_configuration ||
+        operation == BridgeFlightOperation::instance_create ||
+        operation == BridgeFlightOperation::session_create ||
+        operation == BridgeFlightOperation::negotiation ||
+        operation == BridgeFlightOperation::d3d11_bridge ||
+        operation == BridgeFlightOperation::vulkan_bridge;
+}
+
 [[nodiscard]] std::filesystem::path fallback_log_directory() {
     std::array<wchar_t, 32768> buffer{};
     const DWORD length = GetEnvironmentVariableW(
@@ -263,6 +276,7 @@ struct BridgeFlightLogger::Impl {
     };
     struct Slot { std::atomic<std::uint64_t> turn{}; Record record{}; };
     static constexpr std::uint64_t capacity = 262144;
+    std::uint64_t epoch{};
     HANDLE file{INVALID_HANDLE_VALUE};
     LARGE_INTEGER frequency{}, origin{};
     std::atomic<std::uint64_t> next_sequence{1};
@@ -292,7 +306,7 @@ struct BridgeFlightLogger::Impl {
     }
     void write(std::uint64_t sequence, std::int64_t counter, char phase,
         BridgeFlightOperation operation, std::int64_t result, std::uint64_t duration,
-        std::uint64_t a, std::uint64_t b, std::uint64_t c) noexcept {
+        std::uint64_t a, std::uint64_t b, std::uint64_t c, DWORD thread = 0) noexcept {
         if (!active.load(std::memory_order_relaxed)) return;
         auto position = enqueue_position.load(std::memory_order_relaxed);
         for (unsigned attempt = 0; attempt < 16; ++attempt) {
@@ -302,7 +316,7 @@ struct BridgeFlightLogger::Impl {
                 if (!enqueue_position.compare_exchange_weak(position, position + 1,
                         std::memory_order_relaxed)) continue;
                 slot.record = {sequence, duration, a, b, c, counter, result,
-                    GetCurrentThreadId(), operation, phase};
+                    thread ? thread : GetCurrentThreadId(), operation, phase};
                 slot.turn.store(position + 1, std::memory_order_release);
                 return;
             }
@@ -330,16 +344,7 @@ struct BridgeFlightLogger::Impl {
     }
     void serialize(const Record& record, bool replayed = false) noexcept {
         if (!replayed) {
-            const bool metadata = (record.operation == BridgeFlightOperation::logger && record.result > 0) ||
-                record.operation == BridgeFlightOperation::runtime_identity ||
-                record.operation == BridgeFlightOperation::session_binding ||
-                record.operation == BridgeFlightOperation::presenter_clock_capability ||
-                record.operation == BridgeFlightOperation::view_configuration ||
-                record.operation == BridgeFlightOperation::instance_create ||
-                record.operation == BridgeFlightOperation::session_create ||
-                record.operation == BridgeFlightOperation::negotiation ||
-                record.operation == BridgeFlightOperation::d3d11_bridge ||
-                record.operation == BridgeFlightOperation::vulkan_bridge;
+            const bool metadata = startup_operation(record.operation, record.result);
             if (metadata) {
                 auto found = std::find_if(startup_records.begin(), startup_records.begin() + startup_count,
                     [&](const Record& prior) { return prior.operation == record.operation &&
@@ -426,190 +431,183 @@ struct BridgeFlightLogger::Impl {
 };
 
 BridgeFlightLogger::BridgeFlightLogger() noexcept = default;
+BridgeFlightLogger::~BridgeFlightLogger() { shutdown(); }
 
-BridgeFlightLogger::~BridgeFlightLogger() {
-    shutdown();
+void BridgeFlightLogger::remember_startup(BridgeFlightOperation operation,
+    char phase, std::int64_t counter, std::int64_t result, std::uint64_t duration,
+    std::uint64_t a, std::uint64_t b, std::uint64_t c) noexcept {
+    if (!startup_operation(operation, result)) return;
+    try {
+        std::scoped_lock lock(startup_mutex_);
+        auto found = std::find_if(startup_.begin(), startup_.begin() + startup_count_,
+            [&](const StartupRecord& prior) { return prior.operation == operation &&
+                prior.a == a && prior.result == result && prior.phase == phase; });
+        const StartupRecord record{operation, phase, counter, result, duration,
+            a, b, c, GetCurrentThreadId()};
+        if (found != startup_.begin() + startup_count_) *found = record;
+        else if (startup_count_ < startup_.size()) startup_[startup_count_++] = record;
+    } catch (...) {}
 }
 
-void BridgeFlightLogger::initialize(
-    const std::filesystem::path& module_directory) noexcept {
-    try {
-        if (impl_ || ram_) {
-            return;
+void BridgeFlightLogger::start_disk_locked() {
+    auto implementation = std::make_shared<Impl>();
+    const auto config_path = module_directory_ / kConfigurationFileName;
+    const UINT maximum_mb = std::clamp<UINT>(GetPrivateProfileIntW(
+        kConfigurationSection, L"max_file_mb", 32, config_path.c_str()), 1, 256);
+    implementation->maximum_bytes = static_cast<std::uint64_t>(maximum_mb) * kMegabyte;
+    implementation->flush_each_event = GetPrivateProfileIntW(kConfigurationSection,
+        L"flush_each_event", 0, config_path.c_str()) != 0;
+    implementation->file = create_log_file(module_directory_, &implementation->path);
+    if (implementation->file == INVALID_HANDLE_VALUE)
+        implementation->file = create_log_file(fallback_log_directory(), &implementation->path);
+    if (implementation->file == INVALID_HANDLE_VALUE || base_frequency_ <= 0) return;
+    implementation->frequency.QuadPart = base_frequency_;
+    implementation->origin.QuadPart = base_origin_;
+    implementation->epoch = ++disk_epoch_;
+    implementation->start();
+    {
+        // Close the off-to-on metadata race: a new metadata event either joins
+        // this snapshot or observes the published active writer after the lock.
+        std::scoped_lock lock(startup_mutex_);
+        for (std::size_t index = 0; index < startup_count_; ++index) {
+            const auto& record = startup_[index];
+            implementation->write(implementation->next_sequence.fetch_add(1), record.counter,
+                'M', record.operation, record.result, record.duration,
+                record.a, record.b, record.c, record.thread);
         }
-        const auto config_path = module_directory / kConfigurationFileName;
-        gpu_instrumentation_enabled_ = GetPrivateProfileIntW(
-            kConfigurationSection, L"gpu_instrumentation_enabled", 0,
-            config_path.c_str()) != 0;
-        if (GetPrivateProfileIntW(kConfigurationSection, L"timing_capture", 0,
-                config_path.c_str()) != 0) {
-            auto capture = std::make_unique<RamTimingCapture>();
-            const bool pose_profile = GetPrivateProfileIntW(
-                kConfigurationSection, L"pose_cadence_capture", 0,
-                config_path.c_str()) != 0;
-            if (capture->initialize(pose_profile)) ram_ = std::move(capture);
-            // Exclusive RAM mode. Neither capture nor normal logging enables
-            // GPU work; only the independent explicit instrumentation flag can.
-            return;
-        }
-        if (GetPrivateProfileIntW(
-                kConfigurationSection,
-                L"logging_enabled",
-                0,
-                config_path.c_str()) == 0) {
-            return;
-        }
-
-        auto implementation = std::make_unique<Impl>();
-        const UINT maximum_mb = std::clamp<UINT>(
-            GetPrivateProfileIntW(
-                kConfigurationSection,
-                L"max_file_mb",
-                32,
-                config_path.c_str()),
-            1,
-            256);
-        implementation->maximum_bytes =
-            static_cast<std::uint64_t>(maximum_mb) * kMegabyte;
-        implementation->flush_each_event = GetPrivateProfileIntW(
-            kConfigurationSection,
-            L"flush_each_event",
-            0,
-            config_path.c_str()) != 0;
-        implementation->file = create_log_file(
-            module_directory, &implementation->path);
-        if (implementation->file == INVALID_HANDLE_VALUE) {
-            implementation->file = create_log_file(
-                fallback_log_directory(), &implementation->path);
-        }
-        if (implementation->file == INVALID_HANDLE_VALUE ||
-            !QueryPerformanceFrequency(&implementation->frequency) ||
-            !QueryPerformanceCounter(&implementation->origin)) {
-            return;
-        }
-        implementation->start();
-        impl_ = std::move(implementation);
-        event(
-            BridgeFlightOperation::logger,
-            XRFG_IMPLEMENTATION_VERSION,
-            maximum_mb,
-            impl_->flush_each_event ? 1u : 0u,
-            GetCurrentProcessId());
-    } catch (...) {
-        impl_.reset();
+        impl_.store(implementation, std::memory_order_release);
+        disk_enabled_.store(true, std::memory_order_release);
     }
+    event(BridgeFlightOperation::logger, XRFG_IMPLEMENTATION_VERSION,
+        maximum_mb, implementation->flush_each_event ? 1 : 0, GetCurrentProcessId());
+}
+
+void BridgeFlightLogger::initialize(const std::filesystem::path& module_directory) noexcept {
+    try {
+        std::scoped_lock control(control_mutex_);
+        if (initialized_.load()) return;
+        module_directory_ = module_directory;
+        LARGE_INTEGER frequency{}, origin{};
+        QueryPerformanceFrequency(&frequency); QueryPerformanceCounter(&origin);
+        base_frequency_ = frequency.QuadPart; base_origin_ = origin.QuadPart;
+        const auto config_path = module_directory_ / kConfigurationFileName;
+        gpu_instrumentation_enabled_.store(GetPrivateProfileIntW(kConfigurationSection,
+            L"gpu_instrumentation_enabled", 0, config_path.c_str()) != 0);
+        if (GetPrivateProfileIntW(kConfigurationSection, L"timing_capture", 0, config_path.c_str()) != 0) {
+            auto capture = std::make_unique<RamTimingCapture>();
+            const bool pose = GetPrivateProfileIntW(kConfigurationSection,
+                L"pose_cadence_capture", 0, config_path.c_str()) != 0;
+            if (capture->initialize(pose)) ram_ = std::move(capture);
+            ram_mode_ = true; // Exclusive even if RAM initialization failed.
+        } else {
+            candidate_enabled_ = GetPrivateProfileIntW(kConfigurationSection,
+                L"logging_enabled", 0, config_path.c_str()) != 0;
+            candidate_since_ = GetTickCount64();
+            if (candidate_enabled_) start_disk_locked();
+        }
+        initialized_.store(true, std::memory_order_release);
+    } catch (...) { disk_enabled_.store(false); impl_.store(nullptr); }
+}
+
+void BridgeFlightLogger::refresh_settings() noexcept {
+    if (!initialized_.load(std::memory_order_acquire) || ram_mode_) return;
+    const auto now = GetTickCount64();
+    auto next = next_poll_.load(std::memory_order_relaxed);
+    if (now < next || !next_poll_.compare_exchange_strong(next, now + 250)) return;
+    try {
+        std::scoped_lock control(control_mutex_);
+        if (!initialized_.load() || ram_mode_) return;
+        // Retire the old writer on the control caller, never on whichever
+        // producer happens to release the last transient shared reference.
+        std::erase_if(retired_, [](const auto& writer) { return writer.use_count() == 1; });
+        const bool desired = GetPrivateProfileIntW(kConfigurationSection, L"logging_enabled", 0,
+            (module_directory_ / kConfigurationFileName).c_str()) != 0;
+        if (desired != candidate_enabled_) {
+            candidate_enabled_ = desired; candidate_since_ = now; return;
+        }
+        if (now - candidate_since_ < 250 || desired == disk_enabled_.load()) return;
+        if (desired) start_disk_locked();
+        else {
+            event(BridgeFlightOperation::logger, 0);
+            disk_enabled_.store(false, std::memory_order_release);
+            auto prior = impl_.exchange(nullptr, std::memory_order_acq_rel);
+            if (prior) retired_.push_back(std::move(prior));
+        }
+    } catch (...) {} // Live diagnostics cannot fail a frame.
 }
 
 void BridgeFlightLogger::shutdown() noexcept {
-    gpu_instrumentation_enabled_ = false;
-    ram_.reset();
     try {
-        if (!impl_) {
-            return;
-        }
+        std::scoped_lock control(control_mutex_);
         event(BridgeFlightOperation::logger, 0);
-        impl_.reset();
-    } catch (...) {
-        impl_.reset();
-    }
+        disk_enabled_.store(false, std::memory_order_release);
+        auto prior = impl_.exchange(nullptr, std::memory_order_acq_rel);
+        if (prior) retired_.push_back(std::move(prior));
+        retired_.clear(); // Teardown callers have already drained producers.
+        ram_.reset(); ram_mode_ = false;
+        gpu_instrumentation_enabled_.store(false);
+        initialized_.store(false, std::memory_order_release);
+        next_poll_.store(0);
+        { std::scoped_lock startup(startup_mutex_); startup_count_ = 0; }
+    } catch (...) {}
 }
 
 bool BridgeFlightLogger::enabled() const noexcept {
-    return impl_ && impl_->active.load(std::memory_order_relaxed);
+    if (!disk_enabled_.load(std::memory_order_acquire)) return false;
+    const auto implementation = impl_.load(std::memory_order_acquire);
+    return implementation && implementation->active.load(std::memory_order_relaxed);
 }
-
 void BridgeFlightLogger::flush() noexcept {
-    try { if (impl_) impl_->flush(); } catch (...) {}
+    try { const auto implementation = impl_.load(); if (implementation) implementation->flush(); }
+    catch (...) {}
 }
-
-bool BridgeFlightLogger::ram_enabled() const noexcept {
-    return ram_ != nullptr;
+bool BridgeFlightLogger::ram_enabled() const noexcept { return ram_ != nullptr; }
+std::int64_t BridgeFlightLogger::microseconds_for_counter(std::int64_t counter) const noexcept {
+    const auto implementation = impl_.load();
+    if (!implementation || implementation->frequency.QuadPart <= 0) return 0;
+    return (counter - implementation->origin.QuadPart) * 1000000ll / implementation->frequency.QuadPart;
 }
-
-std::int64_t BridgeFlightLogger::microseconds_for_counter(
-    std::int64_t counter) const noexcept {
-    if (impl_ == nullptr || impl_->frequency.QuadPart <= 0) {
-        return 0;
-    }
-    return static_cast<std::int64_t>(
-        (counter - impl_->origin.QuadPart) * 1000000ll /
-        impl_->frequency.QuadPart);
-}
-
 std::filesystem::path BridgeFlightLogger::log_path() const {
-    return impl_ ? impl_->path : std::filesystem::path{};
+    const auto implementation = impl_.load();
+    return implementation ? implementation->path : std::filesystem::path{};
 }
-
-BridgeFlightToken BridgeFlightLogger::begin(
-    BridgeFlightOperation operation,
-    std::uint64_t a,
-    std::uint64_t b,
-    std::uint64_t c) noexcept {
+BridgeFlightToken BridgeFlightLogger::begin(BridgeFlightOperation operation,
+    std::uint64_t a, std::uint64_t b, std::uint64_t c) noexcept {
     if (ram_) return ram_->begin(operation, a, b, c);
-    if (!enabled()) {
-        return {};
-    }
-    LARGE_INTEGER now{};
-    if (!QueryPerformanceCounter(&now)) {
-        return {};
-    }
-    const BridgeFlightToken token{
-        impl_->next_sequence.fetch_add(1, std::memory_order_relaxed),
-        now.QuadPart};
-    impl_->write(
-        token.sequence, token.start_counter, 'B', operation, 0, 0, a, b, c);
+    if (!disk_enabled_.load(std::memory_order_acquire) && !startup_operation(operation, 0)) return {};
+    LARGE_INTEGER now{}; if (!QueryPerformanceCounter(&now)) return {};
+    remember_startup(operation, 'B', now.QuadPart, 0, 0, a, b, c);
+    if (!disk_enabled_.load(std::memory_order_acquire)) return {};
+    const auto implementation = impl_.load(std::memory_order_acquire);
+    if (!implementation || !implementation->active.load()) return {};
+    const BridgeFlightToken token{implementation->next_sequence.fetch_add(1), now.QuadPart, implementation->epoch};
+    implementation->write(token.sequence, now.QuadPart, 'B', operation, 0, 0, a, b, c);
     return token;
 }
-
-void BridgeFlightLogger::end(
-    BridgeFlightToken token,
-    BridgeFlightOperation operation,
-    std::int64_t result,
-    std::uint64_t a,
-    std::uint64_t b,
-    std::uint64_t c) noexcept {
+void BridgeFlightLogger::end(BridgeFlightToken token, BridgeFlightOperation operation,
+    std::int64_t result, std::uint64_t a, std::uint64_t b, std::uint64_t c) noexcept {
     if (ram_) { ram_->end(token, operation, result, a, b, c); return; }
-    if (!enabled() || token.sequence == 0) {
-        return;
-    }
-    LARGE_INTEGER now{};
-    if (!QueryPerformanceCounter(&now)) {
-        return;
-    }
-    const std::uint64_t duration = impl_->frequency.QuadPart > 0 &&
-            now.QuadPart >= token.start_counter
-        ? static_cast<std::uint64_t>(
-              (now.QuadPart - token.start_counter) * 1000000ll /
-              impl_->frequency.QuadPart)
-        : 0;
-    impl_->write(
-        token.sequence, now.QuadPart, 'E', operation, result, duration, a, b, c);
+    if (!disk_enabled_.load(std::memory_order_acquire) && !startup_operation(operation, result)) return;
+    LARGE_INTEGER now{}; if (!QueryPerformanceCounter(&now)) return;
+    const auto duration = base_frequency_ > 0 && token.start_counter > 0 && now.QuadPart >= token.start_counter
+        ? static_cast<std::uint64_t>((now.QuadPart - token.start_counter) * 1000000ll / base_frequency_) : 0;
+    remember_startup(operation, 'E', now.QuadPart, result, duration, a, b, c);
+    if (!disk_enabled_.load(std::memory_order_acquire) || token.sequence == 0) return;
+    const auto implementation = impl_.load(std::memory_order_acquire);
+    if (!implementation || token.recorder_epoch != implementation->epoch) return;
+    implementation->write(token.sequence, now.QuadPart, 'E', operation, result, duration, a, b, c);
 }
-
-void BridgeFlightLogger::event(
-    BridgeFlightOperation operation,
-    std::int64_t result,
-    std::uint64_t a,
-    std::uint64_t b,
-    std::uint64_t c) noexcept {
+void BridgeFlightLogger::event(BridgeFlightOperation operation, std::int64_t result,
+    std::uint64_t a, std::uint64_t b, std::uint64_t c) noexcept {
     if (ram_) { ram_->event(operation, result, a, b, c); return; }
-    if (!enabled()) {
-        return;
-    }
-    LARGE_INTEGER now{};
-    if (!QueryPerformanceCounter(&now)) {
-        return;
-    }
-    impl_->write(
-        impl_->next_sequence.fetch_add(1, std::memory_order_relaxed),
-        now.QuadPart,
-        'I',
-        operation,
-        result,
-        0,
-        a,
-        b,
-        c);
+    if (!disk_enabled_.load(std::memory_order_acquire) && !startup_operation(operation, result)) return;
+    LARGE_INTEGER now{}; if (!QueryPerformanceCounter(&now)) return;
+    remember_startup(operation, 'I', now.QuadPart, result, 0, a, b, c);
+    if (!disk_enabled_.load(std::memory_order_acquire)) return;
+    const auto implementation = impl_.load(std::memory_order_acquire);
+    if (!implementation) return;
+    implementation->write(implementation->next_sequence.fetch_add(1), now.QuadPart,
+        'I', operation, result, 0, a, b, c);
 }
 
 BridgeFlightLogger& bridge_flight_logger() noexcept {

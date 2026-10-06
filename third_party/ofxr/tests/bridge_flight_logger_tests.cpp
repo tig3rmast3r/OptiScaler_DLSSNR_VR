@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -136,6 +137,65 @@ void concurrent_records(const fs::path& directory, bool wrap, bool flush) {
 }
 
 } // namespace
+
+void live_switch_records(const fs::path& directory) {
+    fs::create_directories(directory);
+    const auto ini = directory / "ofxr_bridge.ini";
+    write(ini, "[diagnostics]\r\nlogging_enabled=0\r\ngpu_instrumentation_enabled=1\r\n");
+    xrfg::BridgeFlightLogger logger;
+    logger.initialize(directory);
+    logger.event(xrfg::BridgeFlightOperation::runtime_identity, 777, 1, 2, 3);
+    require(!logger.enabled(), "live fixture started with logging active");
+    std::atomic<bool> stop{};
+    std::vector<std::thread> producers;
+    for (unsigned index = 0; index < 4; ++index) {
+        producers.emplace_back([&, index] {
+            while (!stop.load()) {
+                const auto token = logger.begin(xrfg::BridgeFlightOperation::application_wait_frame, index);
+                logger.event(xrfg::BridgeFlightOperation::synthesis_pair, 8, index);
+                logger.end(token, xrfg::BridgeFlightOperation::application_wait_frame, 8, index);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+    }
+    const auto switch_to = [&](bool on) {
+        require(WritePrivateProfileStringW(L"diagnostics", L"logging_enabled", on ? L"1" : L"0", ini.c_str()),
+            "fixture switch write");
+        logger.refresh_settings();
+        std::this_thread::sleep_for(std::chrono::milliseconds(270));
+        logger.refresh_settings();
+        std::this_thread::sleep_for(std::chrono::milliseconds(270));
+        logger.refresh_settings();
+        require(logger.enabled() == on, "live logger did not follow stable switch");
+        require(logger.gpu_instrumentation_enabled(), "logging switch changed independent GPU instrumentation");
+    };
+    try {
+        switch_to(true);
+        const auto first = logger.log_path();
+        logger.flush();
+        require(read(first).find("phase=M op=runtime_identity result=777") != std::string::npos,
+            "late logging lost startup metadata from disabled mode");
+        const auto stale = logger.begin(xrfg::BridgeFlightOperation::application_wait_frame);
+        require(stale.sequence != 0, "first live writer token");
+        switch_to(false);
+        // Respect the next 250ms control poll before the following toggle.
+        std::this_thread::sleep_for(std::chrono::milliseconds(270));
+        switch_to(true);
+        const auto second = logger.log_path();
+        require(first != second, "live restart truncated previous log");
+        logger.end(stale, xrfg::BridgeFlightOperation::application_wait_frame, 4242);
+        logger.flush();
+        require(read(second).find("result=4242") == std::string::npos,
+            "a span crossed recorder epochs");
+        require(read(second).find("phase=M op=runtime_identity result=777") != std::string::npos,
+            "live restart lost retained identity metadata");
+    } catch (...) {
+        stop.store(true); for (auto& producer : producers) producer.join();
+        logger.shutdown(); throw;
+    }
+    stop.store(true); for (auto& producer : producers) producer.join();
+    logger.shutdown();
+}
 
 int main(int argc, char** argv) {
     if (argc == 2) {
@@ -322,6 +382,7 @@ int main(int argc, char** argv) {
         concurrent_records(temporary.path / "concurrent", false, false);
         concurrent_records(temporary.path / "wrap", true, false);
         concurrent_records(temporary.path / "flush", false, true);
+        live_switch_records(temporary.path / "live-switch");
 
         std::cout << "Bridge flight logger tests passed.\n";
         return 0;

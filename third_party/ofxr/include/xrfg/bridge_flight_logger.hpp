@@ -1,5 +1,9 @@
 #pragma once
 
+#include <atomic>
+#include <array>
+#include <mutex>
+#include <vector>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -194,6 +198,7 @@ enum class BridgeFlightOperation : std::uint32_t {
 struct BridgeFlightToken {
     std::uint64_t sequence{};
     std::int64_t start_counter{};
+    std::uint64_t recorder_epoch{};
 };
 
 class BridgeFlightLogger final {
@@ -206,9 +211,11 @@ public:
 
     void initialize(const std::filesystem::path& module_directory) noexcept;
     void shutdown() noexcept;
+    // Bounded live INI polling; invoke outside resource/presenter locks.
+    void refresh_settings() noexcept;
     // Explicit diagnostic/teardown use only; never called on a render path.
     void flush() noexcept;
-    [[nodiscard]] bool gpu_instrumentation_enabled() const noexcept { return gpu_instrumentation_enabled_; }
+    [[nodiscard]] bool gpu_instrumentation_enabled() const noexcept { return gpu_instrumentation_enabled_.load(std::memory_order_relaxed); }
 
     [[nodiscard]] bool enabled() const noexcept;
     [[nodiscard]] bool ram_enabled() const noexcept;
@@ -243,9 +250,28 @@ public:
 
 private:
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    struct StartupRecord {
+        BridgeFlightOperation operation{};
+        char phase{};
+        std::int64_t counter{}, result{};
+        std::uint64_t duration{}, a{}, b{}, c{};
+        std::uint32_t thread{};
+    };
+    void start_disk_locked();
+    void remember_startup(BridgeFlightOperation, char, std::int64_t, std::int64_t,
+        std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t) noexcept;
+    std::atomic<std::shared_ptr<Impl>> impl_;
     std::unique_ptr<RamTimingCapture> ram_;
-    bool gpu_instrumentation_enabled_{};
+    std::atomic<bool> gpu_instrumentation_enabled_{false}, disk_enabled_{false}, initialized_{false};
+    std::atomic<std::uint64_t> next_poll_{0};
+    std::mutex control_mutex_, startup_mutex_;
+    std::filesystem::path module_directory_;
+    std::array<StartupRecord, 128> startup_{};
+    std::size_t startup_count_{};
+    std::vector<std::shared_ptr<Impl>> retired_;
+    std::int64_t base_frequency_{}, base_origin_{};
+    std::uint64_t disk_epoch_{}, candidate_since_{};
+    bool candidate_enabled_{}, ram_mode_{};
 };
 
 [[nodiscard]] BridgeFlightLogger& bridge_flight_logger() noexcept;

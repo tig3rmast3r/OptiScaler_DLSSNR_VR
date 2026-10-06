@@ -11173,6 +11173,7 @@ XrResult layer_end_frame_impl(
 
     const std::uint32_t diagnostic_capture_frame =
         xrfg::two_frame_capture_begin_end_frame();
+    xrfg::bridge_flight_logger().refresh_settings();
     struct CaptureFrameScope {
         std::uint32_t frame;
         ~CaptureFrameScope() {
