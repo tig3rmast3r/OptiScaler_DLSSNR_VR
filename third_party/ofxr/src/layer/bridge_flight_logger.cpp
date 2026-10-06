@@ -174,6 +174,8 @@ constexpr std::uint64_t kMegabyte = 1024ull * 1024ull;
 }
 
 [[nodiscard]] std::wstring log_file_name() {
+    static std::atomic<std::uint64_t> serial{0};
+    const auto ordinal = serial.fetch_add(1, std::memory_order_relaxed);
     SYSTEMTIME time{};
     GetLocalTime(&time);
     std::array<wchar_t, 128> name{};
@@ -181,14 +183,16 @@ constexpr std::uint64_t kMegabyte = 1024ull * 1024ull;
         name.data(),
         name.size(),
         _TRUNCATE,
-        L"ofxr-bridge-flight-%04u%02u%02u-%02u%02u%02u-pid%lu.log",
+        L"ofxr-bridge-flight-%04u%02u%02u-%02u%02u%02u-%03u-pid%lu-%llu.log",
         static_cast<unsigned>(time.wYear),
         static_cast<unsigned>(time.wMonth),
         static_cast<unsigned>(time.wDay),
         static_cast<unsigned>(time.wHour),
         static_cast<unsigned>(time.wMinute),
         static_cast<unsigned>(time.wSecond),
-        static_cast<unsigned long>(GetCurrentProcessId()));
+        static_cast<unsigned>(time.wMilliseconds),
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long long>(ordinal));
     return name.data();
 }
 
@@ -204,19 +208,19 @@ constexpr std::uint64_t kMegabyte = 1024ull * 1024ull;
         if (error) {
             return INVALID_HANDLE_VALUE;
         }
-        const auto path = directory / log_file_name();
-        HANDLE file = CreateFileW(
-            path.c_str(),
-            GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr);
-        if (file != INVALID_HANDLE_VALUE) {
-            *output_path = path;
+        for (unsigned attempt = 0; attempt < 128; ++attempt) {
+            const auto path = directory / log_file_name();
+            HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file != INVALID_HANDLE_VALUE) {
+                *output_path = path;
+                return file;
+            }
+            if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS)
+                return INVALID_HANDLE_VALUE;
         }
-        return file;
+        return INVALID_HANDLE_VALUE;
     } catch (...) {
         return INVALID_HANDLE_VALUE;
     }
@@ -271,6 +275,10 @@ struct BridgeFlightLogger::Impl {
     std::uint64_t dequeue_position{}, file_position{};
     std::array<char, 65536> batch{};
     std::size_t batch_size{};
+    // Writer-owned bounded metadata: re-emitted after truncation, never from
+    // render threads. No frame-by-frame events are retained.
+    std::array<Record, 128> startup_records{};
+    std::size_t startup_count{};
     std::thread writer;
     std::mutex flush_mutex;
     std::condition_variable flush_condition;
@@ -320,7 +328,26 @@ struct BridgeFlightLogger::Impl {
         if (!good) active.store(false);
         return good;
     }
-    void serialize(const Record& record) noexcept {
+    void serialize(const Record& record, bool replayed = false) noexcept {
+        if (!replayed) {
+            const bool metadata = (record.operation == BridgeFlightOperation::logger && record.result > 0) ||
+                record.operation == BridgeFlightOperation::runtime_identity ||
+                record.operation == BridgeFlightOperation::session_binding ||
+                record.operation == BridgeFlightOperation::presenter_clock_capability ||
+                record.operation == BridgeFlightOperation::view_configuration ||
+                record.operation == BridgeFlightOperation::instance_create ||
+                record.operation == BridgeFlightOperation::session_create ||
+                record.operation == BridgeFlightOperation::negotiation ||
+                record.operation == BridgeFlightOperation::d3d11_bridge ||
+                record.operation == BridgeFlightOperation::vulkan_bridge;
+            if (metadata) {
+                auto found = std::find_if(startup_records.begin(), startup_records.begin() + startup_count,
+                    [&](const Record& prior) { return prior.operation == record.operation &&
+                        prior.a == record.a && prior.result == record.result && prior.phase == record.phase; });
+                if (found != startup_records.begin() + startup_count) *found = record;
+                else if (startup_count < startup_records.size()) startup_records[startup_count++] = record;
+            }
+        }
         const double ms = frequency.QuadPart > 0
             ? static_cast<double>(record.counter - origin.QuadPart) * 1000.0 / frequency.QuadPart : 0.0;
         std::array<char, 384> line{};
@@ -339,6 +366,12 @@ struct BridgeFlightLogger::Impl {
                 return;
             }
             file_position = 0;
+            for (std::size_t index = 0; index < startup_count; ++index) {
+                auto metadata = startup_records[index];
+                metadata.sequence = next_sequence.fetch_add(1, std::memory_order_relaxed);
+                metadata.phase = 'M';
+                serialize(metadata, true);
+            }
         }
         if (batch_size + length > batch.size() && !write_batch()) return;
         std::memcpy(batch.data() + batch_size, line.data(), length);

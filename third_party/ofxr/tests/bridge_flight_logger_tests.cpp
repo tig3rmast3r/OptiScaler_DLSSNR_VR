@@ -63,6 +63,7 @@ void concurrent_records(const fs::path& directory, bool wrap, bool flush) {
     logger.initialize(directory);
     require(logger.enabled(), "concurrent logger did not initialize");
     const auto path = logger.log_path();
+    logger.event(xrfg::BridgeFlightOperation::runtime_identity, 999, 42, 7, 3);
     constexpr unsigned threads = 8;
     const unsigned iterations = wrap ? 12000 : flush ? 32 : 1500;
     std::atomic<unsigned> ready{};
@@ -124,10 +125,14 @@ void concurrent_records(const fs::path& directory, bool wrap, bool flush) {
     }
     require(!identities.empty(), "concurrent log lost all worker records");
     if (!wrap) require(identities.size() + reported_drops == threads * iterations &&
-        sequences.size() + reported_drops == threads * iterations + 3 + drop_records,
+        sequences.size() + reported_drops == threads * iterations + 4 + drop_records,
         "non-wrapping logger lost records without reporting bounded queue pressure");
-    if (wrap) require(identities.size() < threads * iterations,
-        "wrap fixture did not exercise truncation");
+    if (wrap) {
+        require(identities.size() < threads * iterations, "wrap fixture did not exercise truncation");
+        require(contents.find("phase=M op=runtime_identity result=999") != std::string::npos &&
+            contents.find("phase=M op=logger result=") != std::string::npos,
+            "rotation lost startup identity or implementation metadata");
+    }
 }
 
 } // namespace
@@ -299,6 +304,21 @@ int main(int argc, char** argv) {
                     std::string::npos,
             "bridge log is missing V049 NVIDIA GPU timing fields");
 
+        // Repeated startups in one process must not truncate one another.
+        const auto unique_directory = temporary.path / "unique";
+        fs::create_directories(unique_directory);
+        write(unique_directory / "ofxr_bridge.ini", "[diagnostics]\r\nlogging_enabled=1\r\n");
+        std::unordered_set<std::wstring> paths;
+        for (unsigned index = 0; index < 8; ++index) {
+            xrfg::BridgeFlightLogger distinct;
+            distinct.initialize(unique_directory);
+            const auto path = distinct.log_path();
+            require(distinct.enabled() && paths.insert(path.wstring()).second, "logger startup reused a filename");
+            distinct.event(xrfg::BridgeFlightOperation::runtime_identity, index + 1000);
+            distinct.shutdown();
+            require(read(path).find("op=runtime_identity result=" + std::to_string(index + 1000)) != std::string::npos,
+                "unique recorder lost its own startup record");
+        }
         concurrent_records(temporary.path / "concurrent", false, false);
         concurrent_records(temporary.path / "wrap", true, false);
         concurrent_records(temporary.path / "flush", false, true);
