@@ -1463,6 +1463,25 @@ void refused_frame_recovery_test() {
 #include "djules_clock_tests.inc"
 
 int main(int argc, char** argv) {
+#ifdef OFXR_DJULES_COMPARISON
+    {
+        auto timing=std::make_shared<SessionState>(std::make_shared<Dispatch>());
+        timing->graphics_binding=SessionGraphicsBinding::d3d12;
+        timing->nvidia_new_route=true; timing->menu_enabled=true;
+        timing->optical_flow_backend=xrfg::D3D12OpticalFlowBackend::nvidia;
+        timing->frame_generation_mode=xrfg::D3D12FrameGenerationMode::ofxr;
+        timing->minimum_runtime_display_period=10;
+        ProjectionSnapshot a{},b{};a.display_time=100;b.display_time=140;
+        check(std::abs(synthetic_interpolation_fraction(timing,a,b)-0.75F)<0.0001F,"DJ 2X interval fraction");
+        timing->djules_triple_requested=true;
+        check(std::abs(synthetic_interpolation_fraction(timing,a,b)-0.5F)<0.0001F,"DJ 3X first fraction");
+        check(std::abs(synthetic_interpolation_fraction(timing,a,b,1)-0.75F)<0.0001F,"DJ 3X second fraction");
+        b.display_time=120;
+        check(std::abs(synthetic_interpolation_fraction(timing,a,b)-1.0F/3.0F)<0.0001F,"invalid cadence fallback");
+        timing->nvidia_new_route=false;
+        check(synthetic_interpolation_fraction(timing,a,b)==0.5F,"reference fraction changed");
+    }
+#endif
     auto state = session();
     try {
         native_stereo_time_match_test();

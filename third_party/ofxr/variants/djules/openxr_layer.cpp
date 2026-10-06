@@ -6500,6 +6500,7 @@ struct SynthesisJob {
     std::shared_ptr<const CompletedAfwFrame> post_afw_frame;
     bool pair{};
     bool triple{};
+    float fraction{0.5F},extra_fraction{2.0F/3.0F};
 };
 
 [[nodiscard]] XrResult wait_for_synthesis_handoff(
@@ -9128,7 +9129,8 @@ struct AfwSourceCapture {
     const xrfg::D3D12PresentationTransform* captured_transform = nullptr,
     bool defer_d3d11_publication = false,
     const PostAfwFrameInput* post_afw_input = nullptr,
-    const AfwSourceCapture* afw_source = nullptr) noexcept {
+    const AfwSourceCapture* afw_source = nullptr,
+    float extra_fraction=2.0F/3.0F) noexcept {
     PreparedGeneration output{};
     try {
         const auto state = find_swapchain(application_swapchain);
@@ -9355,7 +9357,7 @@ struct AfwSourceCapture {
                                           defer_current_copy,
                                           interpolation_fraction, presentation_transform,
                                           request_extra ? std::optional<xrfg::D3D12ExtraSynthetic>{
-                                              xrfg::D3D12ExtraSynthetic{synthetic_destination_index+1,2.0F/3.0F}} : std::nullopt)
+                                              xrfg::D3D12ExtraSynthetic{synthetic_destination_index+1,extra_fraction}} : std::nullopt)
                                     : synthesizer->submit_prime(
                                           *capture,
                                           current_source_views,
@@ -9506,14 +9508,15 @@ struct AfwSourceCapture {
 [[nodiscard]] float synthetic_interpolation_fraction(
     const std::shared_ptr<SessionState>& state,
     const std::optional<ProjectionSnapshot>& previous_snapshot,
-    const ProjectionSnapshot& current_snapshot) noexcept {
-    constexpr float kFixedMidpoint = 0.5F;
-    if(state && djules_triple_active(*state)) return 1.0F/3.0F;
+    const ProjectionSnapshot& current_snapshot, unsigned index=0) noexcept {
+    const unsigned frames=state && djules_triple_active(*state)?3:2;
+    const float kFixedMidpoint=float(index+1)/float(frames);
     // Match the validated new NVIDIA image contract. Predicted XR-time gaps
     // must not move legacy's synthesized content toward B from pair to pair.
     // Other backends retain their independently tested contracts.
     if (state && state->frame_generation_mode != xrfg::D3D12FrameGenerationMode::fsr3 &&
-        state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia)
+        state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
+        !djules_native_scheduler(*state))
         return kFixedMidpoint;
     if (!state || !previous_snapshot) {
         return kFixedMidpoint;
@@ -9527,10 +9530,10 @@ struct AfwSourceCapture {
         current_snapshot.display_time - previous_snapshot->display_time;
     // One period or less cannot hold a synthetic at all, and an interval wider
     // than four says the pairing has already lost its cadence.
-    if (period <= 0 || interval <= period || interval > period * 4) {
+    if (period <= 0 || interval <= period * (frames-1) || interval > period * frames * 2) {
         return kFixedMidpoint;
     }
-    return 1.0F - static_cast<float>(period) / static_cast<float>(interval);
+    return 1.0F - static_cast<float>(period * (frames-1-index)) / static_cast<float>(interval);
 }
 
 [[nodiscard]] PreparedProjectionFrame prepare_projection_frame(
@@ -9540,7 +9543,8 @@ struct AfwSourceCapture {
     float interpolation_fraction,
     bool worker_submission = false,
     const xrfg::D3D12PresentationTransform* captured_transform = nullptr,
-    std::span<const PostAfwFrameInput> post_afw_inputs = {}) noexcept {
+    std::span<const PostAfwFrameInput> post_afw_inputs = {},
+    float extra_fraction=2.0F/3.0F) noexcept {
     PreparedProjectionFrame output{};
     try {
         if (mappings.empty()) {
@@ -9579,7 +9583,7 @@ struct AfwSourceCapture {
                 std::span<const xrfg::D3D12ReprojectionView>(
                     reprojection_views->data(),
                     reprojection_views->size()),
-                interpolation_fraction, worker_submission, captured_transform, false, post_afw_input);
+                interpolation_fraction, worker_submission, captured_transform, false, post_afw_input, nullptr, extra_fraction);
             all_expected_kind =
                 all_expected_kind && generation.kind == expected_kind;
             all_anchor_current =
@@ -9698,10 +9702,10 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
                 xrfg::BridgeFlightOperation::timing_worker_prepare,
                 job->current->source_sequence, job->current->previous_sequence);
             PreparedProjectionFrame prepared = prepare_projection_frame(
-                job->snapshot, job->mappings, job->pair, job->triple?1.0F/3.0F:0.5F, true,
+                job->snapshot, job->mappings, job->pair, job->fraction, true,
                 &job->presentation_transform, job->post_afw_frame
                     ? std::span<const PostAfwFrameInput>{job->post_afw_frame->inputs}
-                    : std::span<const PostAfwFrameInput>{});
+                    : std::span<const PostAfwFrameInput>{},job->extra_fraction);
             xrfg::bridge_flight_logger().end(prepare_token,
                 xrfg::BridgeFlightOperation::timing_worker_prepare,
                 prepared.kind == PreparedGenerationKind::none ? -1 : 0,
@@ -10115,6 +10119,10 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
         : make_presenter_owned_frame(std::move(metadata));
     if (!job->metadata) return XR_ERROR_LAYER_INVALID;
     job->snapshot = post_afw_frame ? post_afw_frame->snapshot : snapshot;
+    std::optional<ProjectionSnapshot> previous;
+    { std::scoped_lock lock(state->mutex); previous=state->previous_projection; }
+    job->fraction=synthetic_interpolation_fraction(state,previous,job->snapshot);
+    job->extra_fraction=synthetic_interpolation_fraction(state,previous,job->snapshot,1);
     job->mappings.assign(mappings.begin(), mappings.end());
     job->post_afw_frame = std::move(post_afw_frame);
     job->current = std::make_shared<ThreeSlotFrame>();
@@ -12129,7 +12137,8 @@ XrResult layer_end_frame_impl(
                 &final_color_transform, completed_afw->inputs)
             : std::move(afw_produced)
         : prepare_projection_frame(
-              current_snapshot, mapping_span, metadata_pairable, interpolation_fraction);
+              current_snapshot, mapping_span, metadata_pairable, interpolation_fraction, false, nullptr, {},
+              synthetic_interpolation_fraction(state,previous_snapshot,current_snapshot,1));
     if (state->fps_overlay) {
         state->fps_overlay->set_afw_active(
             afw_selected && prepared.kind != PreparedGenerationKind::none);
