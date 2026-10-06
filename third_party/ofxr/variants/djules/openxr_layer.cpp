@@ -1185,8 +1185,11 @@ private:
         state.graphics_binding == SessionGraphicsBinding::d3d12;
 }
 
+[[nodiscard]] bool djules_triple_active(const SessionState& state) noexcept {
+    return state.djules_triple_requested && state.menu_enabled && djules_native_scheduler(state);
+}
 [[nodiscard]] bool djules_triple_director(const SessionState& state) noexcept {
-    return state.djules_triple_requested && state.three_slot_director && djules_native_scheduler(state);
+    return state.three_slot_director && djules_triple_active(state);
 }
 [[nodiscard]] bool djules_deep_active(const SessionState& state) noexcept {
     return state.djules_deep_pipeline && djules_native_scheduler(state) && !djules_triple_director(state);
@@ -1880,7 +1883,7 @@ XrResult wait_presenter_runtime_frame(const std::shared_ptr<SessionState>& state
 
 [[nodiscard]] XrDuration doubled_display_period(XrDuration period) noexcept;
 [[nodiscard]] XrDuration djules_application_period(const SessionState& state,XrDuration period) noexcept {
-    if(!djules_triple_director(state)) return doubled_display_period(period);
+    if(!djules_triple_active(state)) return doubled_display_period(period);
     if(period>std::numeric_limits<XrDuration>::max()/3) return std::numeric_limits<XrDuration>::max();
     return period>0?period*3:period;
 }
@@ -4879,7 +4882,7 @@ XrResult layer_wait_frame_impl(
         // runtime display period to the app, as the inline route does, rather
         // than feeding that doubled cadence into upstream half-rate policies.
         // Keep the prediction anchor/ceiling and all buffer pacing unchanged.
-        frame_state->predictedDisplayPeriod = djules_triple_director(*state)?virtual_period:
+        frame_state->predictedDisplayPeriod = djules_triple_active(*state)?virtual_period:
             (state->three_slot_director || state->fsr_two_slot_presenter)
             ? state->presenter_frame_state.predictedDisplayPeriod : virtual_period;
         frame_state->shouldRender = state->presenter_frame_state.shouldRender;
@@ -4986,6 +4989,8 @@ XrResult layer_wait_frame_impl(
                     ? state->unpaced_wait_streak + 1
                     : 0;
         }
+        if(forwarded_application_wait && djules_triple_active(*state) && !state->manual_control.stop_requested())
+            frame_state->predictedDisplayPeriod=djules_application_period(*state,frame_state->predictedDisplayPeriod);
         const std::uint64_t frame_serial = state->next_application_frame_serial++;
         state->pending_frames.push_back({
             frame_state->predictedDisplayTime,
@@ -8241,7 +8246,8 @@ enqueue_presenter_submission(
 [[nodiscard]] XrResult enqueue_presenter_pair(
     const std::shared_ptr<SessionState>& state,
     std::shared_ptr<GeneratedFrameEndInfo> synthetic,
-    std::shared_ptr<GeneratedFrameEndInfo> current) noexcept {
+    std::shared_ptr<GeneratedFrameEndInfo> current,
+    std::shared_ptr<GeneratedFrameEndInfo> middle=nullptr) noexcept {
     try {
         std::scoped_lock lock(state->presenter_mutex);
         if (!state->presenter_active || state->presenter_stop_requested ||
@@ -8258,13 +8264,22 @@ enqueue_presenter_submission(
         first->sequence = state->next_presenter_sequence++;
         first->pair_sequence = first->sequence;
         first->owned_frame = std::move(synthetic);
+        std::shared_ptr<PresenterSubmission> middle_request;
+        if(middle) {
+            middle_request=std::make_shared<PresenterSubmission>();
+            middle_request->sequence=state->next_presenter_sequence++;
+            middle_request->pair_sequence=first->pair_sequence;
+            middle_request->owned_frame=std::move(middle);
+        }
         auto second = std::make_shared<PresenterSubmission>();
         second->sequence = state->next_presenter_sequence++;
         second->pair_sequence = first->pair_sequence;
         second->owned_frame = std::move(current);
+        const unsigned output_count=middle_request?3:2;
         state->presenter_submissions.push_back(std::move(first));
+        if(middle_request) state->presenter_submissions.push_back(std::move(middle_request));
         state->presenter_submissions.push_back(std::move(second));
-        state->outstanding_presenter_submissions += 2;
+        state->outstanding_presenter_submissions += output_count;
         state->presenter_condition.notify_all();
         return XR_SUCCESS;
     } catch (...) {
@@ -9208,7 +9223,7 @@ struct AfwSourceCapture {
         }
 
         const bool request_extra=request_pair && generation->staged_outputs &&
-            worker_submission && djules_triple_director(*state->session);
+            djules_triple_active(*state->session);
         if (generation->staged_outputs) {
             std::unique_lock lock(state->session->presenter_mutex);
             state->session->presenter_condition.wait(lock,[&] {
@@ -9493,6 +9508,7 @@ struct AfwSourceCapture {
     const std::optional<ProjectionSnapshot>& previous_snapshot,
     const ProjectionSnapshot& current_snapshot) noexcept {
     constexpr float kFixedMidpoint = 0.5F;
+    if(state && djules_triple_active(*state)) return 1.0F/3.0F;
     // Match the validated new NVIDIA image contract. Predicted XR-time gaps
     // must not move legacy's synthesized content toward B from pair to pair.
     // Other backends retain their independently tested contracts.
@@ -10794,7 +10810,8 @@ struct InternalCycleResult {
     const XrFrameEndInfo& current_end_info,
     std::uint64_t frame_serial = 0,
     const PreparedProjectionFrame* prepared = nullptr,
-    std::optional<XrFrameState> adopted_frame = std::nullopt) {
+    std::optional<XrFrameState> adopted_frame = std::nullopt,
+    GeneratedFrameEndInfo* owned_output=nullptr, bool synthetic_output=false) {
     InternalCycleResult output{};
     if (state->dispatch->wait_frame == nullptr ||
         state->dispatch->begin_frame == nullptr ||
@@ -10871,7 +10888,7 @@ struct InternalCycleResult {
     const XrResult end_result = with_runtime_entry(state, [&] {
         log_luke_physical_boundary(state, &submitted, frame_serial, 6, prepared);
         GeneratedFrameEndInfo pending;
-        if(prepared) {
+        if(prepared && !owned_output) {
             // Only this real's exact staging; no extra current copy or latest lookup.
             for(const auto& resource:prepared->resources) {
                 const auto& output=resource.generation;
@@ -10879,9 +10896,10 @@ struct InternalCycleResult {
                     output.staging_generation->current_staging[output.current_slot],output.synthesizer,output.staging_ticket,false});
             }
         }
-        if(!handover_djules_outputs(state.get(),pending.pending_outputs)) return XR_ERROR_RUNTIME_FAILURE;
+        if(!handover_djules_outputs(state.get(),owned_output?owned_output->pending_outputs:pending.pending_outputs))
+            return XR_ERROR_RUNTIME_FAILURE;
         return state->fps_overlay
-            ? state->fps_overlay->end_frame(&submitted, false)
+            ? state->fps_overlay->end_frame(&submitted, synthetic_output)
             : state->dispatch->end_frame(state->handle, &submitted);
     });
     log_luke_physical_boundary(state, &submitted, frame_serial, 7, prepared, end_result);
@@ -12205,7 +12223,7 @@ XrResult layer_end_frame_impl(
     }
 
     GeneratedFrameEndInfo first_generated{};
-    GeneratedFrameEndInfo current_generated{};
+    GeneratedFrameEndInfo current_generated{},extra_generated{};
     const XrFrameEndInfo* produced_end_info = completed_afw
         ? &completed_afw->submission->info : afw_selected ? &afw_terminal_submission.info : end_info;
     const ProjectionSnapshot& produced_snapshot = completed_afw
@@ -12293,8 +12311,18 @@ XrResult layer_end_frame_impl(
         clear_generation_continuity(state);
     }
 
+    bool extra_ready=pair_ready && djules_triple_active(*state);
+    if(extra_ready) {
+        extra_ready=build_generated_frame_end_info(produced_end_info,produced_snapshot,true,
+            synthetic_destinations,&extra_generated);
+        if(!extra_ready) {
+            enter_generation_quarantine(state,GenerationQuarantineReason::generated_end_info_failed);
+            return bypass_generation(GenerationPrepareReason::generated_end_info_failed);
+        }
+        extra_generated.synthetic=true;
+    }
     if(prepared.kind==PreparedGenerationKind::prime) attach_djules_outputs(prepared,first_generated);
-    else if(pair_ready) attach_djules_outputs(prepared,current_generated,&first_generated);
+    else if(pair_ready) attach_djules_outputs(prepared,current_generated,&first_generated,extra_ready?&extra_generated:nullptr);
     if (completed_afw) {
         first_generated.composition_images = completed_afw->submission->composition_images;
         current_generated.composition_images = completed_afw->submission->composition_images;
@@ -12342,8 +12370,9 @@ XrResult layer_end_frame_impl(
       generated_release_value = state->app_release_counter; }
     first_generated.app_release_value = generated_release_value;
     current_generated.app_release_value = generated_release_value;
+    extra_generated.app_release_value = generated_release_value;
     first_generated.synthetic = pair_ready;
-    std::shared_ptr<GeneratedFrameEndInfo> presenter_current_frame;
+    std::shared_ptr<GeneratedFrameEndInfo> presenter_current_frame,presenter_extra_frame;
     if (use_continuous_presenter &&
         (prepared.kind == PreparedGenerationKind::prime || pair_ready)) {
         presenter_first_frame =
@@ -12351,9 +12380,10 @@ XrResult layer_end_frame_impl(
         if (pair_ready) {
             presenter_current_frame =
                 make_presenter_owned_frame(std::move(current_generated));
+            if(extra_ready) presenter_extra_frame=make_presenter_owned_frame(std::move(extra_generated));
         }
         if (!presenter_first_frame ||
-            (pair_ready && !presenter_current_frame)) {
+            (pair_ready && !presenter_current_frame) || (extra_ready && !presenter_extra_frame)) {
             presenter_first_frame.reset();
             presenter_current_frame.reset();
             submitted_end_info = end_info;
@@ -12373,15 +12403,18 @@ XrResult layer_end_frame_impl(
                 if (XR_SUCCEEDED(owned) && presenter_current_frame) {
                     // HUD is identical on S/B: one owned snapshot shared by
                     // both entries, not two full-resolution copies per pair.
-                    auto& current = *presenter_current_frame;
-                    current.composition_layers = presenter_first_frame->composition_layers;
-                    current.composition_images = presenter_first_frame->composition_images;
-                    std::size_t auxiliary = 0;
-                    for (std::size_t index = 0; index < current.layer_pointers.size(); ++index) {
-                        const bool projection = std::any_of(current.projections.begin(), current.projections.end(),
-                            [index](const auto& layer) { return layer.layer_index == index; });
-                        if (!projection)
-                            current.layer_pointers[index] = composition_layer_header(current.composition_layers.at(auxiliary++));
+                    for(auto& owned:{presenter_current_frame,presenter_extra_frame}) {
+                        if(!owned) continue;
+                        auto& current=*owned;
+                        current.composition_layers = presenter_first_frame->composition_layers;
+                        current.composition_images = presenter_first_frame->composition_images;
+                        std::size_t auxiliary = 0;
+                        for (std::size_t index = 0; index < current.layer_pointers.size(); ++index) {
+                            const bool projection = std::any_of(current.projections.begin(), current.projections.end(),
+                                [index](const auto& layer) { return layer.layer_index == index; });
+                            if (!projection)
+                                current.layer_pointers[index] = composition_layer_header(current.composition_layers.at(auxiliary++));
+                        }
                     }
                 }
                 if (XR_FAILED(owned)) {
@@ -12446,7 +12479,7 @@ XrResult layer_end_frame_impl(
             result = enqueue_presenter_pair(
                 state,
                 presenter_first_frame,
-                presenter_current_frame);
+                presenter_current_frame,presenter_extra_frame);
             if (presenter_content_lock.owns_lock()) {
                 presenter_content_lock.unlock();
             }
@@ -12669,8 +12702,16 @@ XrResult layer_end_frame_impl(
         state->runtime_frame_waited_unbegun = false;
         state->application_begin_needs_wait = true;
     }
+    if(extra_ready) {
+        const auto middle_cycle=submit_current_cycle(state,extra_generated.info,frame_serial,&prepared,
+            adopted_frame,&extra_generated,true);
+        if(!middle_cycle.completed || XR_FAILED(middle_cycle.result)) {
+            clear_generation_continuity(state); return middle_cycle.result;
+        }
+        adopted_frame.reset();
+    }
     const InternalCycleResult current_cycle =
-        submit_current_cycle(state, current_generated.info, frame_serial, &prepared, adopted_frame);
+        submit_current_cycle(state, current_generated.info, frame_serial, &prepared, adopted_frame,&current_generated);
     // How far apart the runtime actually received the two frames of this
     // pair: from the synthetic's hand-over completing to the real frame's.
     const auto inline_pair_gap = std::chrono::steady_clock::now() -

@@ -31,6 +31,7 @@ bool legacy_early_current{};
 bool midpoint_cadence{};
 bool deep_readiness{};
 bool triple_core{};
+bool triple_inline{};
 bool fsr_queue_gpu_pending{};
 ComPtr<ID3D12Fence> fsr_gpu_gate;
 std::jthread fsr_gpu_watchdog;
@@ -282,7 +283,9 @@ int main(int argc,char** argv) {
         deep_readiness=argc>1 && std::string_view(argv[1])=="deep-readiness";
         s->djules_deep_pipeline=deep_readiness;
         triple_core=argc>1 && std::string_view(argv[1])=="triple-core";
-        s->djules_triple_requested=triple_core;
+        triple_inline=argc>1 && std::string_view(argv[1])=="triple-inline";
+        s->djules_triple_requested=triple_core||triple_inline;
+        if(triple_inline) { dispatch->virtual_desktop_runtime=true; dispatch->inline_unless_pipelined=true; }
 #endif
         fsr_test=argc>1 && std::string_view(argv[1]).starts_with("fsr-");
         legacy_queue=argc>1 && std::string_view(argv[1]).starts_with("legacy-queue");
@@ -360,7 +363,7 @@ int main(int argc,char** argv) {
         s->last_inline_frame_state.predictedDisplayTime=runtime_time;s->last_inline_frame_state.shouldRender=XR_TRUE;s->last_inline_frame_state_valid=true;
         if(fsr_test) require(!three_slot_generation_session(s),
             "FSR was admitted to the three-slot director");
-        if(!promotion_test && !fsr_test && !legacy_queue) {
+        if(!promotion_test && !fsr_test && !legacy_queue && !triple_inline) {
             require(start_continuous_presenter(s,nullptr,false),"promotion");
             require(s->three_slot_director && s->synthesis_thread.joinable(),"native did not enter three lanes");
         }
@@ -391,11 +394,14 @@ int main(int argc,char** argv) {
             // Legacy's first prime is inline with borrowed auxiliary images;
             // poisoning those before its synchronous End violates that input
             // contract. Once queued, poison the dynamic HUD to test ownership.
-            fill(dynamic->enumerated_d3d12_images[0].Get(),n,60);release(dynamic,!legacy_queue || n>1);
-            if(n==1){fill(fixed->enumerated_d3d12_images[0].Get(),55,120);release(fixed,!legacy_queue);}
+            // Inline submissions borrow the application's released auxiliary
+            // image until synchronous End; only asynchronous consumers require
+            // an independently retained release capture.
+            fill(dynamic->enumerated_d3d12_images[0].Get(),n,60);release(dynamic,!triple_inline && (!legacy_queue || n>1));
+            if(n==1){fill(fixed->enumerated_d3d12_images[0].Get(),55,120);release(fixed,!triple_inline && !legacy_queue);}
             XrFrameState prediction{XR_TYPE_FRAME_STATE};
             require(XR_SUCCEEDED(layer_wait_frame_impl(s->handle,nullptr,&prediction)),"producer wait");
-            require(prediction.predictedDisplayPeriod==(triple_core?24999999 : legacy_queue && n>1 ? 16666666 : 8333333),"advertised period");
+            require(prediction.predictedDisplayPeriod==((triple_core||triple_inline)?24999999 : legacy_queue && n>1 ? 16666666 : 8333333),"advertised period");
             require(XR_SUCCEEDED(layer_begin_frame_impl(s->handle,nullptr)),"producer begin");
             if(fsr_queue_gpu_pending && n==3) {
                 require(XR_SUCCEEDED(wait_for_presenter_idle(s)), "pending GPU test drain");
@@ -421,7 +427,7 @@ int main(int argc,char** argv) {
                 reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[0]),reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[1])};
             XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=prediction.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
             end.layerCount=promotion_test && !s->three_slot_director ? 1 : 3;end.layers=layers;
-            const unsigned independence_frame=(fsr_test || legacy_queue) ? 0 : promotion_test ? 5 : 2;
+            const unsigned independence_frame=(fsr_test || legacy_queue || triple_inline) ? 0 : promotion_test ? 5 : 2;
             if(n==independence_frame){hr(s->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&blocked_synthesis)),"test gate");
                 hr(s->d3d12_synthesis_queue->Wait(blocked_synthesis.Get(),1),"block synthesis");}
             require(XR_SUCCEEDED(layer_end_frame_impl(s->handle,&end)),"actual EndFrame");
@@ -502,7 +508,7 @@ int main(int argc,char** argv) {
             require(submissions.size()==fresh.size()+repeats,"deep physical output accounting");
             submissions=std::move(fresh);
         }
-        const unsigned expected_count=triple_core?22:fsr_queue_switch ? 16 : fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
+        const unsigned expected_count=(triple_core||triple_inline)?22:fsr_queue_switch ? 16 : fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
         require(submissions.size()==expected_count && waits==expected_count+repeats && begins==expected_count+repeats && ends==expected_count+repeats,"unique output/cycle count");
         if(fsr_missing) {
             for(unsigned i=0;i<8;++i) require(submissions[i]==std::pair<unsigned,bool>{i+1,false},"FSR missing guide repeated/lost real");
@@ -522,7 +528,7 @@ int main(int argc,char** argv) {
                     ++next_real;
                 } else require(submissions[i].second,"promotion synthetic order");
             }
-        } else if(triple_core) {
+        } else if(triple_core||triple_inline) {
             for(unsigned i=0;i<7;++i) {
                 require(submissions[3*i]==std::pair<unsigned,bool>{i+1,false},"3X real order");
                 require(submissions[3*i+1]==std::pair<unsigned,bool>{i+2,true} &&
