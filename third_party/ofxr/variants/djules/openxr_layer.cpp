@@ -736,6 +736,10 @@ struct SessionState {
     bool nvidia_new_route{};
     bool djules_deep_pipeline{};
     bool djules_triple_requested{};
+    bool djules_triple_switchable{};
+    std::chrono::steady_clock::time_point djules_triple_poll{};
+    std::optional<bool> djules_triple_candidate;
+
     bool dlss_motion_vectors{};
     xrfg::D3D12FrameGenerationMode frame_generation_mode{};
     // Luke AFW capability is independent of the currently selected AFW mode.
@@ -4163,6 +4167,7 @@ XrResult layer_create_session_impl(
     state->optical_flow_backend = initial_control.desired.backend == 0
         ? xrfg::D3D12OpticalFlowBackend::fidelity_fx : xrfg::D3D12OpticalFlowBackend::nvidia;
     state->nvidia_new_route = initial_control.desired.backend == 2;
+    state->djules_triple_switchable=true;
     state->djules_triple_requested=GetPrivateProfileIntW(L"ofxr",L"triple_frame_gen",0,
         (current_layer_directory()/L"ofxr_bridge.ini").c_str())==1;
     state->djules_deep_pipeline = GetPrivateProfileIntW(L"ofxr",L"deep_pipeline",1,
@@ -8089,7 +8094,7 @@ void stop_continuous_presenter(
 void wait_for_presenter_pair(
     const std::shared_ptr<SessionState>& state) noexcept {
     try {
-        constexpr std::uint64_t kPresenterFramesPerPair = 2;
+        const std::uint64_t kPresenterFramesPerPair = djules_triple_active(*state)?3:2;
         const auto entered = std::chrono::steady_clock::now();
         std::unique_lock lock(state->presenter_mutex);
         state->presenter_condition.wait(lock, [&] {
@@ -11149,6 +11154,42 @@ HRESULT reconcile_depth_history_for_route(SwapchainState& chain) {
     return result;
 }
 
+// Frame-call ownership is held. Drain exact old descriptors before changing
+// buffer shape; reserved staging capacity covers both multipliers.
+[[nodiscard]] XrResult switch_djules_multiplier(const std::shared_ptr<SessionState>& state,bool target) {
+    if(target==state->djules_triple_requested) return XR_SUCCESS;
+    if(continuous_presenter_active(state)) {
+        const auto result=wait_for_presenter_idle(state);
+        if(XR_FAILED(result)) return result;
+    }
+    clear_generation_continuity(state);
+    {
+        std::scoped_lock content(state->presenter_content_mutex);
+        std::scoped_lock lock(state->presenter_mutex);
+        state->djules_triple_requested=target;
+        state->three_slots.configure(djules_triple_director(*state)?3:2);
+        state->application_served_serial=state->presenter_frame_serial;
+        state->presenter_last_frame.reset();
+    }
+    if(state->fps_overlay) state->fps_overlay->reset_metrics();
+    xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::presenter_transition,
+        700,target?3:2,state->djules_deep_pipeline && !target,2);
+    return XR_SUCCESS;
+}
+
+void poll_djules_multiplier(const std::shared_ptr<SessionState>& state) {
+    if(!state->djules_triple_switchable || !djules_native_scheduler(*state)) return;
+    const auto now=std::chrono::steady_clock::now();
+    if(now<state->djules_triple_poll) return;
+    state->djules_triple_poll=now+std::chrono::milliseconds(250);
+    const bool target=GetPrivateProfileIntW(L"ofxr",L"triple_frame_gen",0,
+        (current_layer_directory()/L"ofxr.ini").c_str())!=0;
+    // Two matching observations avoid acting on a partially rewritten INI.
+    if(state->djules_triple_candidate && *state->djules_triple_candidate==target)
+        static_cast<void>(switch_djules_multiplier(state,target));
+    state->djules_triple_candidate=target;
+}
+
 // Called with frame ownership and presenter content excluded. No GUI thread
 // touches GPU objects; no new captures may enter during this transaction.
 void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
@@ -11292,6 +11333,9 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
     state->control_revision = control.revision;
     state->control_reconfigure_required = FAILED(result);
     state->menu_enabled = SUCCEEDED(result) && control.desired.enabled;
+    { std::scoped_lock lock(state->presenter_mutex);
+      state->three_slots.configure(djules_triple_director(*state)?3:2); }
+
     if (state->fps_overlay) state->fps_overlay->reset_metrics();
     xrfg::embedded::applied(state->control_id, control.revision, state->menu_enabled, result);
     xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::embedded_configuration,
@@ -11637,6 +11681,7 @@ XrResult layer_end_frame_impl(
     };
 
     apply_embedded_control(state);
+    poll_djules_multiplier(state);
     const auto afw_control = xrfg::embedded::afw_snapshot();
     const bool afw_selected = state->luke_afw_enabled &&
         afw_control.desired.mode != 0;

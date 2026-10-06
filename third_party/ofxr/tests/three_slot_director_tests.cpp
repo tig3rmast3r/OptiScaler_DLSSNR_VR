@@ -1480,6 +1480,11 @@ int main(int argc, char** argv) {
         check(std::abs(synthetic_interpolation_fraction(timing,a,b)-1.0F/3.0F)<0.0001F,"invalid cadence fallback");
         timing->nvidia_new_route=false;
         check(synthetic_interpolation_fraction(timing,a,b)==0.5F,"reference fraction changed");
+        timing->nvidia_new_route=true; timing->three_slot_director=true;
+        check(XR_SUCCEEDED(switch_djules_multiplier(timing,false)),"switch 2X");
+        check(!timing->djules_triple_requested && timing->three_slots.empty(),"2X shape reset");
+        check(XR_SUCCEEDED(switch_djules_multiplier(timing,true)),"switch 3X");
+        check(timing->djules_triple_requested && timing->three_slots.empty(),"3X shape reset");
     }
 #endif
     auto state = session();
