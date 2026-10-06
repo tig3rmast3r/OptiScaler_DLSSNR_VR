@@ -469,6 +469,7 @@ struct SessionState {
     bool pipelined_presenter_mode{};
     bool pipelined_presenter_start_requested{};
     bool presenter_start_requested{};
+    bool single_threaded_d3d11{}; // D08: runtime calls cannot move to another thread.
     XrFrameState last_inline_frame_state{XR_TYPE_FRAME_STATE};
     bool last_inline_frame_state_valid{};
     std::mutex mutex;
@@ -1362,6 +1363,10 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
 void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept;
 [[nodiscard]] XrResult wait_for_synthesis_handoff(
     const std::shared_ptr<SessionState>& state) noexcept;
+
+[[nodiscard]] bool presenter_forbidden(const SessionState& state) noexcept {
+    return state.graphics_binding == SessionGraphicsBinding::d3d11 && state.single_threaded_d3d11;
+}
 
 [[nodiscard]] bool start_continuous_presenter(
     const std::shared_ptr<SessionState>& state,
@@ -3088,6 +3093,10 @@ XrResult layer_create_session_impl(
                 binding_structure_type = next->type;
                 state->d3d11_device = binding->device;
                 if (state->d3d11_device) {
+                    if ((state->d3d11_device->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED) != 0) {
+                        state->single_threaded_d3d11 = true;
+                        state->graphics_binding_capabilities |= 32ULL;
+                    }
                     state->d3d11_device->GetImmediateContext(
                         state->d3d11_context.ReleaseAndGetAddressOf());
                     Microsoft::WRL::ComPtr<ID3D11Device5> device5;
@@ -3433,7 +3442,7 @@ XrResult layer_wait_frame_impl(
             state->application_frame_has_overlapping_wait = true;
             ++state->pipelined_wait_streak;
         }
-        if (!state->luke_afw_enabled && state->pipelined_wait_streak >= 2 &&
+        if (!presenter_forbidden(*state) && !state->luke_afw_enabled && state->pipelined_wait_streak >= 2 &&
             state->last_inline_frame_state_valid) {
             // The current runtime frame is still owned by the render thread,
             // so the transition cannot start its presenter until xrEndFrame
@@ -6184,6 +6193,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
     std::shared_ptr<GeneratedFrameEndInfo> seed_frame,
     bool preserve_virtual_timeline) noexcept {
     try {
+        if (presenter_forbidden(*state)) return false;
         std::scoped_lock lock(state->presenter_mutex);
         if (state->presenter_active) {
             return true;
@@ -6317,7 +6327,7 @@ void stop_continuous_presenter(
 
 [[nodiscard]] bool three_slot_generation_session(
     const std::shared_ptr<SessionState>& state) noexcept {
-    return state->menu_enabled && state->frame_generation_mode !=
+    return !presenter_forbidden(*state) && state->menu_enabled && state->frame_generation_mode !=
                xrfg::D3D12FrameGenerationMode::fsr3 &&
            state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
            state->nvidia_new_route &&
@@ -6333,7 +6343,7 @@ void stop_continuous_presenter(
 }
 
 [[nodiscard]] bool queued_nvidia_session(const std::shared_ptr<SessionState>& state) noexcept {
-    return !state->luke_afw_enabled && state->menu_enabled &&
+    return !presenter_forbidden(*state) && !state->luke_afw_enabled && state->menu_enabled &&
         state->frame_generation_mode == xrfg::D3D12FrameGenerationMode::ofxr &&
         state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
         !three_slot_generation_session(state) &&
@@ -10682,7 +10692,7 @@ XrResult layer_end_frame_impl(
         // discarded before presentation or repeated by the new scheduler.
         const XrResult start_result = start_requested_pipelined_presenter(nullptr);
         return XR_FAILED(start_result) ? start_result : result;
-    } else if (state->frame_generation_mode !=
+    } else if (!presenter_forbidden(*state) && state->frame_generation_mode !=
                    xrfg::D3D12FrameGenerationMode::fsr3 &&
                (three_slot_generation_session(state) ||
                 steamvr_wait_requires_continuous_presenter(
