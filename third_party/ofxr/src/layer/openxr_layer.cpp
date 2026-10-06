@@ -470,6 +470,9 @@ struct SessionState {
     bool pipelined_presenter_start_requested{};
     bool presenter_start_requested{};
     bool single_threaded_d3d11{}; // D08: runtime calls cannot move to another thread.
+    bool split_frame_loop{}; // D09: targeted direct-D3D11 driver workaround.
+    DWORD application_wait_thread_id{};
+    DWORD application_end_thread_id{};
     XrFrameState last_inline_frame_state{XR_TYPE_FRAME_STATE};
     bool last_inline_frame_state_valid{};
     std::mutex mutex;
@@ -1365,7 +1368,22 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept;
     const std::shared_ptr<SessionState>& state) noexcept;
 
 [[nodiscard]] bool presenter_forbidden(const SessionState& state) noexcept {
-    return state.graphics_binding == SessionGraphicsBinding::d3d11 && state.single_threaded_d3d11;
+    return state.graphics_binding == SessionGraphicsBinding::d3d11 &&
+        (state.single_threaded_d3d11 || state.split_frame_loop);
+}
+
+// frame_call_mutex protects the application thread shape. Observe the first
+// EndFrame too, so a split loop cannot promote before its next application Wait.
+void observe_application_frame_thread(SessionState& state, bool ending) noexcept {
+    auto& id = ending ? state.application_end_thread_id : state.application_wait_thread_id;
+    id = GetCurrentThreadId();
+    if (!state.split_frame_loop && state.application_wait_thread_id && state.application_end_thread_id &&
+        state.application_wait_thread_id != state.application_end_thread_id) {
+        state.split_frame_loop = true;
+        xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::presenter_transition,
+            600, state.application_wait_thread_id, state.application_end_thread_id,
+            static_cast<std::uint64_t>(state.graphics_binding));
+    }
 }
 
 [[nodiscard]] bool start_continuous_presenter(
@@ -3287,6 +3305,8 @@ void reset_frame_bookkeeping(const std::shared_ptr<SessionState>& state) {
         state->pipelined_presenter_mode = false;
         state->pipelined_presenter_start_requested = false;
         state->presenter_start_requested = false;
+        state->split_frame_loop = false;
+        state->application_wait_thread_id = state->application_end_thread_id = 0;
         state->last_inline_frame_state = XrFrameState{XR_TYPE_FRAME_STATE};
         state->last_inline_frame_state_valid = false;
         state->generation_steady_state_established = false;
@@ -3428,6 +3448,7 @@ XrResult layer_wait_frame_impl(
     state->frame_call_condition.wait(frame_call_lock, [&] {
         return !state->application_wait_pending_begin;
     });
+    observe_application_frame_thread(*state, false);
     XrResult result = XR_SUCCESS;
     const bool use_continuous_presenter = continuous_presenter_active(state);
     const bool adaptive_nvidia_presenter = use_continuous_presenter &&
@@ -9593,6 +9614,11 @@ XrResult layer_end_frame_impl(
 
     // The inline second cycle releases this lock before the next app wait.
     std::unique_lock frame_call_lock(state->frame_call_mutex);
+    observe_application_frame_thread(*state, true);
+    if (presenter_forbidden(*state)) {
+        state->pipelined_presenter_start_requested = state->presenter_start_requested = false;
+        state->pipelined_presenter_mode = false;
+    }
     const auto application_end_now = std::chrono::steady_clock::now();
     const bool frame_had_overlapping_wait =
         state->application_frame_has_overlapping_wait;
@@ -9694,6 +9720,18 @@ XrResult layer_end_frame_impl(
         }
         return wait_for_presenter_submission(state, request);
     };
+    if (presenter_forbidden(*state) && use_continuous_presenter) {
+        // A loop may change threads after promotion. Finish this virtual app
+        // frame through its existing physical owner before draining that owner;
+        // a direct downstream EndFrame here would have no matching BeginFrame.
+        const auto result = submit_borrowed_to_presenter();
+        if (XR_SUCCEEDED(result) && end_info)
+            consume_application_frame(state, end_info->displayTime,
+                consume_in_submission_order, match_latest_by_submission);
+        stop_continuous_presenter(state);
+        clear_generation_continuity(state);
+        return result;
+    }
     const auto start_requested_pipelined_presenter =
         [&](std::shared_ptr<GeneratedFrameEndInfo> seed_frame) -> XrResult {
             if (!pipelined_presenter_start_requested) {
