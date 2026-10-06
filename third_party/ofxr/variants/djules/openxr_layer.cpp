@@ -1117,6 +1117,37 @@ void drain_binding_queue(SessionState* state) noexcept {
 }
 
 
+// D26's absolute display grid: loop cost never compounds into the period.
+// After a slow handover, skip whole slots to retain a quarter-period lead,
+// rather than submitting a catch-up burst (final upstream V427 policy).
+class DjulesAbsoluteSchedule {
+public:
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point claim(Clock::time_point now, std::chrono::nanoseconds period) noexcept {
+        if (!valid_ || period != period_) next_ = now;
+        period_ = period;
+        valid_ = period > std::chrono::nanoseconds::zero();
+        return next_;
+    }
+    void submitted(Clock::time_point slot, std::chrono::nanoseconds period,
+        Clock::time_point returned) noexcept {
+        valid_ = period > std::chrono::nanoseconds::zero();
+        period_ = period;
+        if (!valid_) { next_ = returned; return; }
+        next_ = slot + period;
+        const auto earliest = returned + period / 4;
+        if (next_ < earliest) {
+            const auto behind = std::chrono::duration_cast<std::chrono::nanoseconds>(earliest - next_).count();
+            const auto slots = (behind + period.count() - 1) / period.count();
+            next_ += period * slots;
+        }
+    }
+private:
+    Clock::time_point next_{};
+    std::chrono::nanoseconds period_{};
+    bool valid_{};
+};
+
 [[nodiscard]] bool djules_native_scheduler(const SessionState& state) noexcept {
     return state.nvidia_new_route && !state.luke_afw_enabled &&
         state.frame_generation_mode == xrfg::D3D12FrameGenerationMode::ofxr &&
@@ -7458,6 +7489,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
         xrfg::TwoOutputSchedule fsr_schedule;
         xrfg::TwoOutputSchedule director_schedule;
         xrfg::MidpointSchedule midpoint_schedule;
+    DjulesAbsoluteSchedule djules_schedule;
         for (;;) {
             std::shared_ptr<ThreeSlotFrame> selected;
             std::shared_ptr<PresenterSubmission> borrowed;
@@ -7544,7 +7576,9 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             {
                 const auto period = std::chrono::nanoseconds(state->presenter_display_period);
                 const auto now = std::chrono::steady_clock::now();
-                if (state->three_slot_director)
+                if (state->three_slot_director && djules_native_scheduler(*state))
+                    submission_slot = djules_schedule.claim(now, period);
+                else if (state->three_slot_director)
                     submission_slot = midpoint_schedule.claim(now, period, synthetic);
                 else {
                     auto& schedule = state->fsr_two_slot_presenter ? fsr_schedule : director_schedule;
@@ -7621,6 +7655,9 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             if (state->fsr_two_slot_presenter)
                 fsr_schedule.submitted(submission_slot, std::chrono::nanoseconds(state->presenter_display_period),
                     std::chrono::steady_clock::now());
+            else if (state->three_slot_director && djules_native_scheduler(*state))
+                djules_schedule.submitted(submission_slot,
+                    std::chrono::nanoseconds(state->presenter_display_period), std::chrono::steady_clock::now());
             else if (state->three_slot_director)
                 midpoint_schedule.submitted(submission_slot,
                     std::chrono::nanoseconds(state->presenter_display_period));

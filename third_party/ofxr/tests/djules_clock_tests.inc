@@ -1,4 +1,29 @@
 #ifdef OFXR_DJULES_COMPARISON
+void djules_absolute_grid_test() {
+    using namespace std::chrono;
+    DjulesAbsoluteSchedule grid;
+    const auto origin = steady_clock::time_point(milliseconds(1000));
+    const auto period = nanoseconds(milliseconds(10));
+    check(grid.claim(origin, period) == origin, "absolute grid seed");
+    grid.submitted(origin, period, origin + milliseconds(1));
+    check(grid.claim(origin + milliseconds(9), period) == origin + milliseconds(10),
+        "handover loop cost compounded into next slot");
+    check(grid.claim(origin + milliseconds(11), period) == origin + milliseconds(10),
+        "ordinary late synthetic reset the absolute grid");
+    grid.submitted(origin + milliseconds(10), period, origin + milliseconds(25));
+    check(grid.claim(origin + milliseconds(26), period) == origin + milliseconds(30),
+        "slow handover did not skip to an aligned slot with quarter-period lead");
+    grid.submitted(origin + milliseconds(30), period, origin + seconds(2));
+    check(grid.claim(origin + seconds(2), period) == origin + milliseconds(2010),
+        "long stall produced catch-up burst or lost absolute phase");
+    check(grid.claim(origin + seconds(2), nanoseconds(milliseconds(12))) == origin + seconds(2),
+        "actual refresh mode change did not reseed grid");
+    grid.submitted(origin, nanoseconds::zero(), origin + milliseconds(1));
+    check(grid.claim(origin + milliseconds(2), nanoseconds::zero()) == origin + milliseconds(2),
+        "invalid period divided by zero or retained stale deadline");
+    std::cout << "Djules absolute grid: fixed slots, loop jitter, aligned stall recovery and no catch-up burst\n";
+}
+
 void djules_display_clock_test() {
     auto s = session();
     s->presenter_active = false;
