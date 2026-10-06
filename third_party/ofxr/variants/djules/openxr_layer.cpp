@@ -1117,6 +1117,20 @@ void drain_binding_queue(SessionState* state) noexcept {
 }
 
 
+// Final upstream phase acquisition: absolute remaining-time error, one
+// quarter per real frame, 250us dead band, half-period maximum correction.
+// Folding into one period would hide the compositor's extra-interval failure.
+[[nodiscard]] std::chrono::nanoseconds calculate_djules_phase_step(
+    std::optional<std::chrono::nanoseconds> left,
+    std::chrono::nanoseconds period) noexcept {
+    if (!left || period <= std::chrono::nanoseconds::zero()) return {};
+    constexpr auto target = std::chrono::nanoseconds(3'000'000);
+    constexpr auto dead_band = std::chrono::nanoseconds(250'000);
+    const auto error = *left - target;
+    if (error >= -dead_band && error <= dead_band) return {};
+    return std::clamp(error / 4, -period / 2, period / 2);
+}
+
 // D26's absolute display grid: loop cost never compounds into the period.
 // After a slow handover, skip whole slots to retain a quarter-period lead,
 // rather than submitting a catch-up burst (final upstream V427 policy).
@@ -1130,11 +1144,11 @@ public:
         return next_;
     }
     void submitted(Clock::time_point slot, std::chrono::nanoseconds period,
-        Clock::time_point returned) noexcept {
+        Clock::time_point returned, std::chrono::nanoseconds phase_step = {}) noexcept {
         valid_ = period > std::chrono::nanoseconds::zero();
         period_ = period;
         if (!valid_) { next_ = returned; return; }
-        next_ = slot + period;
+        next_ = slot + period + phase_step;
         const auto earliest = returned + period / 4;
         if (next_ < earliest) {
             const auto behind = std::chrono::duration_cast<std::chrono::nanoseconds>(earliest - next_).count();
@@ -1173,6 +1187,20 @@ private:
 void refresh_djules_display_period(const std::shared_ptr<SessionState>& state) noexcept {
     if (!djules_native_scheduler(*state) || !state->dispatch->steamvr_runtime || !state->steamvr_delivery) return;
     static_cast<void>(adopt_djules_display_period(*state, state->steamvr_delivery->display_period()));
+}
+
+[[nodiscard]] std::chrono::nanoseconds sample_djules_phase_step(
+    const std::shared_ptr<SessionState>& state, bool fresh_real,
+    std::uint64_t sequence) noexcept {
+    if (!fresh_real || !state->menu_enabled || !djules_native_scheduler(*state) ||
+        !state->dispatch->steamvr_runtime || !state->steamvr_delivery) return {};
+    const auto left = state->steamvr_delivery->frame_time_remaining();
+    const auto period = std::chrono::nanoseconds(state->presenter_display_period);
+    const auto step = calculate_djules_phase_step(left, period);
+    if (left) xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::presenter_clock_anchor,
+        27, sequence, static_cast<std::uint64_t>(left->count() - 3'000'000),
+        static_cast<std::uint64_t>(step.count()));
+    return step;
 }
 
 // Observer only: compositor records never feed this variant's pacing policy.
@@ -7613,6 +7641,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             token = xrfg::bridge_flight_logger().begin(
                 xrfg::BridgeFlightOperation::internal_end_frame, handle_value(state->handle),
                 end.displayTime, end.layerCount);
+            std::chrono::nanoseconds phase_step{};
             {
                 std::scoped_lock content_lock(state->presenter_content_mutex);
                 result = with_runtime_entry(state, [&] {
@@ -7632,6 +7661,8 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
                     join_runtime_queue_to_application(state.get(), selected
                         ? selected->frame->app_release_value
                         : borrowed->owned_frame ? borrowed->owned_frame->app_release_value : borrowed->app_release_value);
+                    phase_step = sample_djules_phase_step(state, selected && !synthetic,
+                        selected ? selected->source_sequence : 0);
                     return state->fps_overlay ? state->fps_overlay->end_frame(&end, synthetic)
                         : state->dispatch->end_frame(state->handle, &end);
                 });
@@ -7657,7 +7688,8 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
                     std::chrono::steady_clock::now());
             else if (state->three_slot_director && djules_native_scheduler(*state))
                 djules_schedule.submitted(submission_slot,
-                    std::chrono::nanoseconds(state->presenter_display_period), std::chrono::steady_clock::now());
+                    std::chrono::nanoseconds(state->presenter_display_period), std::chrono::steady_clock::now(),
+                    XR_SUCCEEDED(result) ? phase_step : std::chrono::nanoseconds{});
             else if (state->three_slot_director)
                 midpoint_schedule.submitted(submission_slot,
                     std::chrono::nanoseconds(state->presenter_display_period));

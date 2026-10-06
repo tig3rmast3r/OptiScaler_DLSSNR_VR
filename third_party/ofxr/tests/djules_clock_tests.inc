@@ -1,4 +1,29 @@
 #ifdef OFXR_DJULES_COMPARISON
+void djules_phase_acquisition_test() {
+    using namespace std::chrono;
+    const auto period = nanoseconds(11'111'111);
+    check(calculate_djules_phase_step(nanoseconds(13'000'000), period) == nanoseconds(2'500'000),
+        "extra compositor interval was folded away or corrected in the wrong direction");
+    check(calculate_djules_phase_step(nanoseconds(2'000'000), period) == nanoseconds(-250'000),
+        "late submission was shifted later");
+    check(calculate_djules_phase_step(nanoseconds(3'250'000), period) == nanoseconds::zero() &&
+        calculate_djules_phase_step(nanoseconds(2'750'000), period) == nanoseconds::zero(),
+        "phase dead band caused continual jitter");
+    check(calculate_djules_phase_step(nanoseconds(100'000'000), period) == period / 2 &&
+        calculate_djules_phase_step(nanoseconds(-100'000'000), period) == -period / 2,
+        "absurd phase sample escaped half-period bound");
+    check(calculate_djules_phase_step(std::nullopt, period) == nanoseconds::zero() &&
+        calculate_djules_phase_step(nanoseconds(13'000'000), nanoseconds::zero()) == nanoseconds::zero(),
+        "unavailable/invalid clock moved phase");
+    DjulesAbsoluteSchedule grid;
+    const auto origin = steady_clock::time_point(milliseconds(1000));
+    const auto slot = grid.claim(origin, period);
+    grid.submitted(slot, period, origin + milliseconds(1), nanoseconds(2'500'000));
+    check(grid.claim(origin + milliseconds(2), period) == origin + period + nanoseconds(2'500'000),
+        "acquired phase was overwritten by next absolute-grid advance");
+    std::cout << "Djules phase: unwrapped error, real-frame acquisition law, dead band and bounded grid correction\n";
+}
+
 void djules_absolute_grid_test() {
     using namespace std::chrono;
     DjulesAbsoluteSchedule grid;

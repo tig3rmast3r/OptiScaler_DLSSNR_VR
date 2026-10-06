@@ -1493,6 +1493,7 @@ int main(int argc, char** argv) {
             if (mode == "binding-queue") { djules_binding_queue_test(); return 0; }
             if (mode == "display-clock") { djules_display_clock_test(); return 0; }
             if (mode == "absolute-grid") { djules_absolute_grid_test(); return 0; }
+            if (mode == "phase-acquisition") { djules_phase_acquisition_test(); return 0; }
 #endif
             if(mode == "depth-history") { depth_history_test(); return 0; }
             if(mode == "luke-afw-slot") { gpu_pipeline(true, false, false, false, false, true); return 0; }
