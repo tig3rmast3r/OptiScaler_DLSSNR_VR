@@ -4075,6 +4075,56 @@ void test_srgb_synthesis_preserves_brightness(
     }
 }
 
+
+#ifdef OFXR_DJULES_COMPARISON
+void test_djules_extra_output(D3D12WarpFixture& fixture) {
+    constexpr UINT width=256,height=128;
+    auto a=create_source_texture(fixture,width,height,DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto b=create_source_texture(fixture,width,height,DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto ca=create_source_texture(fixture,width,height,DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto cb=create_source_texture(fixture,width,height,DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto s1=create_source_texture(fixture,width,height,DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto s2=create_source_texture(fixture,width,height,DXGI_FORMAT_R8G8B8A8_UNORM);
+    std::array<ID3D12Resource*,2> inputs{a.Get(),b.Get()}, real{ca.Get(),cb.Get()}, outputs{s1.Get(),s2.Get()};
+    // Translate the same scene: a full-screen colour change is a cut and the
+    // surviving FidelityFX cut detector correctly returns current on both outputs.
+    const auto pa=translated_motion_pattern(width,height,{0,0});
+    const auto pb=translated_motion_pattern(width,height,{6,6});
+    const auto expected_first=translated_motion_pattern(width,height,{2,2});
+    const auto expected_second=translated_motion_pattern(width,height,{4,4});
+    upload_pattern(fixture,a.Get(),pa); upload_pattern(fixture,b.Get(),pb);
+    auto history=std::make_shared<xrfg::D3D12SwapchainHistory>();
+    require(operation_succeeded(history->initialize(fixture.device(),fixture.queue(),inputs,D3D12_RESOURCE_STATE_RENDER_TARGET)),"extra history");
+    xrfg::D3D12FrameSynthesizer synth;
+    require(operation_succeeded(synth.initialize(fixture.device(),fixture.queue(),history,real,outputs,
+        DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_STATE_RENDER_TARGET)),"extra initialize");
+    const auto views=make_reprojection_views();
+    xrfg::D3D12HistoryCaptureTicket ta{},tb{}; xrfg::D3D12FrameSynthesisTicket prime{},pair{};
+    require(operation_succeeded(history->capture(0,&ta))&&operation_succeeded(history->commit(ta))&&
+        operation_succeeded(synth.submit_prime(ta,views,0,&prime)),"extra prime");
+    require_frame_start_gate(synth,"extra prime fence");
+    require(operation_succeeded(history->capture(1,&tb))&&operation_succeeded(history->commit(tb)),"extra capture");
+    require(synth.submit_pair(tb,views,views,0,1,&pair,{}, {},false,1.0F/3.0F,{},
+        xrfg::D3D12ExtraSynthetic{0,2.0F/3.0F})==E_INVALIDARG,"same destination accepted");
+    require(operation_succeeded(synth.submit_pair(tb,views,views,0,1,&pair,{}, {},false,1.0F/3.0F,{},
+        xrfg::D3D12ExtraSynthetic{1,2.0F/3.0F})),"two-output pair");
+    require_frame_start_gate(synth,"two-output fence");
+    const auto first=readback_pattern(fixture,s1.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const auto second=readback_pattern(fixture,s2.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET);
+    require(readback_pattern(fixture,cb.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET)==pb,"3X real copy changed");
+    for(UINT eye=0;eye<kEyeCount;++eye) {
+        const auto a1=mean_absolute_rgb_error(first,expected_first,width,height,eye,16);
+        const auto a2=mean_absolute_rgb_error(first,expected_second,width,height,eye,16);
+        const auto b1=mean_absolute_rgb_error(second,expected_first,width,height,eye,16);
+        const auto b2=mean_absolute_rgb_error(second,expected_second,width,height,eye,16);
+        std::cout << "extra fractions eye=" << eye << " errors=" << a1 << ',' << a2 << ',' << b1 << ',' << b2 << '\n';
+        require(a1<a2 && b2<b1,"two outputs lost independent fractions");
+    }
+    fixture.require_no_debug_errors();
+    std::cout << "DJ extra GPU: two fractions, one pair fence, real identity, alias refusal\n";
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -4088,6 +4138,11 @@ int main(int argc, char** argv) {
         xrfg::bridge_flight_logger().initialize(trace_dir);
     }
     try {
+#ifdef OFXR_DJULES_COMPARISON
+        if (argc>1 && std::string_view(argv[1])=="djules-extra") {
+            D3D12WarpFixture fixture; test_djules_extra_output(fixture); return 0;
+        }
+#endif
         if (argc > 1 && std::string_view(argv[1]) == "protected-guides") {
             D3D12WarpFixture fixture;
             test_protected_guide_snapshots(fixture);

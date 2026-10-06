@@ -6041,7 +6041,9 @@ HRESULT D3D12FrameSynthesizer::submit_pair(
     std::shared_ptr<const DlssMotionVectorSet> motion_vectors,
     bool defer_current_copy,
     float interpolation_fraction,
-        D3D12PresentationTransform presentation_transform) noexcept {
+        D3D12PresentationTransform presentation_transform,
+    std::optional<D3D12ExtraSynthetic> extra_synthetic) noexcept {
+    if (extra_synthetic) { if (ticket) *ticket = {}; return E_NOTIMPL; }
     try {
         std::scoped_lock lock(mutex_);
         if (impl_ == nullptr) {

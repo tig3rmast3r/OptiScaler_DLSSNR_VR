@@ -150,6 +150,12 @@ struct D3D12NvidiaOpticalFlowOptions {
 // metadata. Translation remains depth-unaware. A repeated capture ticket is a
 // legal unchanged-resource input: each view reuses only its own retained mono
 // image while camera metadata advances. Submission calls never wait on the CPU.
+// D29: another output from the same optical-flow pair and completion fence.
+struct D3D12ExtraSynthetic {
+    std::uint32_t destination_index{};
+    float interpolation_fraction{0.5F};
+};
+
 class D3D12FrameSynthesizer final {
 public:
     D3D12FrameSynthesizer() noexcept;
@@ -210,7 +216,8 @@ public:
         // and the synthetic shown one period before the current frame.
         // Clamped internally; out-of-range values fall back to half.
         float interpolation_fraction = 0.5F,
-        D3D12PresentationTransform presentation_transform = {}) noexcept;
+        D3D12PresentationTransform presentation_transform = {},
+        std::optional<D3D12ExtraSynthetic> extra_synthetic = std::nullopt) noexcept;
 
     // Executes the current output's copy, which submit_pair records but
     // deliberately leaves unsubmitted. The synthetic frame is handed to the

@@ -875,6 +875,9 @@ if(WIN32 AND XRFG_BUILD_LAYER)
                 NOMINMAX
                 WIN32_LEAN_AND_MEAN)
         endif()
+        if(XRFG_COMPARISON_ROUTE STREQUAL "djules")
+            add_test(NAME xrfg_djules_extra_output_gpu COMMAND xrfg_d3d12_history_tests djules-extra)
+        endif()
         add_test(NAME xrfg_d3d12_history_tests COMMAND xrfg_d3d12_history_tests)
         add_test(NAME xrfg_luke_protected_guides COMMAND xrfg_d3d12_history_tests protected-guides)
 
