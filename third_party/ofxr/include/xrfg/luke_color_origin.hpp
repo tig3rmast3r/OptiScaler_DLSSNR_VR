@@ -2,6 +2,7 @@
 
 #include <d3d12.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -10,7 +11,7 @@
 #include <vector>
 
 namespace xrfg {
-// Compact one-band Manchester token: sync16 + token32 + CRC16.
+// Compact Manchester token: sync16 + token32 + CRC16. Spatial copies share ID.
 // Tokens are process-unique; the full publication stays in the guide registry.
 inline constexpr unsigned kLukeOriginBits = 64;
 inline constexpr unsigned kLukeOriginWidth = kLukeOriginBits * 4;
@@ -165,24 +166,44 @@ struct LukeColorOriginRect { unsigned x{}, y{}, width{}, height{}; };
 inline constexpr unsigned kLukeOriginHeight = 8;
 inline constexpr unsigned kLukeOriginMargin = 2;
 struct LukeColorOriginLayout {
-    LukeColorOriginRect band;
+    std::array<LukeColorOriginRect,8> bands{};
+    unsigned band_count{};
     LukeColorOriginRect scan;
 };
-// A final eye is an unscaled subrectangle of the producer output. Its crop
-// origin is in [0, output-color]; this common rectangle survives BOTH eyes
-// without guessing the eye-specific crop. No frame identity comes from geometry.
+// Cover every possible unscaled horizontal eye crop with complete, disjoint
+// copies of ONE token. A narrow common intersection need not contain a marker.
+// Geometry selects positions, never an eye, frame or alternate metadata source.
 inline bool compact_luke_origin_layout(unsigned output_width, unsigned output_height,
     unsigned color_width, unsigned color_height, LukeColorOriginLayout& layout) noexcept {
     layout = {};
-    if (!color_width || !color_height || color_width > output_width ||
-        color_height > output_height) return false;
+    if (!color_width || !color_height || output_width>16384 || output_height>8192 ||
+        color_width > output_width || color_height > output_height ||
+        color_width<kLukeOriginWidth+2*kLukeOriginMargin) return false;
     const unsigned dx = output_width - color_width, dy = output_height - color_height;
-    if (static_cast<std::uint64_t>(dx) + kLukeOriginWidth + 2 * kLukeOriginMargin > color_width ||
-        static_cast<std::uint64_t>(dy) + kLukeOriginHeight + 2 * kLukeOriginMargin > color_height)
+    if (static_cast<std::uint64_t>(dy) + kLukeOriginHeight + 2 * kLukeOriginMargin > color_height)
         return false;
-    layout.band = {dx + kLukeOriginMargin, dy + kLukeOriginMargin, kLukeOriginWidth, kLukeOriginHeight};
-    layout.scan = {0, 0, dx + kLukeOriginWidth + 2 * kLukeOriginMargin,
-        dy + kLukeOriginHeight + 2 * kLukeOriginMargin};
+    LukeColorOriginLayout candidate{};
+    const unsigned capacity=color_width-kLukeOriginWidth-2*kLukeOriginMargin;
+    unsigned x=std::min(dx,capacity)+kLukeOriginMargin,uncovered=0;
+    for(;;) {
+        if(candidate.band_count==candidate.bands.size()||
+            x+kLukeOriginWidth+kLukeOriginMargin>output_width)return false;
+        // A complete band survives crop starts in this inclusive interval.
+        const unsigned end=x+kLukeOriginWidth+kLukeOriginMargin;
+        const unsigned first=end>color_width?end-color_width:0;
+        const unsigned last=x-kLukeOriginMargin;
+        if(first>uncovered)return false; // Reject gaps; no inferred crop.
+        candidate.bands[candidate.band_count++]={x,dy+kLukeOriginMargin,kLukeOriginWidth,kLukeOriginHeight};
+        candidate.scan.width=std::min(color_width,end);
+        if(last>=dx)break;
+        uncovered=last+1;
+        // Next placement covers the remaining crop interval without overwriting
+        // any Manchester cell in the preceding copy.
+        x=std::max(std::min(dx,uncovered+capacity)+kLukeOriginMargin,
+            x+kLukeOriginWidth+2*kLukeOriginMargin);
+    }
+    candidate.scan.height=dy+kLukeOriginHeight+2*kLukeOriginMargin;
+    layout=candidate;
     return true;
 }
 // Geometry negotiation is independent of identity. The first consumer knows

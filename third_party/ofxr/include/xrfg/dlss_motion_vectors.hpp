@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <array>
 #include <memory>
+#include <optional>
 
 namespace xrfg {
 
@@ -55,6 +56,9 @@ struct DlssMotionVectorPublication {
     std::array<float, 16> camera_view_to_clip{};
     std::array<float, 16> camera_clip_to_view{};
     bool camera_matrices_valid{};
+    // Same-frame producer-declared raw motion camera/history. In-process only.
+    int raw_camera_motion_included{-1};
+    std::array<float, 16> raw_clip_to_previous_clip{}, raw_previous_clip_to_clip{};
     D3D12_RESOURCE_STATES output_resource_state{
         D3D12_RESOURCE_STATE_COMMON};
     bool snapshot_output{};
@@ -73,6 +77,15 @@ struct DlssMotionVectorPublication {
     bool camera_frame_token_valid{};
 };
 
+// Scalar native camera history: no retained older GPU resources or SL metadata.
+struct DlssNativeCameraHistory {
+    std::uint64_t stream{},epoch{},serial{},publication{};
+    std::uint32_t token{},motion_width{},motion_height{},output_width{},output_height{};
+    bool valid{},reset{},jittered{};
+    float jitter_x{},jitter_y{};
+    std::array<float,3> position{},right{},up{},forward{};
+    std::array<float,16> projection{},inverse_projection{};
+};
 struct DlssMotionVectorFrame {
     std::uint64_t stream{};
     std::uint64_t epoch{};
@@ -131,6 +144,8 @@ struct DlssMotionVectorFrame {
     std::array<float, 16> camera_view_to_clip{};
     std::array<float, 16> camera_clip_to_view{};
     bool camera_matrices_valid{};
+    int raw_camera_motion_included{-1};
+    std::array<float, 16> raw_clip_to_previous_clip{}, raw_previous_clip_to_clip{};
     // The snapshots are recorded into the producer command list.  The real
     // submission callback replaces the provisional queue with the queue that
     // actually executed that list and attaches a fence signalled immediately
@@ -139,10 +154,10 @@ struct DlssMotionVectorFrame {
     Microsoft::WRL::ComPtr<ID3D12Fence> producer_fence;
     Microsoft::WRL::ComPtr<ID3D12Device> producer_fence_device;
     std::uint64_t producer_fence_value{};
-    // Exact immediately preceding opposite-eye publication. AFW uses its
-    // camera to restore the earlier half of the same-eye temporal interval;
-    // its contaminated motion field is not sampled.
+    // Exact preceding opposite-eye publication, retained for identity and
+    // production-order unit calibration; never sample its raw motion field.
     std::shared_ptr<const DlssMotionVectorFrame> previous_opposite_guide;
+    std::optional<DlssNativeCameraHistory> previous_same_native_camera;
     // Calibrated same-time eye separation in the producer camera units.
     float calibrated_game_eye_baseline{};
     std::shared_ptr<DlssSnapshotRetention> motion_retention;
@@ -150,6 +165,14 @@ struct DlssMotionVectorFrame {
     std::uint32_t camera_frame_token{};
     bool camera_frame_token_valid{};
 };
+
+inline DlssNativeCameraHistory dlss_native_camera_history(const DlssMotionVectorFrame& f) noexcept {
+    return {f.stream,f.epoch,f.serial,f.publication,f.camera_frame_token,
+        f.motion_width,f.motion_height,f.output_width,f.output_height,
+        f.camera_frame_token_valid&&f.camera_data_valid&&f.camera_matrices_valid,
+        f.reset,f.jittered,f.jitter_x,f.jitter_y,f.camera_position,f.camera_right,
+        f.camera_up,f.camera_forward,f.camera_view_to_clip,f.camera_clip_to_view};
+}
 
 constexpr std::uint32_t kDlssMotionVectorEyeCount = 2;
 

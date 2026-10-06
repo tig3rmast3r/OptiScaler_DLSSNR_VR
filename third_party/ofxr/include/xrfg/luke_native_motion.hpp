@@ -1,0 +1,97 @@
+#pragma once
+#include "xrfg/dlss_motion_vectors.hpp"
+#include "xrfg/luke_motion_format.hpp"
+#include <cmath>
+#include <algorithm>
+
+namespace xrfg {
+struct LukeNativeMotionConstants {
+    std::array<std::uint32_t,2> source_base{},crop{};
+    std::array<float,2> extent{},scale{},jitter_difference{},padding{};
+    std::array<float,16> opposite{},same{};
+};
+static_assert(sizeof(LukeNativeMotionConstants)==44*sizeof(std::uint32_t));
+namespace native_motion_detail {
+using Matrix=std::array<std::array<double,4>,4>;
+inline Matrix matrix(const std::array<float,16>& values) noexcept {
+    Matrix m{};for(unsigned r=0;r<4;++r)for(unsigned c=0;c<4;++c)m[r][c]=values[c*4+r];return m;
+}
+inline Matrix multiply(const Matrix& a,const Matrix& b) noexcept {
+    Matrix m{};for(unsigned r=0;r<4;++r)for(unsigned c=0;c<4;++c)
+        for(unsigned k=0;k<4;++k)m[r][c]+=a[r][k]*b[k][c];return m;
+}
+inline bool inverse(Matrix a,Matrix& out) noexcept {
+    out={};for(unsigned i=0;i<4;++i)out[i][i]=1;
+    for(unsigned c=0;c<4;++c) {
+        unsigned pivot=c;for(unsigned r=c+1;r<4;++r)if(std::abs(a[r][c])>std::abs(a[pivot][c]))pivot=r;
+        if(!std::isfinite(a[pivot][c]) || std::abs(a[pivot][c])<1e-10)return false;
+        std::swap(a[c],a[pivot]);std::swap(out[c],out[pivot]);double d=a[c][c];
+        for(unsigned j=0;j<4;++j){a[c][j]/=d;out[c][j]/=d;}
+        for(unsigned r=0;r<4;++r)if(r!=c){d=a[r][c];for(unsigned j=0;j<4;++j){a[r][j]-=d*a[c][j];out[r][j]-=d*out[c][j];}}
+    }
+    return true;
+}
+inline bool transform(const DlssNativeCameraHistory& current,
+    const DlssNativeCameraHistory& target,std::array<float,16>& output) noexcept {
+    Matrix source{},destination{},to_target{};source[3][3]=destination[3][3]=1;
+    for(unsigned r=0;r<3;++r) {
+        source[r][0]=current.right[r];source[r][1]=current.up[r];source[r][2]=-current.forward[r];
+        destination[r][0]=target.right[r];destination[r][1]=target.up[r];destination[r][2]=-target.forward[r];
+        // Subtract world origins in double before rotation; no 2km float cancellation.
+        source[r][3]=double(current.position[r])-target.position[r];
+    }
+    if(!inverse(destination,to_target))return false;
+    const auto m=multiply(multiply(matrix(target.projection),multiply(to_target,source)),matrix(current.inverse_projection));
+    for(unsigned r=0;r<4;++r)for(unsigned c=0;c<4;++c) {
+        output[c*4+r]=static_cast<float>(m[r][c]);if(!std::isfinite(output[c*4+r]))return false;
+    }
+    return true;
+}
+}
+inline bool luke_native_motion_constants(const DlssMotionVectorFrame& guide,
+    unsigned crop_x,unsigned crop_y,LukeNativeMotionConstants& out,unsigned& failure) noexcept {
+    out={};failure=1;
+    if(!guide.previous_opposite_guide || !guide.previous_same_native_camera)return false;
+    const auto current=dlss_native_camera_history(guide);
+    const auto middle=dlss_native_camera_history(*guide.previous_opposite_guide);
+    const auto& older=*guide.previous_same_native_camera;
+    failure=2;
+    if(guide.serial<3 || !guide.stream || !guide.epoch || !guide.publication ||
+        middle.stream!=current.stream || older.stream!=current.stream ||
+        middle.epoch!=current.epoch || older.epoch!=current.epoch ||
+        middle.serial+1!=current.serial || older.serial+2!=current.serial ||
+        middle.publication+1!=current.publication || older.publication+2!=current.publication ||
+        guide.previous_serial!=older.serial)return false;
+    failure=3;
+    for(const auto* f:{&current,&middle,&older}) {
+        if(!f->valid || !f->token || f->reset || f->jittered ||
+            !std::isfinite(f->jitter_x) || !std::isfinite(f->jitter_y) ||
+            std::abs(f->projection[11]+1.F)>1e-5F)return false;
+        for(const auto* values:{&f->projection,&f->inverse_projection})
+            for(float v:*values)if(!std::isfinite(v))return false;
+        for(const auto* values:{&f->position,&f->right,&f->up,&f->forward})
+            for(float v:*values)if(!std::isfinite(v))return false;
+    }
+    auto next=[](std::uint32_t v){++v;return v?v:1;};
+    failure=4;if(next(older.token)!=middle.token || next(middle.token)!=current.token)return false;
+    failure=5;
+    if(!current.motion_width || !current.motion_height || guide.motion_width!=guide.depth_width ||
+        guide.motion_height!=guide.depth_height)return false;
+    for(const auto* f:{&middle,&older})if(f->motion_width!=current.motion_width || f->motion_height!=current.motion_height ||
+        f->output_width!=current.output_width || f->output_height!=current.output_height)return false;
+    failure=6;
+    if(!std::isfinite(guide.scale_x) || !std::isfinite(guide.scale_y) || !guide.scale_x || !guide.scale_y)return false;
+    failure=7;
+    if(!guide.motion_vectors || !guide.motion_retention || !guide.depth_retention || !guide.motion_snapshot_device ||
+        guide.motion_slice || !(guide.resource_state&D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))return false;
+    const auto d=guide.motion_vectors->GetDesc();failure=8;
+    if(d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize!=1 || d.SampleDesc.Count!=1 ||
+        (d.Flags&D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) || luke_motion_srv_format(d.Format)==DXGI_FORMAT_UNKNOWN ||
+        std::uint64_t(guide.motion_x)+guide.motion_width>d.Width || std::uint64_t(guide.motion_y)+guide.motion_height>d.Height)return false;
+    out.source_base={guide.motion_x,guide.motion_y};out.crop={crop_x,crop_y};
+    out.extent={float(guide.motion_width),float(guide.motion_height)};out.scale={guide.scale_x,guide.scale_y};
+    out.jitter_difference={middle.jitter_x-older.jitter_x,middle.jitter_y-older.jitter_y};failure=9;
+    if(!native_motion_detail::transform(current,middle,out.opposite) || !native_motion_detail::transform(current,older,out.same))return false;
+    failure=0;return true;
+}
+}

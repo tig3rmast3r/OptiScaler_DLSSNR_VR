@@ -1,6 +1,7 @@
 #include "xrfg/luke_afw.hpp"
 #include "xrfg/luke_depth_format.hpp"
 #include "xrfg/luke_motion_format.hpp"
+#include "xrfg/luke_native_motion.hpp"
 #include "xrfg/luke_recording_scope.hpp"
 #include "xrfg/luke_guide_window.hpp"
 #include "xrfg/luke_physical_projection.hpp"
@@ -151,7 +152,6 @@ enum class AfwStage : std::uint64_t {
     configuration,
     allocator_wait_begin,
     allocator_wait_end,
-    temporal_camera_ready = 37,
 };
 
 void report_stage(AfwStage stage, std::int64_t result, std::uint64_t detail,
@@ -365,10 +365,6 @@ struct LukeAfwSynthesizer::Impl {
     std::uint64_t last_submission_fence{};
     std::uint64_t next_submission_fence{1};
     EyeFrameBuffers eye_buffers{};
-    std::array<CameraData, 2> previous_source_camera{};
-    std::array<std::uint64_t, 2> previous_source_stream{};
-    std::array<std::uint64_t, 2> previous_source_epoch{};
-    std::array<std::uint64_t, 2> previous_source_publication{};
     TextureDesc depth;
     Microsoft::WRL::ComPtr<ID3D12Resource> depth_staging;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> depth_descriptor_heap;
@@ -751,7 +747,7 @@ struct LukeAfwSynthesizer::Impl {
                 ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV
                 : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
             ranges[index].NumDescriptors = 1;
-            ranges[index].BaseShaderRegister = index == 2 ? 0 : index;
+            ranges[index].BaseShaderRegister = index == 1 ? 1 : 0;
             ranges[index].OffsetInDescriptorsFromTableStart = 0;
             parameters[index].ParameterType =
                 D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -763,7 +759,7 @@ struct LukeAfwSynthesizer::Impl {
         parameters[3].ParameterType =
             D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         parameters[3].Constants.ShaderRegister = 0;
-        parameters[3].Constants.Num32BitValues = 56;
+        parameters[3].Constants.Num32BitValues = 44;
         parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC root_description{};
         root_description.NumParameters =
@@ -794,7 +790,7 @@ struct LukeAfwSynthesizer::Impl {
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpu =
             descriptors->GetCPUDescriptorHandleForHeapStart();
-        cpu.ptr += 2ULL * descriptor_size;
+        cpu.ptr += 2 * descriptor_size;
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
         uav.Format = kLukeAfwMotionFormat;
         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -812,41 +808,31 @@ struct LukeAfwSynthesizer::Impl {
     }
 
     HRESULT compose_motion(ID3D12GraphicsCommandList* list,
-        const DlssMotionVectorFrame& guide, const CameraData& camera,
-        const Matrix4x4& middle_same_transform,
-        const Matrix4x4& previous_same_transform,
-        UINT crop_x,
+        const DlssMotionVectorFrame& guide,
+        const LukeNativeMotionConstants& constants, UINT crop_x,
         UINT crop_y, UINT width, UINT height) noexcept {
         if (!list || !guide.motion_vectors || !depth.texture ||
             !motion_resource ||
             !composed_motion_staging || !composed_motion_descriptors ||
             !composed_motion_root || !composed_motion_pipeline ||
             crop_x + width > guide.motion_width ||
-            crop_y + height > guide.motion_height ||
-            width != depth_width || height != depth_height)
+            crop_y + height > guide.motion_height)
             return E_INVALIDARG;
 
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = luke_motion_srv_format(guide.motion_vectors->GetDesc().Format);
-        if (srv.Format == DXGI_FORMAT_UNKNOWN) return DXGI_ERROR_UNSUPPORTED;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping =
-            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu =
-            composed_motion_descriptors->GetCPUDescriptorHandleForHeapStart();
-        device->CreateShaderResourceView(guide.motion_vectors.Get(), &srv,
-            cpu);
-        cpu.ptr += composed_motion_descriptor_size;
-        D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv{};
-        depth_srv.Format = DXGI_FORMAT_R32_FLOAT;
-        depth_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        depth_srv.Shader4ComponentMapping =
-            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        depth_srv.Texture2D.MipLevels = 1;
-        device->CreateShaderResourceView(depth.texture, &depth_srv, cpu);
-        const HRESULT descriptor_status = device->GetDeviceRemovedReason();
-        if (FAILED(descriptor_status)) return descriptor_status;
+        for(unsigned index=0; index<2; ++index) {
+            ID3D12Resource* field=index==0?guide.motion_vectors.Get():depth.texture;
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format=index==0?luke_motion_srv_format(field->GetDesc().Format):DXGI_FORMAT_R32_FLOAT;
+            if(srv.Format==DXGI_FORMAT_UNKNOWN) return DXGI_ERROR_UNSUPPORTED;
+            srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels=1;
+            auto cpu=composed_motion_descriptors->GetCPUDescriptorHandleForHeapStart();
+            cpu.ptr+=index*composed_motion_descriptor_size;
+            device->CreateShaderResourceView(field,&srv,cpu);
+        }
+        const HRESULT descriptor_status=device->GetDeviceRemovedReason();
+        if(FAILED(descriptor_status)) return descriptor_status;
 
         const auto transition = [](ID3D12Resource* resource,
             D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
@@ -874,38 +860,7 @@ struct LukeAfwSynthesizer::Impl {
             list->SetComputeRootDescriptorTable(index, gpu);
             gpu.ptr += composed_motion_descriptor_size;
         }
-        struct Constants {
-            UINT base_x, base_y;
-            UINT crop_x, crop_y;
-            float current_forward_x, current_forward_y;
-            float window_width, window_height;
-            float transform[16];
-            float middle_same_transform[16];
-            float previous_same_transform[16];
-        };
-        static_assert(sizeof(Constants) == 56 * sizeof(std::uint32_t));
-        Constants constants{};
-        constants.base_x = guide.motion_x;
-        constants.base_y = guide.motion_y;
-        constants.crop_x = crop_x;
-        constants.crop_y = crop_y;
-        constants.current_forward_x = -guide.scale_x;
-        constants.current_forward_y = -guide.scale_y;
-        constants.window_width = static_cast<float>(width);
-        constants.window_height = static_cast<float>(height);
-        const Matrix4x4 transform = multiply(multiply(multiply(
-            camera.source_clip_to_view, camera.source_view_to_world),
-            camera.destination_world_to_view),
-            camera.destination_view_to_clip);
-        std::copy(std::begin(transform.values), std::end(transform.values),
-            constants.transform);
-        std::copy(std::begin(middle_same_transform.values),
-            std::end(middle_same_transform.values),
-            constants.middle_same_transform);
-        std::copy(std::begin(previous_same_transform.values),
-            std::end(previous_same_transform.values),
-            constants.previous_same_transform);
-        list->SetComputeRoot32BitConstants(3, 56, &constants, 0);
+        list->SetComputeRoot32BitConstants(3, 44, &constants, 0);
         list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 
         std::array<D3D12_RESOURCE_BARRIER, 3> before_copy{};
@@ -1105,6 +1060,14 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
         const UINT motion_crop_x = motion_window->x;
         const UINT motion_crop_y = motion_window->y;
 
+        if(cropped_depth_width!=cropped_motion_width || cropped_depth_height!=cropped_motion_height ||
+            depth_crop_x!=motion_crop_x || depth_crop_y!=motion_crop_y) return reject_input(42);
+        LukeNativeMotionConstants native_motion{};unsigned native_failure{};
+        const bool have_native_motion=luke_native_motion_constants(guide,motion_crop_x,motion_crop_y,native_motion,native_failure);
+        bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage,native_failure,950,guide.publication,
+            guide.previous_same_native_camera?guide.previous_same_native_camera->publication:0);
+        if(!have_native_motion) return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+
         // The allocator, plugin eye buffers and private depth/motion targets
         // are reused by the next evaluation. V23181 skipped that evaluation
         // whenever the previous GPU submission had not yet retired, visibly
@@ -1176,7 +1139,6 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
                 source_eye * 100 + 40, guide.publication,
                 pair(impl_->world_scale, guide.camera_fov_vertical), 0);
         }
-        if (guide.reset) impl_->previous_source_publication = {};
         report_stage(AfwStage::camera_ready, S_OK, source_eye,
             guide.publication);
 
@@ -1203,7 +1165,6 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
                 return E_FAIL;
             impl_->color_description = color_desc;
             impl_->frame_buffers_ready = true;
-            impl_->previous_source_publication = {};
         }
         if (impl_->depth.texture == nullptr ||
             impl_->depth_width != cropped_depth_width ||
@@ -1238,10 +1199,9 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
         if (FAILED(result)) return result;
         report_stage(AfwStage::resources_ready, S_OK, source_eye,
             guide.publication);
-        if (guide.producer_fence != nullptr && guide.producer_fence_value != 0) {
-            const HRESULT wait_result = impl_->queue->Wait(
-                guide.producer_fence.Get(), guide.producer_fence_value);
-            if (FAILED(wait_result)) return wait_result;
+        if(guide.producer_fence && guide.producer_fence_value) {
+            const HRESULT waited=impl_->queue->Wait(guide.producer_fence.Get(),guide.producer_fence_value);
+            if(FAILED(waited)) return waited;
         }
         report_stage(AfwStage::producer_waited, S_OK, source_eye,
             guide.publication);
@@ -1346,55 +1306,9 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
         report_stage(AfwStage::depth_converted, result, source_eye,
             guide.publication);
         if (FAILED(result)) return result;
-        Matrix4x4 middle_same_transform{};
-        Matrix4x4 previous_same_transform{};
-        identity(middle_same_transform);
-        identity(previous_same_transform);
-        bool temporal_camera_valid = false;
-        const auto& middle = guide.previous_opposite_guide;
-        const bool have_previous_camera =
-            impl_->previous_source_publication[source_eye] != 0 &&
-            impl_->previous_source_publication[source_eye] < guide.publication &&
-            impl_->previous_source_epoch[source_eye] == guide.epoch &&
-            impl_->previous_source_stream[source_eye] == guide.stream;
-        if (have_previous_camera && middle &&
-            middle->stream == guide.stream && middle->epoch == guide.epoch &&
-            middle->publication + 1 == guide.publication) {
-            CameraData middle_camera{};
-            // The middle guide is an NGX camera at its own publication. Its
-            // virtual same-time peer needs stereo translation, not the XR
-            // rotation between today's submitted eyes: the peer pose can be
-            // several AER publications older than this middle guide.
-            D3D12ReprojectionView middle_peer_view = source_view;
-            middle_peer_view.pose.orientation =
-                destination_view.pose.orientation;
-            if (camera_data(destination_view, middle_peer_view, *middle,
-                    1U - source_eye, impl_->world_scale, xr_eye_baseline, units, middle_camera)) {
-                const Matrix4x4 current_clip_to_world = multiply(
-                    camera.source_clip_to_view, camera.source_view_to_world);
-                middle_same_transform = multiply(multiply(
-                    current_clip_to_world,
-                    middle_camera.destination_world_to_view),
-                    middle_camera.destination_view_to_clip);
-                const CameraData& previous =
-                    impl_->previous_source_camera[source_eye];
-                previous_same_transform = multiply(multiply(
-                    current_clip_to_world, previous.source_world_to_view),
-                    previous.source_view_to_clip);
-                temporal_camera_valid = true;
-            }
-        }
-        report_stage(AfwStage::temporal_camera_ready,
-            temporal_camera_valid ? S_OK : S_FALSE,
-            impl_->previous_source_publication[source_eye],
-            guide.publication);
-        bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage,
-            source_eye, 80, guide.publication, impl_->previous_source_publication[source_eye]);
-        bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage,
-            temporal_camera_valid ? 1 : 0, 81, guide.publication,
-            middle ? middle->publication : 0);
-        result = impl_->compose_motion(command_list, guide, camera,
-            middle_same_transform, previous_same_transform,
+        // Preserve native object flow. Rebase only depth-projected camera motion
+        // from the opposite N-1 reference to the exact native same-eye N-2 camera.
+        result = impl_->compose_motion(command_list, guide, native_motion,
             motion_crop_x, motion_crop_y, cropped_motion_width,
             cropped_motion_height);
         report_stage(AfwStage::motion_copied, result, source_eye,
@@ -1499,6 +1413,15 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
             contract.jittered = guide.jittered;
             contract.depth_inverted = guide.depth_inverted;
             contract.depth_infinite = guide.depth_infinite;
+            contract.native_previous_publication=guide.previous_opposite_guide->publication;
+            contract.native_same_publication=guide.previous_same_native_camera->publication;
+            contract.native_clip_to_opposite=native_motion.opposite;
+            contract.native_clip_to_same=native_motion.same;
+            contract.native_history_jitter_x=native_motion.jitter_difference[0];
+            contract.native_history_jitter_y=native_motion.jitter_difference[1];
+            contract.raw_camera_motion_included = guide.raw_camera_motion_included;
+            contract.raw_clip_to_previous_clip = guide.raw_clip_to_previous_clip;
+            contract.raw_previous_clip_to_clip = guide.raw_previous_clip_to_clip;
             contract.camera_position = guide.camera_position;
             contract.camera_right = guide.camera_right;
             contract.camera_up = guide.camera_up;
@@ -1600,7 +1523,7 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
             return FAILED(close_result) ? close_result : result;
         }
         ID3D12CommandList* lists[] = {command_list};
-        if (guide.motion_retention) guide.motion_retention->begin_gpu_read();
+        guide.motion_retention->begin_gpu_read();
         if (guide.depth_retention) guide.depth_retention->begin_gpu_read();
         impl_->queue->ExecuteCommandLists(1, lists);
         if (two_frame_capture_active())
@@ -1612,19 +1535,16 @@ HRESULT LukeAfwSynthesizer::synthesize(ID3D12Resource* source_color,
         report_stage(AfwStage::fence_signaled, result, source_eye,
             guide.publication);
         if (SUCCEEDED(result)) {
-            if (guide.motion_retention)
-                result = guide.motion_retention->retire_gpu_read(impl_->submission_fence.Get(), fence_value);
-            if (SUCCEEDED(result) && guide.depth_retention)
-                result = guide.depth_retention->retire_gpu_read(impl_->submission_fence.Get(), fence_value);
+            for(const auto& retention:{guide.motion_retention,guide.depth_retention}) {
+                if(!retention) continue;
+                const HRESULT retired=retention->retire_gpu_read(impl_->submission_fence.Get(),fence_value);
+                if(FAILED(retired) && SUCCEEDED(result)) result=retired;
+            }
             bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage,
                 result, 87, guide.publication, fence_value);
         }
         if (SUCCEEDED(result)) {
             impl_->last_submission_fence = fence_value;
-            impl_->previous_source_camera[source_eye] = camera;
-            impl_->previous_source_stream[source_eye] = guide.stream;
-            impl_->previous_source_epoch[source_eye] = guide.epoch;
-            impl_->previous_source_publication[source_eye] = guide.publication;
         }
         return result;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }

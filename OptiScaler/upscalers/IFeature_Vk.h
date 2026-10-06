@@ -23,6 +23,7 @@ class IFeature_Vk : public virtual IFeature
     };
 
   protected:
+    std::unique_ptr<IFeature_Vk> _lukeCapture;
     VkInstance Instance = nullptr;
     VkPhysicalDevice PhysicalDevice = nullptr;
     VkDevice Device = nullptr;

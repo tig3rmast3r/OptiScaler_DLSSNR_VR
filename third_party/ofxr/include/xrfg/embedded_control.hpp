@@ -2,6 +2,9 @@
 #include <cstdint>
 
 namespace xrfg::embedded {
+// Set by successful OpenXR negotiation; shared by layer and host publication.
+void set_layer_active(bool active) noexcept;
+bool layer_active() noexcept;
 // CPU-only interface: no NGX/FFX structures cross the host/backend ABI boundary.
 struct Settings {
     bool enabled{true};
@@ -42,6 +45,11 @@ struct AfwSnapshot {
     std::uint64_t failed_frames{};
     std::uint64_t evaluations{};
     std::uint64_t successful_evaluations{};
+    std::uint64_t ingress_frames{};
+    std::uint64_t published_ingress_frames{};
+    std::uint64_t missing_camera_ingress_frames{};
+    std::uint64_t rejected_guide_pairs{};
+    std::uint32_t last_guide_rejection{};
     std::uint64_t last_publication{};
     std::uint32_t last_source_eye{};
     std::uint32_t last_motion_width{};
@@ -59,6 +67,8 @@ AfwSnapshot afw_snapshot();
 bool request_afw(AfwSettings settings);
 bool toggle_afw_debug();
 void report_afw_prepare(std::int64_t reason);
+void report_afw_ingress(bool published, bool camera);
+void report_afw_guide_rejection(std::uint32_t mask);
 void report_afw_evaluation(std::uint64_t publication,
     std::uint32_t source_eye, std::uint32_t motion_width,
     std::uint32_t motion_height, std::uint32_t output_width,

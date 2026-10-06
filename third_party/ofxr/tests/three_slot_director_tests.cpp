@@ -26,6 +26,9 @@ Microsoft::WRL::ComPtr<ID3D11Texture2D> auxiliary_readback;
 bool gpu_pixels_correct = true;
 bool terminal_optical_test = false;
 unsigned terminal_real_reads{}, terminal_synthetic_reads{};
+std::shared_ptr<xrfg::D3D11D3D12SwapchainInterop> inline_publication_bridge;
+std::uint64_t inline_publication_before{};
+std::atomic<bool> inline_early_release{};
 bool three_layer_test{};
 Microsoft::WRL::ComPtr<ID3D11Device> test_device;
 std::unordered_map<XrSwapchain, Microsoft::WRL::ComPtr<ID3D11Texture2D>> auxiliary_outputs;
@@ -230,6 +233,83 @@ template<class Predicate>
 void until(const std::shared_ptr<SessionState>& state, Predicate condition) {
     std::unique_lock lock(state->presenter_mutex);
     check(state->presenter_condition.wait_for(lock, std::chrono::seconds(3), condition), "timed out");
+}
+
+// Delay the real publication GPU queue. The production inline consumer must
+// keep its XR image acquired until its own copy receipt completes.
+void inline_afw_publication_gpu_test(const std::shared_ptr<SessionState>& state,
+    const PostAfwFrameInput& input, unsigned pixel_serial) {
+    const auto gen=input.generation;
+    const auto active=gen->afw_temporal_synthesizer;
+    const auto current_slot=gen->current_slot,synthetic_slot=gen->synthetic_slot;
+    static std::shared_ptr<xrfg::D3D12FrameSynthesizer> probe;
+    static std::shared_ptr<xrfg::D3D12SwapchainHistory> probe_history;
+    if(pixel_serial==1) {
+    probe_history=std::make_shared<xrfg::D3D12SwapchainHistory>();
+    check(SUCCEEDED(probe_history->initialize(state->d3d12_device.Get(),state->d3d12_queue.Get(),
+        gen->d3d11_interop->current_destination_images(),D3D12_RESOURCE_STATE_COMMON)),"inline independent history");
+    probe=std::make_shared<xrfg::D3D12FrameSynthesizer>();
+    check(SUCCEEDED(probe->initialize(state->d3d12_device.Get(),state->d3d12_queue.Get(),
+        probe_history,gen->d3d11_interop->current_destination_images(),
+        gen->d3d11_interop->synthetic_destination_images(),DXGI_FORMAT_R8G8B8A8_UNORM,
+        D3D12_RESOURCE_STATE_COMMON,xrfg::D3D12OpticalFlowBackend::nvidia,{},true)), "inline probe synth");
+    }
+    auto probe_input=input;
+    check(SUCCEEDED(probe_history->capture(input.capture.source_index,&probe_input.capture)),"inline independent capture");
+    check(SUCCEEDED(probe_history->commit(probe_input.capture)),"inline independent commit");
+    gen->afw_temporal_synthesizer=probe;
+    Microsoft::WRL::ComPtr<ID3D12Fence> gate;
+    check(SUCCEEDED(state->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate))),"inline publication fence");
+    const auto before=gen->d3d11_interop->publication_snapshot().copy_complete_value;
+    check(SUCCEEDED(state->d3d12_queue->Wait(gate.Get(),1)),"delay inline output copy");
+    std::atomic<bool> finished{false};
+    const auto release=state->dispatch->release_swapchain_image;
+    inline_publication_bridge=gen->d3d11_interop;inline_publication_before=before;inline_early_release=false;
+    state->dispatch->release_swapchain_image=[](XrSwapchain,const XrSwapchainImageReleaseInfo*) -> XrResult {
+        const auto receipt=inline_publication_bridge->publication_snapshot();
+        if(receipt.copy_complete_value>inline_publication_before && receipt.completed_value<receipt.copy_complete_value)
+            inline_early_release.store(true);
+        return XR_SUCCESS;
+    };
+    PreparedGeneration prepared;
+    std::thread consumer([&] {
+        prepared=prepare_frame_generation(probe_input.application_swapchain,pixel_serial>1,probe_input.views,.5F,
+            false,nullptr,false,&probe_input);
+        finished.store(true);
+    });
+    bool queued=false;
+    for(unsigned i=0;i<500;++i) {
+        if(gen->d3d11_interop->publication_snapshot().copy_complete_value>before){queued=true;break;}
+        if(finished.load())break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    const bool blocked=queued && !finished.load() && !inline_early_release.load();
+    const bool outside_gpu_lock=state->gpu_mutex.try_lock();
+    if(outside_gpu_lock)state->gpu_mutex.unlock();
+    static_cast<void>(gate->Signal(1));consumer.join();
+    state->dispatch->release_swapchain_image=release;
+    inline_publication_bridge.reset();
+    // Keep the prime's temporal anchor for the subsequent pair; wait_for_idle
+    // deliberately retires that anchor and is only appropriate after the pair.
+    const HRESULT probe_idle=pixel_serial==1?probe->wait_for_previous_submission(5000):probe->wait_for_idle();
+    if(FAILED(probe_idle))std::cerr<<"inline probe idle HRESULT "<<probe_idle<<" kind "<<int(prepared.kind)
+        <<" reason "<<int(prepared.reason)<<" queued "<<queued<<" blocked "<<blocked
+        <<" device "<<state->d3d12_device->GetDeviceRemovedReason()<<'\n';
+    check(SUCCEEDED(probe_idle),"inline probe completion");
+    gen->afw_temporal_synthesizer=active;
+    gen->current_slot=current_slot;gen->synthetic_slot=synthetic_slot;
+    check(blocked && outside_gpu_lock && prepared.kind==(pixel_serial==1?
+            PreparedGenerationKind::prime:PreparedGenerationKind::pair),
+        "inline AFW released XR output before exact D3D11 publication completion");
+    state->d3d11_context->CopyResource(readback.Get(),gpu_outputs.at(prepared.current_handle));
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    check(SUCCEEDED(state->d3d11_context->Map(readback.Get(),0,D3D11_MAP_READ,0,&mapped)),"inline fresh pixels");
+    const auto actual=*static_cast<const std::uint32_t*>(mapped.pData);
+    state->d3d11_context->Unmap(readback.Get(),0);
+    check(actual==terminal_optical_pixel(pixel_serial,0,0,0),"inline AFW returned stale pixels");
+    std::cout<<"Inline AFW "<<(pixel_serial==1?"prime":"S/B pair")<<": delayed D3D11 copy blocks XR release, waits outside GPU lock, returns fresh pixels\n";
+    if(pixel_serial==2){probe.reset();probe_history.reset();}
 }
 
 void held_afw_pair_gpu_test(const std::shared_ptr<SessionState>& state,
@@ -817,6 +897,7 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
                 }
                 auto completed = freeze_completed_afw_frame(state, &terminal.info, terminal_snapshot, std::move(packet), n);
                 check(completed && completed->application_serial == n, "completed direct-XR packet freeze");
+                if(n<=2) inline_afw_publication_gpu_test(state,completed->inputs.front(),n);
                 if (n == 1) {
                     // Reproduce promotion with one eye's inline post-AFW
                     // prime still on the GPU. The ordinary synthesizer is

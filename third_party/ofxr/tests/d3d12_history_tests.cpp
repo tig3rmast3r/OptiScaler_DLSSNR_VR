@@ -1699,6 +1699,10 @@ void test_protected_guide_snapshots(D3D12WarpFixture& fixture) {
             p.protect_snapshot_lifetime = true;
             p.reset = reset;
             p.camera_frame_token_valid = true; p.camera_frame_token = n * 7;
+            p.raw_camera_motion_included = n % 2;
+            for (unsigned i=0;i<4;++i) p.raw_clip_to_previous_clip[i*5]=p.raw_previous_clip_to_clip[i*5]=1;
+            p.raw_clip_to_previous_clip[12]=float(n)*.25F;
+            p.raw_previous_clip_to_clip[12]=-float(n)*.25F;
             published = xrfg::publish_dlss_motion_vectors(p);
         });
         const auto resolved = xrfg::resolve_dlss_motion_vectors(1, fixture.queue());
@@ -1732,6 +1736,18 @@ void test_protected_guide_snapshots(D3D12WarpFixture& fixture) {
             selected->camera_frame_token == 28 &&
             selected->previous_opposite_guide->camera_frame_token == 21,
             "color origin did not resolve its exact retained guide and N-1 camera");
+        require(selected->previous_same_native_camera &&
+            selected->previous_same_native_camera->publication == held[1]->publication &&
+            selected->previous_same_native_camera->serial == 2 &&
+            selected->previous_same_native_camera->token == 14 &&
+            selected->previous_same_native_camera->valid ==
+                xrfg::dlss_native_camera_history(*held[1]).valid,
+            "color origin borrowed or synthesized the N-2 native camera");
+        require(selected->raw_camera_motion_included == 0 &&
+            selected->raw_clip_to_previous_clip[12] == 1.0F &&
+            selected->raw_previous_clip_to_clip[12] == -1.0F &&
+            held.back()->raw_clip_to_previous_clip[12] == 4.0F,
+            "older color borrowed newer producer-declared motion history");
         require_readback_matches(fixture, selected->motion_vectors.Get(), make_pattern(52),
             "exact older origin MV", selected->resource_state);
         require_readback_matches(fixture, selected->depth.Get(), make_pattern(68),

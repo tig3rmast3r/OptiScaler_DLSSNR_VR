@@ -167,7 +167,7 @@ void report_read(HRESULT result, std::uint32_t token, UINT width, UINT height) n
             telemetry.file = CreateFileW(destination.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ |
                 FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (telemetry.file != INVALID_HANDLE_VALUE) {
-                constexpr char header[] = "# V30059 compact token32+CRC16, one256x8 band\n"
+                constexpr char header[] = "# V33008 compact token32+CRC16, disjoint256x8 coverage bands\n"
                     "# uptime_ms,read_ok,read_missing,read_error,last_hr,token,roi_width,roi_height\n";
                 DWORD written{};
                 WriteFile(telemetry.file, header, static_cast<DWORD>(sizeof(header)-1), &written, nullptr);
@@ -202,6 +202,22 @@ void configure_luke_color_origin_extent(unsigned width, unsigned height) noexcep
     g_color_extent.store(extent_bits(width, height), std::memory_order_release);
 }
 
+// Bounded changed-geometry evidence only. Admission and marker layout unchanged.
+static void report_origin_layout(bool writer, unsigned reason,
+    std::uint64_t output, std::uint64_t eye) noexcept {
+    try {
+        struct State { std::uint64_t output{},eye{}; unsigned reason{},count{}; };
+        static std::mutex mutex;
+        static std::array<State,2> states{};
+        std::scoped_lock lock(mutex);
+        auto& state=states[writer?0:1];
+        if(state.count>=16||(state.count&&state.output==output&&state.eye==eye&&state.reason==reason))return;
+        state.output=output;state.eye=eye;state.reason=reason;++state.count;
+        bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage,
+            reason,writer?948:949,output,eye);
+    } catch (...) { }
+}
+
 HRESULT mark_luke_color_origin(ID3D12GraphicsCommandList* list, ID3D12Resource* color,
     std::uint32_t token, D3D12_RESOURCE_STATES state, ID3D12Device* native_device,
     LukeColorOriginRect rect) noexcept {
@@ -218,11 +234,17 @@ HRESULT mark_luke_color_origin(ID3D12GraphicsCommandList* list, ID3D12Resource* 
             static_cast<UINT64>(rect.y) + rect.height > desc.Height) return E_INVALIDARG;
         g_output_extent.store(extent_bits(rect.width, rect.height), std::memory_order_release);
         const auto color_extent = g_color_extent.load(std::memory_order_acquire);
-        if (!color_extent) return E_PENDING; // Actual eye viewport is not known during startup.
+        if (!color_extent) {
+            report_origin_layout(true,1,extent_bits(rect.width,rect.height),0);
+            return E_PENDING; // Actual eye viewport is not known during startup.
+        }
         LukeColorOriginLayout layout;
         if (!compact_luke_origin_layout(rect.width, rect.height,
                 static_cast<UINT>(color_extent >> 32), static_cast<UINT>(color_extent), layout))
+        {
+            report_origin_layout(true,2,extent_bits(rect.width,rect.height),color_extent);
             return E_PENDING;
+        }
         ComPtr<ID3D12Device> device = native_device;
         if (!device) {
             const HRESULT result = list->GetDevice(IID_PPV_ARGS(device.GetAddressOf()));
@@ -237,14 +259,16 @@ HRESULT mark_luke_color_origin(ID3D12GraphicsCommandList* list, ID3D12Resource* 
             auto barrier = transition(color, state, D3D12_RESOURCE_STATE_COPY_DEST);
             list->ResourceBarrier(1, &barrier);
         }
-        const UINT x = rect.x + layout.band.x, y = rect.y + layout.band.y;
-        for (unsigned cell = 0; cell < kLukeOriginBits * 2; ++cell) {
+        for(unsigned band=0;band<layout.band_count;++band) {
+            const UINT x=rect.x+layout.bands[band].x,y=rect.y+layout.bands[band].y;
+            for (unsigned cell = 0; cell < kLukeOriginBits * 2; ++cell) {
             const bool white = luke_origin_white(token, cell * 2);
             D3D12_TEXTURE_COPY_LOCATION source{};
             source.pResource = patterns->colors[white ? 1 : 0].Get();
             source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             source.PlacedFootprint.Footprint = {desc.Format, 2, kLukeOriginHeight, 1, 256};
-            list->CopyTextureRegion(&destination, x + cell * 2, y, 0, &source, nullptr);
+                list->CopyTextureRegion(&destination, x + cell * 2, y, 0, &source, nullptr);
+            }
         }
         if (state != D3D12_RESOURCE_STATE_COPY_DEST) {
             auto barrier = transition(color, D3D12_RESOURCE_STATE_COPY_DEST, state);
@@ -268,11 +292,17 @@ HRESULT read_luke_color_origin(ID3D12CommandQueue* queue, ID3D12Resource* color,
             return report.finish(DXGI_ERROR_UNSUPPORTED);
         configure_luke_color_origin_extent(static_cast<UINT>(original.Width), original.Height);
         const auto output_extent = g_output_extent.load(std::memory_order_acquire);
-        if (!output_extent) return report.finish(E_PENDING);
+        if (!output_extent) {
+            report_origin_layout(false,1,0,extent_bits(static_cast<UINT>(original.Width),original.Height));
+            return report.finish(E_PENDING);
+        }
         LukeColorOriginLayout layout;
         if (!compact_luke_origin_layout(static_cast<UINT>(output_extent >> 32),
                 static_cast<UINT>(output_extent), static_cast<UINT>(original.Width),
-                original.Height, layout)) return report.finish(E_PENDING);
+                original.Height, layout)) {
+            report_origin_layout(false,2,output_extent,extent_bits(static_cast<UINT>(original.Width),original.Height));
+            return report.finish(E_PENDING);
+        }
         report.width = layout.scan.width; report.height = layout.scan.height;
         std::shared_ptr<Reader> reader;
         HRESULT result = get_reader(queue, reader);

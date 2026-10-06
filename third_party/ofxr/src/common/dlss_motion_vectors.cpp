@@ -447,6 +447,9 @@ std::shared_ptr<const DlssMotionVectorFrame> publish_dlss_motion_vectors(
         frame->camera_view_to_clip = publication.camera_view_to_clip;
         frame->camera_clip_to_view = publication.camera_clip_to_view;
         frame->camera_matrices_valid = publication.camera_matrices_valid;
+        frame->raw_camera_motion_included = publication.raw_camera_motion_included;
+        frame->raw_clip_to_previous_clip = publication.raw_clip_to_previous_clip;
+        frame->raw_previous_clip_to_clip = publication.raw_previous_clip_to_clip;
         frame->producer_command_list = publication.producer_command_list;
         if (publication.protect_snapshot_lifetime) {
             // Calibrate exactly once in immutable production order. Consumer
@@ -471,6 +474,12 @@ std::shared_ptr<const DlssMotionVectorFrame> publish_dlss_motion_vectors(
                 ? luke_camera_separation(camera_sample(older), camera_sample(middle), camera_sample(frame)) : 0;
             frame->calibrated_game_eye_baseline = stream.camera_units.observe(
                 frame->epoch, frame->publication, sample);
+        }
+        if (stream.previous && stream.previous->epoch == frame->epoch &&
+            stream.previous->serial + 2 == frame->serial &&
+            stream.previous->publication + 2 == frame->publication) {
+            // Exact N-2 scalar camera survives eviction of that GPU snapshot.
+            frame->previous_same_native_camera=dlss_native_camera_history(*stream.previous);
         }
         if (two_frame_capture_active()) {
             TwoFrameGuideContract contract{};
@@ -499,6 +508,9 @@ std::shared_ptr<const DlssMotionVectorFrame> publish_dlss_motion_vectors(
             contract.camera_position = frame->camera_position;
             contract.camera_right = frame->camera_right;
             contract.view_to_clip = frame->camera_view_to_clip;
+            contract.raw_camera_motion_included = frame->raw_camera_motion_included;
+            contract.raw_clip_to_previous_clip = frame->raw_clip_to_previous_clip;
+            contract.raw_previous_clip_to_clip = frame->raw_previous_clip_to_clip;
             contract.clip_to_view = frame->camera_clip_to_view;
             two_frame_capture_guide_contract(contract);
         }
@@ -1116,6 +1128,7 @@ std::shared_ptr<const DlssMotionVectorFrame> resolve_luke_guide_token(
         auto resolved = std::make_shared<DlssMotionVectorFrame>(*current);
         resolved->previous_serial = resolved->serial > 2 ? resolved->serial - 2 : 0;
         resolved->previous_opposite_guide = previous;
+
         ++state.statistics.matched;
         return resolved;
     } catch (...) {

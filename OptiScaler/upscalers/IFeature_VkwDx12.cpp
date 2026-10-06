@@ -5,6 +5,9 @@
 #include <Config.h>
 #include <dlssnr/DlssNr.h>
 #include <SysUtils.h>
+#include <NVNGX_Parameter.h>
+#include <ofxr/ofxr_bridge_client.hpp>
+#include <hooks/LukeCaptureParameters.h>
 
 #include <proxies/DXGI_Proxy.h>
 #include <proxies/D3D12_Proxy.h>
@@ -17,6 +20,26 @@
 #include <magic_enum.hpp>
 #include <detours/detours.h>
 #include <imgui/ImGuiNotify.hpp>
+
+// Diagnostic only: inspect the native NGX call, not Streamline's earlier
+// declaration. Never retain the borrowed pointer or change capture metadata.
+static void LogNativeMotionHistory(const NVSDK_NGX_Parameter* parameters, uint64_t frame)
+{
+    if (frame >= 2 && frame % 240 != 0) return;
+    void* borrowed = nullptr;
+    const auto status = parameters->Get(NVSDK_NGX_Parameter_DLSS_CLIP_TO_PREV_CLIP_MATRIX, &borrowed);
+    float matrix[16] {};
+    SIZE_T copied = 0;
+    bool valid = status == NVSDK_NGX_Result_Success && borrowed &&
+        ReadProcessMemory(GetCurrentProcess(), borrowed, matrix, sizeof(matrix), &copied) &&
+        copied == sizeof(matrix);
+    if (valid) for (float value : matrix) valid = valid && std::isfinite(value) && std::abs(value) < 1e12F;
+    LOG_INFO("V30071 native NGX motion history frame={} status=0x{:X} present={} valid={}",
+        frame, static_cast<unsigned>(status), borrowed != nullptr, valid);
+    if (valid) for (unsigned row = 0; row < 4; ++row)
+        LOG_INFO("V30071 native NGX ClipToPrevClip row={} values={},{},{},{}", row,
+            matrix[row*4], matrix[row*4+1], matrix[row*4+2], matrix[row*4+3]);
+}
 
 // Used Nukem's VKToDX as a base
 // https://github.com/Nukem9/dlssg-to-fsr3/blob/eca4a79b4d23339a1dcf02e30b9f3bafe7901513/source/maindll/FFFrameInterpolatorVKToDX.cpp
@@ -75,7 +98,6 @@ static bool HasStencil(VkFormat format)
 {
     switch (format)
     {
-    case VK_FORMAT_X8_D24_UNORM_PACK32:
     case VK_FORMAT_D16_UNORM_S8_UINT:
     case VK_FORMAT_D24_UNORM_S8_UINT:
     case VK_FORMAT_D32_SFLOAT_S8_UINT:
@@ -467,7 +489,7 @@ bool IFeature_VkwDx12::CreateSharedTexture(const VkImageCreateInfo& ImageInfo, V
     }
 
     D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
-    if (InOutput)
+    if (InOutput || CapturesCompletedOutput())
         flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
     const D3D12_RESOURCE_DESC d3d12ResourceDesc = {
@@ -484,7 +506,7 @@ bool IFeature_VkwDx12::CreateSharedTexture(const VkImageCreateInfo& ImageInfo, V
     };
 
     ID3D12Resource* createdResourceDX = nullptr;
-    auto hr = _dx11on12Device->CreateCommittedResource(&d3d12HeapProperties, D3D12_HEAP_FLAG_SHARED, &d3d12ResourceDesc,
+    auto hr = InteropDevice->CreateCommittedResource(&d3d12HeapProperties, D3D12_HEAP_FLAG_SHARED, &d3d12ResourceDesc,
                                                        D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                        IID_PPV_ARGS(&createdResourceDX));
 
@@ -495,7 +517,7 @@ bool IFeature_VkwDx12::CreateSharedTexture(const VkImageCreateInfo& ImageInfo, V
     }
 
     HANDLE win32Handle = nullptr;
-    hr = _dx11on12Device->CreateSharedHandle(createdResourceDX, nullptr, GENERIC_ALL, nullptr, &win32Handle);
+    hr = InteropDevice->CreateSharedHandle(createdResourceDX, nullptr, GENERIC_ALL, nullptr, &win32Handle);
 
     if (FAILED(hr))
     {
@@ -622,7 +644,7 @@ bool IFeature_VkwDx12::CopyTextureFromVkToDx12(VkCommandBuffer InCmdBuffer, NVSD
     }
 
     // Check if this is a depth format
-    bool isDepthFormat = InDepth; // IsDepthFormat(InParam->Resource.ImageViewInfo.Format);
+    bool isDepthFormat = InDepth && IsDepthFormat(InParam->Resource.ImageViewInfo.Format);
 
     // Check if we need to create a new shared resource
     if (OutResource->Width != InParam->Resource.ImageViewInfo.Width ||
@@ -675,7 +697,7 @@ bool IFeature_VkwDx12::CopyTextureFromVkToDx12(VkCommandBuffer InCmdBuffer, NVSD
         imageCreateInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
         if (!CreateSharedTexture(imageCreateInfo, OutResource->VkSharedImage, OutResource->VkSharedMemory,
-                                 OutResource->Dx12Resource, !InCopy))
+                                 OutResource->Dx12Resource, OutResource == &vkOut))
         {
             if (State::Instance().isRunningOnLinux)
                 ImGui::InsertNotification(
@@ -698,7 +720,7 @@ bool IFeature_VkwDx12::CopyTextureFromVkToDx12(VkCommandBuffer InCmdBuffer, NVSD
                   (int) InParam->Resource.ImageViewInfo.Format);
     }
 
-    if (InCopy)
+    if (InCopy && OutResource != &vkOut)
     {
         OutResource->VkSourceImageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         OutResource->VkSourceImageAccess = VK_ACCESS_SHADER_READ_BIT;
@@ -834,6 +856,21 @@ bool IFeature_VkwDx12::CopyTextureFromVkToDx12(VkCommandBuffer InCmdBuffer, NVSD
             {
                 if (!Config::Instance()->VulkanUseCopyForInputs.value_or_default())
                 {
+                    // Completed native Vulkan output is a storage image in GENERAL,
+                    // unlike ordinary read-only SR inputs. Restore it after capture.
+                    VkImageMemoryBarrier sourceBarrier{};
+                    sourceBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    sourceBarrier.oldLayout = OutResource->VkSourceImageLayout;
+                    sourceBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    sourceBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    sourceBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    sourceBarrier.image = InParam->Resource.ImageViewInfo.Image;
+                    sourceBarrier.subresourceRange = InParam->Resource.ImageViewInfo.SubresourceRange;
+                    sourceBarrier.srcAccessMask = OutResource->VkSourceImageAccess;
+                    sourceBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    if (OutResource == &vkOut)
+                        vkCmdPipelineBarrier(InCmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &sourceBarrier);
                     VkImageMemoryBarrier imageBarrier = {};
                     imageBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
                     imageBarrier.oldLayout = OutResource->VkSharedImageLayout;
@@ -851,7 +888,8 @@ bool IFeature_VkwDx12::CopyTextureFromVkToDx12(VkCommandBuffer InCmdBuffer, NVSD
                     VkExtent2D extent = { InParam->Resource.ImageViewInfo.Width,
                                           InParam->Resource.ImageViewInfo.Height };
                     if (!InCopyShader->Dispatch(VulkanDevice, InCmdBuffer, InParam->Resource.ImageViewInfo.ImageView,
-                                                OutResource->VkSharedImageView, extent))
+                                                OutResource->VkSharedImageView, extent,
+                                                InParam->Resource.ImageViewInfo.Format))
                     {
                         LOG_ERROR("Failed to dispatch resource copy!");
                         return false;
@@ -867,6 +905,14 @@ bool IFeature_VkwDx12::CopyTextureFromVkToDx12(VkCommandBuffer InCmdBuffer, NVSD
 
                     OutResource->VkSharedImageLayout = imageBarrier.newLayout;
                     OutResource->VkSharedImageAccess = imageBarrier.dstAccessMask;
+                    if (OutResource == &vkOut) {
+                        sourceBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        sourceBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                        sourceBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                        sourceBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                        vkCmdPipelineBarrier(InCmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &sourceBarrier);
+                    }
                 }
                 else
                 {
@@ -913,11 +959,14 @@ bool IFeature_VkwDx12::CopyTextureFromVkToDx12(VkCommandBuffer InCmdBuffer, NVSD
                     vkCmdCopyImage(InCmdBuffer, imageBarriers[0].image, imageBarriers[0].newLayout,
                                    imageBarriers[1].image, imageBarriers[1].newLayout, 1, &copyRegion);
 
-                    // Restore source image to read layout
+                    // Restore the completed storage output to GENERAL; input
+                    // textures retain the native read-only NGX input layout.
                     imageBarriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                    imageBarriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    imageBarriers[0].newLayout = OutResource == &vkOut ?
+                        VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                     imageBarriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                    imageBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    imageBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                        (OutResource == &vkOut ? VK_ACCESS_SHADER_WRITE_BIT : 0);
 
                     // Pass shared image to general layout for D3D12 access
                     imageBarriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -983,9 +1032,12 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
     {
         LOG_WARN("Could not determine queue family for command buffer {:X}, using default {}", (size_t) InCmdList,
                  ActiveQueueFamilyIndex);
+        if (CapturesCompletedOutput()) return false;
     }
 
     LOG_DEBUG("Upscaling command buffer: {:X}, frame: {}", (size_t) InCmdList, frame);
+
+    if (CapturesCompletedOutput() && !WaitCaptureSlot(frame)) return false;
 
     // Only wait if we're more than 1 frame behind (triple buffering protection)
     uint64_t lastFrameToWaitFor = (_frameCount > 1) ? (_frameCount - 1) : 0;
@@ -1043,6 +1095,8 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
     {
         if (OutCopy == nullptr || OutCopy.get() == nullptr)
             OutCopy = std::make_unique<ResourceCopy_Vk>("OutCopy", VulkanDevice, VulkanPhysicalDevice);
+        if (CapturesCompletedOutput() && !OutCopy2)
+            OutCopy2 = std::make_unique<ResourceCopy_Vk>("CompletedNativeColorCopy", VulkanDevice, VulkanPhysicalDevice);
     }
 
     NVSDK_NGX_Resource_VK* paramDepth = nullptr;
@@ -1064,7 +1118,7 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
     }
 
     NVSDK_NGX_Resource_VK* paramExposure = nullptr;
-    if (!AutoExposure())
+    if (!CapturesCompletedOutput() && !AutoExposure())
     {
         if (InParameters->Get(NVSDK_NGX_Parameter_ExposureTexture, (void**) &paramExposure) !=
                 NVSDK_NGX_Result_Success &&
@@ -1083,7 +1137,7 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
     }
 
     NVSDK_NGX_Resource_VK* paramReactiveMask = nullptr;
-    if (!Config::Instance()->DisableReactiveMask.value_or(false))
+    if (!CapturesCompletedOutput() && !Config::Instance()->DisableReactiveMask.value_or(false))
     {
         if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, (void**) &paramReactiveMask) !=
                 NVSDK_NGX_Result_Success &&
@@ -1101,6 +1155,17 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
 #pragma endregion
 
 #pragma region Copy Vulkan Textures to Shared Resources
+
+    if (CapturesCompletedOutput()) {
+        const auto changes = [](const NVSDK_NGX_Resource_VK* source, const VK_TEXTURE2D_RESOURCE_C& target) {
+            return source && target.VkSharedImage && (target.Width != source->Resource.ImageViewInfo.Width ||
+                target.Height != source->Resource.ImageViewInfo.Height || target.Format != source->Resource.ImageViewInfo.Format);
+        };
+        if (changes(paramColor, vkColor) || changes(paramMv, vkMv) || changes(paramOutput, vkOut) ||
+            changes(paramDepth, vkDepth) || changes(paramExposure, vkExp) || changes(paramReactiveMask, vkReactive))
+            for (unsigned slot = 0; slot < VKDX12_BUFFER_COUNT; ++slot)
+                if (!WaitCaptureSlot(slot)) return false;
+    }
 
     // Now process all textures - they will record their copy commands into the same command buffer
     if (paramColor != nullptr)
@@ -1157,7 +1222,8 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
                   magic_enum::enum_name(paramOutput->Resource.ImageViewInfo.Format),
                   (int) paramOutput->Resource.ImageViewInfo.Format);
 
-        if (!CopyTextureFromVkToDx12(InCmdList, paramOutput, &vkOut, OutCopy.get(), false, false))
+        if (!CopyTextureFromVkToDx12(InCmdList, paramOutput, &vkOut,
+                CapturesCompletedOutput() ? OutCopy2.get() : OutCopy.get(), CapturesCompletedOutput(), false))
         {
             LOG_ERROR("Failed to copy output texture!");
             return false;
@@ -1249,6 +1315,8 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
 #pragma endregion
 
 #pragma region Vulkan to D3D12 Synchronization
+
+    if (CapturesCompletedOutput()) CaptureExternalOwnership(InCmdList, true);
 
     // Create shared fence/semaphore if needed
     if (!CreateSharedFenceSemaphore())
@@ -1501,6 +1569,7 @@ bool IFeature_VkwDx12::CopyBackOutput()
         }
 
         std::vector<VkImageMemoryBarrier> imageBarriers;
+        if (CapturesCompletedOutput()) CaptureExternalOwnership(b.VulkanCopyCommandBuffer[frame], false);
         imageBarriers.reserve(5);
 
         auto AddVkBarrier = [&](VK_TEXTURE2D_RESOURCE_C* resource)
@@ -1509,8 +1578,8 @@ bool IFeature_VkwDx12::CopyBackOutput()
             {
                 VkImageMemoryBarrier imageBarrier {};
                 imageBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                imageBarrier.oldLayout = resource->VkSourceImageLayout;
-                imageBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                imageBarrier.oldLayout = CapturesCompletedOutput() ? VK_IMAGE_LAYOUT_GENERAL : resource->VkSourceImageLayout;
+                imageBarrier.newLayout = CapturesCompletedOutput() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 imageBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 imageBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 imageBarrier.image = resource->VkSharedImage;
@@ -1592,7 +1661,7 @@ bool IFeature_VkwDx12::CopyBackOutput()
             // Dispatch resource copy compute shader
             VkExtent2D extent = { vkOut.Width, vkOut.Height };
             if (!OutCopy->Dispatch(VulkanDevice, b.VulkanCopyCommandBuffer[frame], vkOut.VkSharedImageView,
-                                   vkOut.VkSourceImageView, extent))
+                                   vkOut.VkSourceImageView, extent, vkOut.Format))
             {
                 LOG_ERROR("Failed to dispatch resource copy!");
                 return false;
@@ -1722,6 +1791,9 @@ bool IFeature_VkwDx12::CopyBackOutput()
         Vulkan_wDx12::syncSubmitInfo.pCommandBuffers = &b.VulkanBarrierCommandBuffer[frame];
 
         // Trigger the injection on next vkQueueSubmit
+        Vulkan_wDx12::captureCompletionSemaphore = CapturesCompletedOutput() ? vkSemaphoreCopyBack[frame] : VK_NULL_HANDLE;
+        Vulkan_wDx12::captureCompletionValue = CapturesCompletedOutput() ? ++_fenceValue : 0;
+        CopyBackValues[frame] = Vulkan_wDx12::captureCompletionValue;
         Vulkan_wDx12::commandBufferFoundCount = 0;
 
         LOG_DEBUG("Output copy completed synchronously");
@@ -1845,7 +1917,15 @@ HRESULT IFeature_VkwDx12::CreateDx12Device()
     HRESULT result;
     D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_12_0;
 
-    if (State::Instance().currentD3D12Device == nullptr ||
+    if (CapturesCompletedOutput())
+    {
+        result = ofxr_bridge::request_luke_vulkan_context(reinterpret_cast<std::uintptr_t>(VulkanDevice),
+            InteropDevice.ReleaseAndGetAddressOf(), &Dx12CommandQueue);
+        if (FAILED(result)) return result;
+        LOG_INFO("V30068 native Vulkan capture reuses early LUID-matched owner={:p} queue={:p}",
+            static_cast<void*>(InteropDevice.Get()), static_cast<void*>(Dx12CommandQueue));
+    }
+    else if (State::Instance().currentD3D12Device == nullptr ||
         ((State::Instance().gameQuirks & GameQuirk::ForceCreateD3D12Device) && _localDx11on12Device == nullptr))
     {
         IDXGIFactory2* factory = nullptr;
@@ -1907,13 +1987,15 @@ HRESULT IFeature_VkwDx12::CreateDx12Device()
         }
     }
 
+    if (!CapturesCompletedOutput()) InteropDevice = _dx11on12Device;
+
     if (Dx12CommandQueue == nullptr)
     {
         D3D12_COMMAND_QUEUE_DESC queueDesc = {};
         queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
         queueDesc.Type = Dx12CommandListType;
 
-        result = _dx11on12Device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&Dx12CommandQueue));
+        result = InteropDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&Dx12CommandQueue));
 
         if (result != S_OK || Dx12CommandQueue == nullptr)
         {
@@ -1927,7 +2009,7 @@ HRESULT IFeature_VkwDx12::CreateDx12Device()
         if (Dx12CommandAllocator[i] == nullptr)
         {
             result =
-                _dx11on12Device->CreateCommandAllocator(Dx12CommandListType, IID_PPV_ARGS(&Dx12CommandAllocator[i]));
+                InteropDevice->CreateCommandAllocator(Dx12CommandListType, IID_PPV_ARGS(&Dx12CommandAllocator[i]));
 
             if (result != S_OK)
             {
@@ -1939,7 +2021,7 @@ HRESULT IFeature_VkwDx12::CreateDx12Device()
         if (Dx12CommandList[i] == nullptr && Dx12CommandAllocator[i] != nullptr)
         {
             // CreateCommandList
-            result = _dx11on12Device->CreateCommandList(0, Dx12CommandListType, Dx12CommandAllocator[i], nullptr,
+            result = InteropDevice->CreateCommandList(0, Dx12CommandListType, Dx12CommandAllocator[i], nullptr,
                                                         IID_PPV_ARGS(&Dx12CommandList[i]));
 
             if (result != S_OK)
@@ -1954,7 +2036,7 @@ HRESULT IFeature_VkwDx12::CreateDx12Device()
 
     if (Dx12Fence == nullptr)
     {
-        result = _dx11on12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&Dx12Fence));
+        result = InteropDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&Dx12Fence));
 
         if (result != S_OK)
         {
@@ -1988,13 +2070,77 @@ IFeature_VkwDx12::~IFeature_VkwDx12()
     ReleaseSharedResources();
 }
 
+bool IFeature_VkwDx12::WaitCaptureSlot(unsigned frame)
+{
+    if (!CopyBackValues[frame]) return true;
+    // Final Vulkan continuation, not D3D12 completion or early copyback, owns
+    // pool/descriptor reuse. Reallocation additionally drains every old slot.
+    VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wait.semaphoreCount = 1;
+    wait.pSemaphores = &vkSemaphoreCopyBack[frame];
+    wait.pValues = &CopyBackValues[frame];
+    auto waitSemaphores = reinterpret_cast<PFN_vkWaitSemaphores>(VulkanGDPA(VulkanDevice, "vkWaitSemaphores"));
+    if (!waitSemaphores) waitSemaphores = reinterpret_cast<PFN_vkWaitSemaphores>(VulkanGDPA(VulkanDevice, "vkWaitSemaphoresKHR"));
+    return waitSemaphores && waitSemaphores(VulkanDevice, &wait, UINT64_MAX) == VK_SUCCESS;
+}
+
+void IFeature_VkwDx12::DrainCapture()
+{
+    if (State::Instance().isShuttingDown) return;
+    for (unsigned slot = 0; slot < VKDX12_BUFFER_COUNT; ++slot) WaitCaptureSlot(slot);
+}
+
+bool IFeature_VkwDx12::InitInteropFeature(NVSDK_NGX_Parameter* parameters)
+{
+    return dx12Feature->Init(InteropDevice.Get(), Dx12CommandList[0], parameters);
+}
+
+bool IFeature_VkwDx12::EvaluateInteropFeature(ID3D12GraphicsCommandList* cmdList,
+                                            NVSDK_NGX_Parameter* InParameters)
+{
+    bool dx12EvalResult = false;
+        // V23070 can edit either the copied Color before SR or Output after SR.
+        if (dx12Feature->GetUpscalerType() != Upscaler::DLSSD &&
+            Config::Instance()->DlssNrRunBeforeSr.value_or_default())
+            DlssNr::EvaluateBeforeUpscale(Handle()->Id, cmdList, InParameters, InteropQueue());
+        LOG_DEBUG("Dispatch!!");
+        dx12EvalResult = dx12Feature->Evaluate(cmdList, InParameters);
+        if (dx12EvalResult && dx12Feature->GetUpscalerType() != Upscaler::DLSSD &&
+            !Config::Instance()->DlssNrRunBeforeSr.value_or_default())
+            DlssNr::EvaluateAfterUpscale(Handle()->Id, cmdList, InParameters, InteropQueue());
+
+    return dx12EvalResult;
+}
+
+void IFeature_VkwDx12::CaptureExternalOwnership(VkCommandBuffer list, bool release)
+{
+    std::vector<VkImageMemoryBarrier> barriers;
+    for (auto* resource : {&vkColor, &vkMv, &vkDepth, &vkExp, &vkReactive, &vkOut}) {
+        if (!resource->VkSharedImage) continue;
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.oldLayout = release ? resource->VkSharedImageLayout : VK_IMAGE_LAYOUT_GENERAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = release ? ActiveQueueFamilyIndex : VK_QUEUE_FAMILY_EXTERNAL;
+        barrier.dstQueueFamilyIndex = release ? VK_QUEUE_FAMILY_EXTERNAL : ActiveQueueFamilyIndex;
+        barrier.image = resource->VkSharedImage;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier.srcAccessMask = release ? VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT : 0;
+        barrier.dstAccessMask = release ? 0 : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        barriers.push_back(barrier);
+        resource->VkSharedImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        resource->VkSharedImageAccess = release ? 0 : barrier.dstAccessMask;
+    }
+    if (!barriers.empty()) vkCmdPipelineBarrier(list, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+        static_cast<uint32_t>(barriers.size()), barriers.data());
+}
 bool IFeature_VkwDx12::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevice InDevice, VkCommandBuffer InCmdList,
                             PFN_vkGetInstanceProcAddr InGIPA, PFN_vkGetDeviceProcAddr InGDPA,
                             NVSDK_NGX_Parameter* InParameters)
 {
     LOG_FUNC();
 
-    if (IsInited())
+    if (InteropDevice && IsInited())
         return true;
 
     VulkanInstance = InInstance;
@@ -2044,7 +2190,7 @@ bool IFeature_VkwDx12::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevi
     // Create D3D12 device
     auto result = CreateDx12Device();
 
-    if (result != S_OK || _dx11on12Device == nullptr)
+    if (result != S_OK || !InteropDevice)
     {
         LOG_ERROR("CreateDx12Device result: {0:x}", result);
         return false;
@@ -2054,7 +2200,7 @@ bool IFeature_VkwDx12::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevi
 
     // Non-DLSS upscalers don't use the cmdList during Init
     // We have more than one cmdList so unsure how that would even work
-    SetInit(dx12Feature->Init(_dx11on12Device, Dx12CommandList[0], InParameters));
+    SetInit(InitInteropFeature(InParameters));
 
     return IsInited();
 }
@@ -2065,6 +2211,22 @@ bool IFeature_VkwDx12::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter
 
     if (!IsInited())
         return false;
+
+    // Never leave D3D12 pointers in a Vulkan parameter table (also on failure).
+    struct RestoreResources {
+        NVSDK_NGX_Parameter* parameters;
+        const std::array<const char*, 6> keys{NVSDK_NGX_Parameter_Color,
+            NVSDK_NGX_Parameter_MotionVectors, NVSDK_NGX_Parameter_Output,
+            NVSDK_NGX_Parameter_Depth, NVSDK_NGX_Parameter_ExposureTexture,
+            NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask};
+        std::array<void*, 6> values{};
+        explicit RestoreResources(NVSDK_NGX_Parameter* p) : parameters(p) {
+            for (size_t i = 0; i < keys.size(); ++i) p->Get(keys[i], &values[i]);
+        }
+        ~RestoreResources() {
+            for (size_t i = 0; i < keys.size(); ++i) parameters->Set(keys[i], values[i]);
+        }
+    };
 
     auto frame = _frameCount % VKDX12_BUFFER_COUNT;
     auto cmdList = Dx12CommandList[frame];
@@ -2083,26 +2245,27 @@ bool IFeature_VkwDx12::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter
             break;
         }
 
-        InParameters->Set(NVSDK_NGX_Parameter_Color, (void*) vkColor.Dx12Resource);
-        InParameters->Set(NVSDK_NGX_Parameter_MotionVectors, (void*) vkMv.Dx12Resource);
-        InParameters->Set(NVSDK_NGX_Parameter_Output, (void*) vkOut.Dx12Resource);
-        InParameters->Set(NVSDK_NGX_Parameter_Depth, (void*) vkDepth.Dx12Resource);
-
-        if (!AutoExposure() && vkExp.Dx12Resource != nullptr)
-            InParameters->Set(NVSDK_NGX_Parameter_ExposureTexture, (void*) vkExp.Dx12Resource);
-
-        if (!Config::Instance()->DisableReactiveMask.value_or(false) && vkReactive.Dx12Resource != nullptr)
-            InParameters->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, (void*) vkReactive.Dx12Resource);
-
-        // V23070 can edit either the copied Color before SR or Output after SR.
-        if (dx12Feature->GetUpscalerType() != Upscaler::DLSSD &&
-            Config::Instance()->DlssNrRunBeforeSr.value_or_default())
-            DlssNr::EvaluateBeforeUpscale(Handle()->Id, cmdList, InParameters, Dx12CommandQueue);
-        LOG_DEBUG("Dispatch!!");
-        dx12EvalResult = dx12Feature->Evaluate(cmdList, InParameters);
-        if (dx12EvalResult && dx12Feature->GetUpscalerType() != Upscaler::DLSSD &&
-            !Config::Instance()->DlssNrRunBeforeSr.value_or_default())
-            DlssNr::EvaluateAfterUpscale(Handle()->Id, cmdList, InParameters, Dx12CommandQueue);
+        if (CapturesCompletedOutput()) {
+            LogNativeMotionHistory(InParameters, _frameCount);
+            NVNGX_Parameters captureParameters(API::DX12, false);
+            luke_vulkan::copy_capture_metadata(*InParameters, captureParameters);
+            captureParameters.Set(NVSDK_NGX_Parameter_Color, vkColor.Dx12Resource);
+            captureParameters.Set(NVSDK_NGX_Parameter_MotionVectors, vkMv.Dx12Resource);
+            captureParameters.Set(NVSDK_NGX_Parameter_Output, vkOut.Dx12Resource);
+            captureParameters.Set(NVSDK_NGX_Parameter_Depth, vkDepth.Dx12Resource);
+            dx12EvalResult = EvaluateInteropFeature(cmdList, &captureParameters);
+        } else {
+            RestoreResources restore(InParameters);
+            InParameters->Set(NVSDK_NGX_Parameter_Color, (void*) vkColor.Dx12Resource);
+            InParameters->Set(NVSDK_NGX_Parameter_MotionVectors, (void*) vkMv.Dx12Resource);
+            InParameters->Set(NVSDK_NGX_Parameter_Output, (void*) vkOut.Dx12Resource);
+            InParameters->Set(NVSDK_NGX_Parameter_Depth, (void*) vkDepth.Dx12Resource);
+            if (!AutoExposure() && vkExp.Dx12Resource != nullptr)
+                InParameters->Set(NVSDK_NGX_Parameter_ExposureTexture, (void*) vkExp.Dx12Resource);
+            if (!Config::Instance()->DisableReactiveMask.value_or(false) && vkReactive.Dx12Resource != nullptr)
+                InParameters->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, (void*) vkReactive.Dx12Resource);
+            dx12EvalResult = EvaluateInteropFeature(cmdList, InParameters);
+        }
 
     } while (false);
 
@@ -2114,15 +2277,6 @@ bool IFeature_VkwDx12::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter
         LOG_ERROR("Can't copy output texture back!");
         return false;
     }
-
-    // Not restoring the original values of NVSDK_NGX_Parameter_Color etc.
-    // Unsure if that's a potential problem but in theory the game should only be setting those
-    InParameters->Set(NVSDK_NGX_Parameter_Color, (void*) nullptr);
-    InParameters->Set(NVSDK_NGX_Parameter_MotionVectors, (void*) nullptr);
-    InParameters->Set(NVSDK_NGX_Parameter_Output, (void*) nullptr);
-    InParameters->Set(NVSDK_NGX_Parameter_Depth, (void*) nullptr);
-    InParameters->Set(NVSDK_NGX_Parameter_ExposureTexture, (void*) nullptr);
-    InParameters->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, (void*) nullptr);
 
     _frameCount++;
 
@@ -2145,7 +2299,7 @@ bool IFeature_VkwDx12::CreateSharedFenceSemaphore()
         if (dx12FenceTextureCopy[i] == nullptr)
         {
             auto result =
-                _dx11on12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&dx12FenceTextureCopy[i]));
+                InteropDevice->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&dx12FenceTextureCopy[i]));
 
             if (result != S_OK)
             {
@@ -2157,7 +2311,7 @@ bool IFeature_VkwDx12::CreateSharedFenceSemaphore()
         // Create shared handle for the fence (only once)
         if (vkSHForTextureCopy[i] == nullptr)
         {
-            auto result = _dx11on12Device->CreateSharedHandle(dx12FenceTextureCopy[i], nullptr, GENERIC_ALL, nullptr,
+            auto result = InteropDevice->CreateSharedHandle(dx12FenceTextureCopy[i], nullptr, GENERIC_ALL, nullptr,
                                                               &vkSHForTextureCopy[i]);
 
             if (result != S_OK)

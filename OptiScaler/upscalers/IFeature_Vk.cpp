@@ -3,6 +3,58 @@
 #include "IFeature_Vk.h"
 #include "State.h"
 #include "nvsdk_ngx_vk.h"
+#include <upscalers/IFeature_VkwDx12.h>
+#include <inputs/NVNGX_DLSS.h>
+#include <ofxr/ofxr_bridge_client.hpp>
+#include <hooks/VulkanCaptureFeatures.h>
+#include <hooks/LukeSourceTrace.h>
+#include "../../third_party/ofxr/include/xrfg/bridge_flight_logger.hpp"
+
+// No second SR/NR/postprocessing pipeline: native Vulkan DLSS evaluates first.
+// The bridge only transports that exact completed color and its same-call guides.
+class LukeVulkanCaptureBridge final : public IFeature_VkwDx12
+{
+    IFeature* _native;
+  protected:
+    IFeature* InteropFeature() override { return _native; }
+    bool CapturesCompletedOutput() const override { return true; }
+    bool InitInteropFeature(NVSDK_NGX_Parameter*) override {
+        ofxr_bridge::ensure_d3d12_submission_hook(InteropDeviceOwner());
+        LOG_INFO("V30065 Luke native Vulkan guide/color capture ready, stream={} queue={:p}",
+            Handle()->Id, static_cast<void*>(InteropQueue()));
+        return _native->IsInited();
+    }
+    bool EvaluateInteropFeature(ID3D12GraphicsCommandList* list,
+                                 NVSDK_NGX_Parameter* parameters) override {
+        static_cast<void>(ofxr_bridge::take_luke_origin_frame());
+        LukeRossDlssIngress::PublishD3D12Guide(Handle()->Id, list, parameters, _native, InteropQueue());
+        const HRESULT result = LukeRossDlssIngress::CompleteD3D12Color(list, parameters, _native, true);
+        static std::atomic_uint64_t receipts{0};
+        const auto receipt = receipts.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (receipt <= 2 || receipt % 240 == 0) {
+            const auto control = ofxr_bridge::snapshot();
+            LOG_INFO("V30067 Vulkan AFW completion receipt={} stream={} nativeFrame={} result=0x{:X} embedded={} tracking={} generation={} afwMode={}",
+                receipt, Handle()->Id, _native->FrameCount(), static_cast<unsigned>(result),
+                ofxr_bridge::embedded_layer_active(), control.desired.motion_vectors,
+                control.desired.frame_generation, ofxr_bridge::afw_snapshot().desired.mode);
+        }
+        xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::luke_afw_stage,
+            result, 130, Handle()->Id, _native->FrameCount());
+        // Missing camera/guide rejects AFW, not the already-completed native SR.
+        // Finish the copyback handshake even if no identity could be stamped.
+        return true;
+    }
+  public:
+    LukeVulkanCaptureBridge(IFeature* native, NVSDK_NGX_Parameter* parameters)
+        : IFeature(native->Handle()->Id, parameters), IFeature_Vk(native->Handle()->Id, parameters),
+          IFeature_VkwDx12(native->Handle()->Id, parameters), _native(native) {}
+    Upscaler GetUpscalerType() const override { return _native->GetUpscalerType(); }
+    ~LukeVulkanCaptureBridge() override {
+        DrainCapture();
+        ofxr_bridge::retire_dlss_guide_stream(Handle()->Id);
+    }
+};
+
 
 bool IFeature_Vk::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevice InDevice, VkCommandBuffer InCmdBuffer,
                        PFN_vkGetInstanceProcAddr InGIPA, PFN_vkGetDeviceProcAddr InGDPA,
@@ -24,6 +76,18 @@ bool IFeature_Vk::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevice In
         Magnifier = std::make_unique<Magnifier_Vk>("Magnifier", InDevice, InPD);
 
         // UpscalerTime = std::make_unique<GpuTime_Vk>(InDevice);
+        if ((GetUpscalerType() == Upscaler::DLSS || GetUpscalerType() == Upscaler::DLSSD) &&
+            !IsWithDx12() && LukeRossDlssIngress::Detected()) {
+            if (!vulkan_capture::enabled(InDevice)) {
+                LOG_ERROR("V30065 Luke Vulkan capture requires enabled shaderStorageImageExtendedFormats; native SR unchanged");
+                return result;
+            }
+            _lukeCapture = std::make_unique<LukeVulkanCaptureBridge>(this, InParameters);
+            if (!_lukeCapture->Init(InInstance, InPD, InDevice, InCmdBuffer, InGIPA, InGDPA, InParameters)) {
+                LOG_ERROR("V30065 Luke Vulkan interop initialization failed; native SR remains Vulkan");
+                _lukeCapture.reset();
+            }
+        }
     }
 
     return result;
@@ -304,6 +368,15 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
     }
 
     _frameCount++;
+
+    if(_lukeCapture) luke_source::native(*InParameters,2,Handle()->Id,reinterpret_cast<std::uintptr_t>(InCmdBuffer));
+    // ONE completion for native Vulkan SR and RR, after every native postpass.
+    if (_lukeCapture && ofxr_bridge::afw_snapshot().desired.mode != 0 &&
+        !_lukeCapture->Evaluate(InCmdBuffer, InParameters)) {
+        static std::atomic_uint64_t failures{0};
+        if (failures.fetch_add(1, std::memory_order_relaxed) < 8)
+            LOG_ERROR("V30065 Luke Vulkan completed-color capture failed");
+    }
 
     return evalResult;
 }

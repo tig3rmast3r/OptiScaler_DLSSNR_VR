@@ -21,6 +21,9 @@
 #include <misc/IdentifyGpu.h>
 
 #include "Hook_Utils.h"
+#include "VulkanCaptureFeatures.h"
+#include <inputs/NVNGX_DLSS.h>
+#include <ofxr/ofxr_bridge_client.hpp>
 
 // for menu rendering
 static VkDevice _device = VK_NULL_HANDLE;
@@ -31,6 +34,7 @@ static HWND _hwnd = nullptr;
 static std::mutex _vkPresentMutex;
 
 PFN_vkCreateDevice o_vkCreateDevice = nullptr;
+static PFN_vkDestroyDevice o_vkDestroyDevice = nullptr;
 PFN_vkCreateInstance o_vkCreateInstance = nullptr;
 PFN_vkCreateWin32SurfaceKHR o_vkCreateWin32SurfaceKHR = nullptr;
 PFN_vkQueuePresentKHR o_QueuePresentKHR = nullptr;
@@ -152,6 +156,12 @@ static VkResult hkvkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, cons
     return result;
 }
 
+VALIDATE_HOOK(hkvkDestroyDevice, PFN_vkDestroyDevice)
+static void hkvkDestroyDevice(VkDevice device, const VkAllocationCallbacks* allocator) {
+    ofxr_bridge::unregister_luke_vulkan_device(reinterpret_cast<std::uintptr_t>(device));
+    o_vkDestroyDevice(device, allocator);
+}
+
 VALIDATE_HOOK(hkvkCreateDevice, PFN_vkCreateDevice)
 static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo,
                                  const VkAllocationCallbacks* pAllocator, VkDevice* pDevice)
@@ -178,7 +188,24 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
 
     VulkanSpoofing::hkvkCreateDevice(physicalDevice, &localCreteInfo, pAllocator, pDevice);
 
+    vulkan_capture::FeatureRequest captureFeatures;
+    const bool extendedFormats = captureFeatures.prepare(localCreteInfo,
+        !State::Instance().vulkanSkipHooks && LukeRossDlssIngress::Detected(),
+        features2.features.shaderStorageImageExtendedFormats == VK_TRUE);
     auto result = o_vkCreateDevice(physicalDevice, &localCreteInfo, pAllocator, pDevice);
+    if (result == VK_SUCCESS) vulkan_capture::record(*pDevice, extendedFormats);
+    if (result == VK_SUCCESS && !State::Instance().vulkanSkipHooks) {
+        ScopedSkipSpoofingGlobal skip;
+        VkPhysicalDeviceIDProperties identity{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        properties.pNext = &identity;
+        vkGetPhysicalDeviceProperties2(physicalDevice, &properties);
+        LUID luid{};
+        static_assert(sizeof(luid) == VK_LUID_SIZE);
+        std::memcpy(&luid, identity.deviceLUID, sizeof(luid));
+        ofxr_bridge::register_luke_vulkan_device(reinterpret_cast<std::uintptr_t>(*pDevice),
+            luid, identity.deviceNodeMask, identity.deviceLUIDValid == VK_TRUE);
+    }
 
     if (result == VK_SUCCESS && Config::Instance()->OverlayMenu.value_or_default())
     {
@@ -321,6 +348,11 @@ PFN_vkVoidFunction hkvkGetInstanceProcAddr(VkInstance instance, const char* pNam
 
     auto procName = std::string(pName);
 
+    if (procName == "vkDestroyDevice") {
+        if (!o_vkDestroyDevice) o_vkDestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(orgFunc);
+        return reinterpret_cast<PFN_vkVoidFunction>(hkvkDestroyDevice);
+    }
+
     if (procName == std::string("vkCreateInstance"))
     {
         if (o_vkCreateInstance == nullptr)
@@ -354,6 +386,11 @@ PFN_vkVoidFunction hkvkGetDeviceProcAddr(VkDevice device, const char* pName)
         return VK_NULL_HANDLE;
 
     auto procName = std::string(pName);
+
+    if (procName == "vkDestroyDevice") {
+        if (!o_vkDestroyDevice) o_vkDestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(orgFunc);
+        return reinterpret_cast<PFN_vkVoidFunction>(hkvkDestroyDevice);
+    }
 
     if (procName == std::string("vkCreateInstance"))
     {
@@ -420,6 +457,10 @@ void VulkanHooks::Hook(HMODULE vulkan1)
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
 
+    if (!o_vkDestroyDevice) o_vkDestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(
+        KernelBaseProxy::GetProcAddress_()(vulkan1, "vkDestroyDevice"));
+    if (o_vkDestroyDevice) DetourAttach(&(PVOID&)o_vkDestroyDevice, hkvkDestroyDevice);
+
     if (o_vkCreateDevice != nullptr)
         DetourAttach(&(PVOID&) o_vkCreateDevice, hkvkCreateDevice);
 
@@ -455,6 +496,8 @@ void VulkanHooks::Unhook()
 {
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
+
+    if (o_vkDestroyDevice) DetourDetach(&(PVOID&)o_vkDestroyDevice, hkvkDestroyDevice);
 
     if (o_QueuePresentKHR != nullptr)
         DetourDetach(&(PVOID&) o_QueuePresentKHR, hkvkQueuePresentKHR);

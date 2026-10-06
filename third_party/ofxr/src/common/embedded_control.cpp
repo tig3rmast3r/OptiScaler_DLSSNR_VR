@@ -5,10 +5,12 @@
 #include <mutex>
 #include <algorithm>
 #include <cmath>
+#include <atomic>
 #include <cwchar>
 
 namespace xrfg::embedded {
 namespace {
+std::atomic_bool g_layer_active{false};
 std::filesystem::path directory() {
     HMODULE module{};
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -178,6 +180,21 @@ bool toggle_afw_debug() {
     return request_afw(settings);
 }
 
+void report_afw_ingress(bool published, bool camera) {
+    auto& c = afw_control();
+    std::scoped_lock lock(c.mutex);
+    ++c.snapshot.ingress_frames;
+    if (published) ++c.snapshot.published_ingress_frames;
+    if (!camera) ++c.snapshot.missing_camera_ingress_frames;
+}
+
+void report_afw_guide_rejection(std::uint32_t mask) {
+    auto& c = afw_control();
+    std::scoped_lock lock(c.mutex);
+    ++c.snapshot.rejected_guide_pairs;
+    c.snapshot.last_guide_rejection = mask;
+}
+
 void report_afw_prepare(std::int64_t reason) {
     auto& c = afw_control();
     std::scoped_lock lock(c.mutex);
@@ -213,6 +230,8 @@ void applied(std::uint64_t id, std::uint64_t revision, bool enabled, long error)
     auto& c = control(); std::scoped_lock lock(c.mutex);
     if (auto it = c.sessions.find(id); it != c.sessions.end()) it->second = {revision, enabled, error};
 }
+void set_layer_active(bool active) noexcept { g_layer_active.store(active, std::memory_order_release); }
+bool layer_active() noexcept { return g_layer_active.load(std::memory_order_acquire); }
 bool logging_setting() { return GetPrivateProfileIntW(L"diagnostics", L"logging_enabled", 0, ini().c_str()) != 0; }
 bool set_logging_setting(bool enabled) { return write(L"diagnostics", L"logging_enabled", enabled ? L"1" : L"0"); }
 bool cadence_setting() { return GetPrivateProfileIntW(L"diagnostics", L"cadence_logging_enabled", 0, ini().c_str()) != 0; }

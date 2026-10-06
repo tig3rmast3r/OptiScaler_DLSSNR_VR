@@ -21,6 +21,8 @@
 #include <misc/IdentifyGpu.h>
 
 #include "Hook_Utils.h"
+#include "LukeNativeSceneCamera.h"
+#include "../inputs/NVNGX_DLSS.h"
 
 #pragma intrinsic(_ReturnAddress)
 
@@ -2239,6 +2241,10 @@ static void HookToDevice(ID3D12Device* InDevice)
     }
 
     HookToCommandList(InDevice);
+    if (LukeRossDlssIngress::Detected()) {
+        const bool cameraProbe = luke_scene_camera::install(realDevice ? realDevice : InDevice);
+        LOG_INFO("V33008 current scene camera hooks installed={}", cameraProbe);
+    }
     // NR is independent of OptiScaler FG. Install only the queue-submission hook here, before the
     // first DLSS feature can record NR work; the FG/HUD resource trackers remain gated below.
     ResTrack_Dx12::HookQueueSubmission(InDevice);
@@ -2345,6 +2351,8 @@ void D3D12Hooks::HookAgility(HMODULE module)
 
 void D3D12Hooks::Unhook()
 {
+    if (!luke_scene_camera::uninstall())
+        LOG_ERROR("V33003 native buffer camera probe hooks could not detach");
     if (o_D3D12CreateDevice == nullptr)
         return;
 

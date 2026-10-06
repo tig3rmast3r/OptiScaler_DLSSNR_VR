@@ -72,6 +72,14 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
+    const HMODULE embedded_owner = delegated_module ? delegated_module : module;
+    const auto embedded_active = reinterpret_cast<int (*)() noexcept>(
+        GetProcAddress(embedded_owner, "OFXR_GetEmbeddedLayerActiveV1"));
+    if (embedded_active && embedded_active() != 1) {
+        std::cerr << "successful embedded negotiation did not establish ownership\n";
+        return EXIT_FAILURE;
+    }
+
     if (delegated_module != nullptr) {
         HMODULE owner = nullptr;
         if (!GetModuleHandleExW(

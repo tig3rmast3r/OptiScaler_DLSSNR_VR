@@ -29,7 +29,7 @@ void stamp(std::vector<float>& row, double start, double scale, std::uint32_t to
 }
 void codec_tests() {
     require(xrfg::kLukeOriginBits==64 && xrfg::kLukeOriginWidth==256 &&
-        xrfg::kLukeOriginHeight==8, "compact one-band dimensions");
+        xrfg::kLukeOriginHeight==8, "compact copy dimensions");
     for (const auto token : {1u,17u,0x12345678u,0xfedcba98u,UINT32_MAX})
         for (const double scale : {.5,.75,.9,1.,1.1,1.25,1.5,2.})
             for (const double offset : {.0,.2,.5,.8}) {
@@ -62,14 +62,37 @@ void codec_tests() {
     require(!xrfg::decode_luke_origin_row(row).token,"zero token accepted");
     xrfg::LukeColorOriginLayout layout;
     require(xrfg::compact_luke_origin_layout(3344,3344,3063,3344,layout),"Horizon crop layout");
-    require(layout.band.x==283 && layout.band.y==2 && layout.band.width==256 &&
-        layout.band.height==8 && layout.scan.width==541 && layout.scan.height==12,"derived corner crop");
+    require(layout.band_count==1 && layout.bands[0].x==283 && layout.bands[0].y==2 && layout.bands[0].width==256 &&
+        layout.bands[0].height==8 && layout.scan.width==541 && layout.scan.height==12,"derived corner crop");
     for (unsigned crop=0;crop<=281;++crop)
-        require(layout.band.x>=crop && layout.band.x+256<=crop+3063,"either-eye crop erases marker");
+        require(layout.bands[0].x>=crop && layout.bands[0].x+256<=crop+3063,"either-eye crop erases marker");
     require(xrfg::compact_luke_origin_layout(2048,1400,1700,1200,layout),"vertical crop layout");
     for (unsigned crop=0;crop<=200;++crop)
-        require(layout.band.y>=crop && layout.band.y+8<=crop+1200,"vertical crop erases band");
-    require(!xrfg::compact_luke_origin_layout(1024,1024,400,1024,layout),"no common crop invented");
+        require(layout.bands[0].y>=crop && layout.bands[0].y+8<=crop+1200,"vertical crop erases band");
+    require(xrfg::compact_luke_origin_layout(2560,1440,1319,1440,layout),"KCD2 measured crop layout");
+    require(layout.band_count==2&&layout.scan.width==1319&&layout.scan.height==12,"KCD2 bounded two-band ROI");
+    for(unsigned i=0;i<layout.band_count;++i) {
+        const auto& b=layout.bands[i];
+        require(b.x+b.width<=2560&&b.y+b.height<=1440,"band outside producer");
+        if(i)require(layout.bands[i-1].x+layout.bands[i-1].width<=b.x,"copies overwrite Manchester cells");
+    }
+    constexpr std::uint32_t coverage_token=0xa5c31236u;
+    std::vector<float> producer(2560,.5F);
+    for(unsigned i=0;i<layout.band_count;++i)for(unsigned x=0;x<xrfg::kLukeOriginWidth;++x)
+        producer[layout.bands[i].x+x]=xrfg::luke_origin_white(coverage_token,x)?1.F:0.F;
+    // Decode real cell patterns through EVERY possible KCD2 crop origin, not
+    // merely the left/right endpoints or a matching implementation formula.
+    for(unsigned crop=0;crop<=2560-1319;++crop) {
+        const auto decoded=xrfg::decode_luke_origin_row(std::span<const float>(producer).subspan(crop,1319));
+        require(decoded.token==coverage_token&&!decoded.ambiguous,"KCD2 crop lost/corrupted token");
+    }
+    // Both copies present in one eye must still reject conflicting identities.
+    for(unsigned x=0;x<xrfg::kLukeOriginWidth;++x)
+        producer[layout.bands[1].x+x]=xrfg::luke_origin_white(coverage_token+1,x)?1.F:0.F;
+    require(xrfg::decode_luke_origin_row(std::span<const float>(producer).subspan(620,1319)).ambiguous,
+        "distinct copied tokens selected silently");
+    require(!xrfg::compact_luke_origin_layout(1024,1024,400,1024,layout),"uncoverable disjoint crop admitted");
+    require(!xrfg::compact_luke_origin_layout(UINT32_MAX,1440,1319,1440,layout),"oversized/overflow layout admitted");
     require(!xrfg::compact_luke_origin_layout(512,8,512,8,layout),"insufficient band margin accepted");
     require(!xrfg::compact_luke_origin_layout(512,32,1024,32,layout),"upscaled/crop mismatch accepted");
 }
@@ -162,6 +185,25 @@ void gpu_tests() {
     gpu.crop(final.Get(),active.Get(),160,16,800,32);gpu.submit();
     check(xrfg::read_luke_color_origin(gpu.queue.Get(),active.Get(),&token,D3D12_RESOURCE_STATE_COMMON,5000),"final active read");
     require(token==0xfedcba98u,"marker attached to intermediate/incorrect active rectangle");
+    // Actual KCD2 producer and eye dimensions; endpoint and interior crops.
+    gpu.reset();auto kcd_source=gpu.texture(2560,1440);
+    const std::array<unsigned,8> crops{0,1,257,258,620,1059,1060,1241};
+    std::array<ComPtr<ID3D12Resource>,8> eyes;
+    xrfg::configure_luke_color_origin_extent(1319,1440);
+    constexpr std::uint32_t kcd_token=0x50520731u;
+    check(xrfg::mark_luke_color_origin(gpu.list.Get(),kcd_source.Get(),kcd_token,
+        D3D12_RESOURCE_STATE_COMMON,gpu.device.Get()),"KCD2 measured producer marker");
+    for(unsigned i=0;i<eyes.size();++i) {
+        eyes[i]=gpu.texture(1319,1440);
+        gpu.crop(kcd_source.Get(),eyes[i].Get(),crops[i],0,1319,1440);
+    }
+    gpu.submit();
+    for(auto& eye:eyes) {
+        check(xrfg::read_luke_color_origin(gpu.queue.Get(),eye.Get(),&token,D3D12_RESOURCE_STATE_COMMON,5000),
+            "KCD2 actual GPU endpoint/interior crop read");
+        require(token==kcd_token,"KCD2 GPU crop changed publication identity");
+    }
+
 }
 }
 int main() {

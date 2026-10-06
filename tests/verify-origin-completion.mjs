@@ -7,44 +7,58 @@ const root = path.resolve(process.argv[2] ?? '.');
 const read = name => fs.readFileSync(path.join(root, name), 'utf8');
 const source = read('OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp');
 const helper = source.indexOf('static NVSDK_NGX_Result EvaluateFeatureImplementationDx12(');
+const writer = source.indexOf('HRESULT LukeRossDlssIngress::CompleteD3D12Color(');
 const exported = source.indexOf('NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(');
-assert(helper >= 0 && exported > helper, 'both SR routes need one common completion wrapper');
-const implementation = source.slice(helper, exported);
-const completion = source.slice(exported, source.indexOf('#pragma endregion', exported));
+assert(helper >= 0 && writer > helper && exported > writer, 'shared completion writer missing');
+const implementation = source.slice(helper, writer);
+const completion = source.slice(writer, exported);
+const wrapper = source.slice(exported, source.indexOf('#pragma endregion', exported));
 assert(implementation.includes('NVNGXProxy::D3D12_EvaluateFeature()('), 'native SR route missing');
 assert(implementation.includes('TryEvaluateOptiFeature('), 'owned SR route missing');
-assert(!implementation.includes('take_luke_origin_frame()'), 'native-only consumption bypasses common completion');
-assert(!implementation.includes('mark_luke_color_origin('), 'native-only marker survived replacement');
-assert.equal(source.match(/xrfg::mark_luke_color_origin\(/g)?.length, 1, 'exactly one completion writer');
-const evaluate = completion.indexOf('const auto result = EvaluateFeatureImplementationDx12(');
+assert(!implementation.includes('take_luke_origin_frame()') && !implementation.includes('mark_luke_color_origin('),
+    'SR implementation must not consume/write final identity');
+assert.equal(source.match(/xrfg::mark_luke_color_origin\(/g)?.length, 1, 'one functional writer, not an API-specific duplicate');
+assert(wrapper.indexOf('const auto result = EvaluateFeatureImplementationDx12(') <
+       wrapper.indexOf('LukeRossDlssIngress::CompleteD3D12Color('), 'D3D12 must complete only after all SR/postprocessing');
+assert(wrapper.includes('result == NVSDK_NGX_Result_Success') &&
+    wrapper.includes('context->second.feature.get()'), 'failed SR cannot stamp and final extent needs owned metadata');
 const origin = completion.indexOf('const auto color_origin = ofxr_bridge::take_luke_origin_frame()');
-const finalOutput = completion.indexOf('InParameters->Get(NVSDK_NGX_Parameter_Output, &final_output)');
+const finalOutput = completion.indexOf('parameters->Get(NVSDK_NGX_Parameter_Output, &final_output)');
 const marker = completion.indexOf('xrfg::mark_luke_color_origin(native_list, final_output,');
-assert(evaluate >= 0 && origin > evaluate && finalOutput > origin && marker > finalOutput,
-    'stamp the restored final output after SR/postprocessing/NR, retaining its immutable guide');
-assert(completion.includes('color_origin->color_origin_token, state,'),
-    'the completion writer must receive its exact allocated 32-bit color token');
-assert(!completion.includes('color_origin->publication, state,'),
-    'publication must not be truncated or passed as the compact wire token');
-assert(completion.includes('result == NVSDK_NGX_Result_Success && color_origin'), 'failed SR must not stamp');
-assert(completion.includes('owned_sr ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS'), 'owned final DLSS state must be UAV');
-assert(completion.includes('SameAdapter(final_device.Get(), color_origin->verified_producer_device.Get())'),
-    'final resource must use the validated same-adapter ingress contract');
-assert(!completion.includes('SameCanonicalIdentity(final_device.Get(),'),
-    'resource-device aliases must not be rejected by a stricter canonical-device guard');
-assert(completion.includes('d3d_owner::same(list_device.Get(), color_origin->verified_producer_device.Get())'),
-    'completion must reuse the exact device-backing proof, never adapter-only ownership');
-assert(completion.includes('Dx12Contexts.find(InFeatureHandle->Id)') &&
-    completion.includes('context->second.feature->DisplayWidth()') &&
-    completion.includes('context->second.feature->DisplayHeight()'),
-    'owned final extent must come from authoritative creation-time display dimensions');
-assert(!completion.includes('InParameters->Get(NVSDK_NGX_Parameter_OutWidth') &&
-    !completion.includes('InParameters->Get(NVSDK_NGX_Parameter_OutHeight'),
-    'owned Evaluate params need not repeat creation-only output dimensions');
+assert(origin >= 0 && finalOutput > origin && marker > finalOutput, 'writer must take exact retained origin and restored output');
+assert(completion.includes('color_origin->color_origin_token, state,') &&
+    !completion.includes('color_origin->publication, state,'), 'never truncate publication into compact token');
+assert(completion.includes('owned_sr ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS'), 'owned final color state must be UAV');
+assert(completion.includes('SameAdapter(final_device.Get(), color_origin->verified_producer_device.Get())') &&
+    completion.includes('d3d_owner::same(list_device.Get(), color_origin->verified_producer_device.Get())'),
+    'resource adapter compatibility and exact list backing owner remain distinct requirements');
+assert(completion.includes('feature->DisplayWidth()') && completion.includes('feature->DisplayHeight()'),
+    'authoritative final display extent required for either API');
 for (const failure of ['Nested', 'MissingOutput', 'MissingContext', 'Dimensions', 'ResourceAdapter', 'ListIdentity', 'Unsupported'])
     assert(completion.includes(`kOrigin${failure}`), `missing marker validation condition ${failure}`);
-assert(completion.includes('marker_result, 91, color_origin->publication'),
-    'the single functional writer outcome must retain the full publication label');
+assert(completion.includes('marker_result, 91, color_origin->publication'), 'keep full writer outcome identity');
+const vk = read('OptiScaler/upscalers/IFeature_Vk.cpp');
+assert(vk.indexOf('paramOutput->Resource.ImageViewInfo.Image = originalOutput.Image') <
+    vk.indexOf('_lukeCapture->Evaluate(InCmdBuffer, InParameters)'), 'capture follows restored native Vulkan pipeline');
+for (const native of ['dlss/DLSSFeature_Vk.cpp', 'dlssd/DLSSDFeature_Vk.cpp']) {
+    const feature = read('OptiScaler/upscalers/' + native);
+    assert(feature.includes('NVNGXProxy::VULKAN_EvaluateFeature()(') &&
+        !feature.includes('NVNGXProxy::D3D12_EvaluateFeature()('), 'do not replace native Vulkan SR/RR');
+}
+assert(vk.includes('GetUpscalerType() == Upscaler::DLSS || GetUpscalerType() == Upscaler::DLSSD') &&
+    vk.includes('parameters, _native, InteropQueue()') &&
+    vk.includes('CompleteD3D12Color(list, parameters, _native, true)'), 'SR/RR share explicit queue and one completion writer');
+const interop = read('OptiScaler/upscalers/IFeature_VkwDx12.cpp');
+assert(interop.includes('CapturesCompletedOutput() ? OutCopy2.get() : OutCopy.get()') &&
+    interop.includes('CaptureExternalOwnership(InCmdList, true)') &&
+    interop.includes('CaptureExternalOwnership(b.VulkanCopyCommandBuffer[frame], false)') &&
+    interop.includes('wait.pValues = &CopyBackValues[frame]') &&
+    interop.includes('parameters->Set(keys[i], values[i])'), 'separate descriptor rings, GPU ownership, slot completion and parameter restoration required');
+const producerBroker = read('OptiScaler/hooks/LukeVulkanProducer.h');
+assert(interop.includes('ofxr_bridge::request_luke_vulkan_context(') &&
+    producerBroker.includes('factory->EnumAdapterByLuid(found->second.luid,') &&
+    producerBroker.includes('if (devices.size() != 1) return E_INVALIDARG;'),
+    'Vulkan producer determines exact D3D12 adapter; no title or primary GPU guess');
 for (const retired of ['luke_origin_observer', 'HookOriginObserver', 'ObserveNativeTrace',
     'luke_recording_token', 'bind_luke_sr_recording_token', 'ObserveOriginResourceWitness',
     'marker_failures, 92,', 'publication), 93,'])
@@ -145,10 +159,94 @@ assert(ingress.indexOf('if (deviceFailures)') < ingress.indexOf('publication.ver
 console.log('Origin completion and guide ownership source contracts: PASS');
 const afw = read('third_party/ofxr/src/d3d12/luke_afw.cpp');
 assert(afw.includes('luke_motion_srv_format(motion_desc.Format) == DXGI_FORMAT_UNKNOWN') &&
-    afw.includes('srv.Format = luke_motion_srv_format(guide.motion_vectors->GetDesc().Format)') &&
+    afw.includes('srv.Format=index==0?luke_motion_srv_format(field->GetDesc().Format):DXGI_FORMAT_R32_FLOAT') &&
     afw.includes('clean.Format = kLukeAfwMotionFormat') &&
     afw.includes('motion_description.Format == kLukeAfwMotionFormat') &&
     afw.includes('texture.Format = kLukeAfwMotionFormat') &&
     !afw.includes('description.Format != DXGI_FORMAT_R16G16_FLOAT'),
     'float2 inputs must use their actual typed SRV and one normalized RG16F AFW output');
+const motionFormat = read('third_party/ofxr/include/xrfg/luke_motion_format.hpp');
+assert(motionFormat.includes('case DXGI_FORMAT_R16G16B16A16_FLOAT:') &&
+    motionFormat.includes('case DXGI_FORMAT_R32G32B32A32_FLOAT: return format;') &&
+    motionFormat.includes('kLukeAfwMotionFormat = DXGI_FORMAT_R16G16_FLOAT'),
+    'typed float4 XY inputs must preserve actual SRV format and normalized RG16F output');
 console.log('Luke motion input/output format contract: PASS');
+const composition = read('third_party/ofxr/src/d3d12/luke_compose_motion.hlsl');
+const bridge = read('OptiScaler/ofxr/ofxr_bridge_client.cpp');
+const motionStore = read('third_party/ofxr/src/common/dlss_motion_vectors.cpp');
+assert(composition.includes('CurrentDepth.Load') && composition.includes('same.xy/same.w-opposite.xy/opposite.w') &&
+    afw.includes('luke_native_motion_constants(guide,') &&
+    motionStore.includes('frame->previous_same_native_camera=dlss_native_camera_history(*stream.previous)') &&
+    !composition.includes('PreviousMotion') && !afw.includes('prior_motion') &&
+    afw.includes('params.motion_vectors_type = Normal;'),
+    'depth-projected native camera rebase physically replaces adjacent-field sampling; Normal for every mode');
+assert(bridge.includes('embedded.raw_clip_to_previous_clip = productionCameraToken ? std::array<float,16>{} : g_active_streamline_camera.clip_to_previous_clip') &&
+    bridge.includes('embedded.raw_camera_motion_included = productionCameraToken ? -1 : g_active_streamline_camera.camera_motion_included') &&
+    motionStore.includes('frame->raw_clip_to_previous_clip = publication.raw_clip_to_previous_clip'),
+    'declared Streamline metadata remains immutable; native producer must not borrow unreported Streamline motion history');
+console.log('Native depth/camera motion rebase contract: PASS');
+const sourceTrace=read('OptiScaler/hooks/LukeSourceTrace.h');
+const sourceContext=read('OptiScaler/hooks/LukeSourceContext.h');
+const sourceHooks=read('OptiScaler/hooks/Streamline_Hooks.cpp');
+const nativePipeline=read('OptiScaler/upscalers/IFeature_Vk.cpp');
+assert(afw.includes('params.motion_scale[0] = guide.scale_x *') &&
+    afw.includes('params.motion_scale[1] = guide.scale_y *') &&
+    !afw.includes('params.motion_scale[0] = -guide.scale_x *'),
+    'rejected sign control must be absent: source trace uses V30071 geometry');
+assert(sourceTrace.includes('p->conversionFormula') && sourceTrace.includes('t.extent.left') &&
+    sourceTrace.includes('baseArrayLayer') && sourceTrace.includes('NVSDK_NGX_Parameter_MV_Scale_X') &&
+    !sourceTrace.includes('ReadProcessMemory') && !sourceTrace.includes('CopyTexture') &&
+    !sourceTrace.includes('.Set('),
+    'source receipts inspect borrowed identity/precision/scalars only, never alter maps or GPU work');
+assert(sourceHooks.includes('const bool attachResourceHooks = o_slSetTag || o_slSetTagForFrame;') &&
+    sourceHooks.includes('trace(true); return result;') &&
+    sourceHooks.includes('luke_source::Scope traceScope(') &&
+    sourceContext.includes('~Scope() { active = previous; }') &&
+    read('OptiScaler/upscalers/dlss/DLSSFeature_Vk.cpp').includes('luke_source::native(*InParameters,0,') &&
+    read('OptiScaler/upscalers/dlss/DLSSFeature_Vk.cpp').includes('luke_source::native(*InParameters,1,') &&
+    read('OptiScaler/upscalers/dlssd/DLSSDFeature_Vk.cpp').includes('luke_source::native(*InParameters,0,') &&
+    read('OptiScaler/upscalers/dlssd/DLSSDFeature_Vk.cpp').includes('luke_source::native(*InParameters,1,') &&
+    nativePipeline.includes('luke_source::native(*InParameters,2,'),
+    'same-evaluation source trace covers tag forwarding/nested scope/native SR/native final postpass');
+console.log('Luke same-evaluation source contract trace: PASS');
+const ramFilter=read('third_party/ofxr/src/common/ram_timing.cpp');
+const ramTest=read('third_party/ofxr/tests/ram_timing_tests.cpp');
+assert(ramFilter.includes('selected_luke_source_stage(a)') &&
+    ramFilter.includes('{320ULL, 368ULL, 416ULL}') &&
+    ramFilter.includes('{480ULL, 520ULL, 560ULL}') &&
+    ramTest.includes('source contract receipt lost before F11 save'),
+    'source receipts must survive the active pose-profile recorder and F11 saver');
+console.log('Luke source trace RAM/F11 retention contract: PASS');
+const vkHooks = read('OptiScaler/hooks/Vulkan_Hooks.cpp');
+const vkCopy = read('OptiScaler/shaders/resource_copy/RC_Vk.cpp');
+assert(vkHooks.includes('captureFeatures.prepare(localCreteInfo,') &&
+    vkHooks.includes('vulkan_capture::record(*pDevice, extendedFormats)') &&
+    vk.includes('vulkan_capture::enabled(InDevice)') &&
+    vkCopy.includes('vulkan_copy::typed_shader(rc_spv, format)') &&
+    interop.includes('InParam->Resource.ImageViewInfo.Format))'),
+    'typed Vulkan copies require the exact destination format and actually enabled device feature');
+assert(interop.includes('if (!CapturesCompletedOutput() && !AutoExposure())') &&
+    interop.includes('if (!CapturesCompletedOutput() && !Config::Instance()->DisableReactiveMask.value_or(false))'),
+    'completed-color capture cannot change native SR exposure/reactive configuration');
+console.log('Native Vulkan capture feature/format/no-SR-mutation contracts: PASS');
+const librarySearch = read('OptiScaler/Util.cpp');
+assert(librarySearch.includes('library_search::accept_streamline_candidate(fileName.wstring(), isDlssgOutput)') &&
+    !librarySearch.includes('if (isDlssgOutput || !IsSubpath(normalizedPath, normalizedStreamlinePath))'),
+    'replace FG-dependent exclusion: legitimate SR/RR files must remain discoverable');
+console.log('Native SR/RR library discovery contract: PASS');
+const negotiationOwnerSource = read('third_party/ofxr/src/layer/openxr_layer.cpp');
+const negotiation = negotiationOwnerSource.slice(negotiationOwnerSource.lastIndexOf('extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoaderApiLayerInterface('));
+assert(negotiation.indexOf('xrfg::embedded::set_layer_active(true)') >
+    negotiation.indexOf('layer_request->createApiLayerInstance = layer_create_api_layer_instance'),
+    'embedded ownership must be established by validated negotiation, not only an external caller');
+const bridgeClient = read('OptiScaler/ofxr/ofxr_bridge_client.cpp');
+assert(bridgeClient.includes('if (xrfg::embedded::layer_active()) return {};') &&
+    !bridgeClient.includes('g_embedded_layer_active'),
+    'layer and publisher must share a single ownership state');
+console.log('Embedded negotiation/publication ownership contract: PASS');
+assert(interop.includes('NVNGX_Parameters captureParameters(API::DX12, false)') &&
+    interop.includes('luke_vulkan::copy_capture_metadata(*InParameters, captureParameters)') &&
+    interop.includes('EvaluateInteropFeature(cmdList, &captureParameters)') &&
+    !bridgeClient.includes('register_luke_vulkan_queue'),
+    'capture uses a local typed D3D12 map and early device-lifetime owner');
+console.log('Vulkan local parameter map / early producer ownership contract: PASS');

@@ -2,6 +2,7 @@
 #include "RC_Vk.h"
 #include <Config.h>
 #include "precompile/rc_Shader_Vk.h"
+#include "VulkanCopyFormat.h"
 
 ResourceCopy_Vk::ResourceCopy_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InPhysicalDevice)
     : Shader_Vk(InName, InDevice, InPhysicalDevice)
@@ -35,6 +36,27 @@ ResourceCopy_Vk::ResourceCopy_Vk(std::string InName, VkDevice InDevice, VkPhysic
     }
 
     _init = true;
+    _typedPipelines.emplace(VK_FORMAT_R32G32B32A32_SFLOAT, _pipeline);
+}
+
+bool ResourceCopy_Vk::SelectOutputFormat(VkFormat format)
+{
+    if (auto found = _typedPipelines.find(format); found != _typedPipelines.end()) {
+        _pipeline = found->second;
+        return true;
+    }
+    auto code = vulkan_copy::typed_shader(rc_spv, format);
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    if (code.empty() || !CreateComputePipeline(_device, _pipelineLayout, &pipeline, code)) return false;
+    _typedPipelines.emplace(format, pipeline);
+    _pipeline = pipeline;
+    return true;
+}
+
+ResourceCopy_Vk::~ResourceCopy_Vk()
+{
+    for (const auto& [format, pipeline] : _typedPipelines)
+        if (pipeline != _pipeline) vkDestroyPipeline(_device, pipeline, nullptr);
 }
 
 bool ResourceCopy_Vk::InitializeViews(VkImageView InResourceView, VkImageView OutResourceView)
@@ -53,7 +75,7 @@ bool ResourceCopy_Vk::InitializeViews(VkImageView InResourceView, VkImageView Ou
 }
 
 bool ResourceCopy_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, VkImageView InResourceView,
-                               VkImageView OutResourceView, VkExtent2D OutExtent)
+                               VkImageView OutResourceView, VkExtent2D OutExtent, VkFormat OutFormat)
 {
     if (!_init || InDevice == VK_NULL_HANDLE || InCmdList == VK_NULL_HANDLE || InResourceView == VK_NULL_HANDLE ||
         OutResourceView == VK_NULL_HANDLE)
@@ -61,7 +83,7 @@ bool ResourceCopy_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, VkI
 
     LOG_DEBUG("[{0}] Start!", _name);
 
-    if (!InitializeViews(InResourceView, OutResourceView))
+    if (!SelectOutputFormat(OutFormat) || !InitializeViews(InResourceView, OutResourceView))
         return false;
 
     _currentSetIndex = (_currentSetIndex + 1) % _maxFramesInFlight;

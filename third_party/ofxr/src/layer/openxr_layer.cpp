@@ -67,6 +67,9 @@
 #include <vector>
 
 
+// This library exists only as part of OptiScaler. A successful negotiation
+// establishes ownership here even when the loader reaches this export directly,
+// rather than through a tray bootstrap that calls the activation export first.
 namespace {
 
 [[nodiscard]] std::filesystem::path current_layer_directory() noexcept;
@@ -8818,6 +8821,7 @@ struct AfwSourceCapture {
             ? state->session->fps_overlay->marker_placement()
             : std::nullopt;
         HRESULT submit_result = E_UNEXPECTED;
+        xrfg::D3D11PublicationReceipt inline_publication;
         const xrfg::BridgeFlightOperation synthesis_operation = request_pair
             ? xrfg::BridgeFlightOperation::synthesis_pair
             : xrfg::BridgeFlightOperation::synthesis_prime;
@@ -8897,7 +8901,8 @@ struct AfwSourceCapture {
                         request_pair
                             ? std::optional<std::uint32_t>(
                                   synthetic_destination_index)
-                            : std::nullopt);
+                            : std::nullopt,
+                        post_afw_input ? &inline_publication : nullptr);
                 xrfg::bridge_flight_logger().end(
                     publish_token,
                     xrfg::BridgeFlightOperation::d3d11_publish,
@@ -8919,6 +8924,30 @@ struct AfwSourceCapture {
             ticket.previous_serial,
             ticket.current_serial,
             ticket.fence_value);
+
+        // A successful publish only queues D3D12->D3D11 copies. The legacy
+        // post-AFW consumer must not release S/B to XR until THIS receipt is
+        // complete, just as the director's worker does. Wait outside gpu_mutex
+        // and the interop mutex; never follow the mutable next-frame cursor.
+        if (SUCCEEDED(submit_result) && inline_publication.fence) {
+            const auto publication_token = xrfg::bridge_flight_logger().begin(
+                xrfg::BridgeFlightOperation::timing_publication_complete,
+                post_afw_input->color_identity.application_serial,
+                handle_value(application_swapchain),
+                inline_publication.copy_complete_value);
+            const HRESULT published = xrfg::wait_for_d3d11_publication(inline_publication);
+            xrfg::bridge_flight_logger().end(publication_token,
+                xrfg::BridgeFlightOperation::timing_publication_complete, published,
+                post_afw_input->color_identity.application_serial,
+                handle_value(application_swapchain),
+                inline_publication.copy_complete_value);
+            if (FAILED(published)) {
+                // Retain acquired images on failure, never expose unfinished
+                // output to XR. Normal session retirement/teardown drains it.
+                output.reason = GenerationPrepareReason::synthesis_failed;
+                return output;
+            }
+        }
 
         // The runtime orders its use of these swapchain images against the
         // queue the application supplied, so when synthesis ran elsewhere
@@ -9933,9 +9962,17 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
         }
         source.guide = xrfg::resolve_luke_guide_token(
             origin_token, session->d3d12_queue.Get(), session->d3d12_device.Get());
-        if (!source.guide || !source.guide->camera_data_valid ||
-            !source.guide->previous_opposite_guide ||
-            !source.guide->previous_opposite_guide->camera_data_valid) {
+        std::uint32_t camera_rejection = !source.guide ? 1u : 0u;
+        if (source.guide) {
+            if (!source.guide->camera_data_valid) camera_rejection |= 2u;
+            if (!source.guide->previous_opposite_guide) camera_rejection |= 4u;
+            else if (!source.guide->previous_opposite_guide->camera_data_valid)
+                camera_rejection |= 8u;
+        }
+        if (camera_rejection != 0) {
+            xrfg::embedded::report_afw_guide_rejection(camera_rejection);
+            xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::luke_afw_stage,
+                camera_rejection, 132, frame_serial, origin_token);
             report_missing(8, origin_token);
             output.reason = GenerationPrepareReason::missing_capture;
             release_deferred();
@@ -12575,6 +12612,7 @@ extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoade
         layer_request->layerApiVersion = kLayerApiVersion;
         layer_request->getInstanceProcAddr = layer_get_instance_proc_addr;
         layer_request->createApiLayerInstance = layer_create_api_layer_instance;
+        xrfg::embedded::set_layer_active(true);
         return XR_SUCCESS;
     });
     xrfg::bridge_flight_logger().end(

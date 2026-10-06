@@ -22,6 +22,7 @@
 #include <hooks/Streamline_Hooks.h>
 #include <hooks/D3D_NativeInterface.h>
 #include <hooks/D3D_DeviceOwner.h>
+#include <hooks/LukeNativeSceneCamera.h>
 #include <diagnostics/DredMarkers.h>
 
 #include <dxgi1_4.h>
@@ -56,6 +57,9 @@ HMODULE FindRealVrModule()
     // Prefer the ordinary basename lookup, but do not rely on it: Luke Ross'
     // proxy and the system DXGI can both be present in this process.
     HMODULE candidate = GetModuleHandleW(L"dxgi.dll");
+    if (hasMarker(candidate))
+        return candidate;
+    candidate = GetModuleHandleW(L"RealVR64.dll");
     if (hasMarker(candidate))
         return candidate;
 
@@ -224,7 +228,8 @@ static void PublishOfxrDlssGuides(
     unsigned int handleId,
     ID3D12GraphicsCommandList* commandList,
     NVSDK_NGX_Parameter* parameters,
-    IFeature_Dx12* optiFeature)
+    IFeature* optiFeature,
+    ID3D12CommandQueue* producerQueue = nullptr)
 {
     // This is called at the actual native NGX EvaluateFeature ingress, after
     // OptiScaler's DLSS parameter processing and before the DLSS DLL runs.
@@ -233,21 +238,38 @@ static void PublishOfxrDlssGuides(
     const bool enabled = control.desired.motion_vectors == 1 ||
         control.desired.frame_generation == 1;
     ofxr_bridge::configure_dlss_guides(enabled);
-    if (!enabled)
+    if (!enabled) {
+        if (producerQueue) {
+            static std::atomic_uint64_t rejects{0};
+            const auto count = rejects.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 2 || count % 240 == 0)
+                LOG_WARN("V30067 Vulkan guide tracking disabled embedded={} motion={} generation={}",
+                    ofxr_bridge::embedded_layer_active(), control.desired.motion_vectors,
+                    control.desired.frame_generation);
+        }
         return;
+    }
 
     ID3D12Resource* output = nullptr;
     ID3D12Resource* motion = nullptr;
     ID3D12Resource* depth = nullptr;
     ID3D12Resource* inputColor = nullptr;
-    auto* queue = State::Instance().currentCommandQueue;
-    if (parameters->Get(NVSDK_NGX_Parameter_Output, &output) !=
-            NVSDK_NGX_Result_Success ||
-        parameters->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) !=
-            NVSDK_NGX_Result_Success ||
+    auto* queue = producerQueue ? producerQueue : State::Instance().currentCommandQueue;
+    const auto outputGet = parameters->Get(NVSDK_NGX_Parameter_Output, &output);
+    const auto motionGet = parameters->Get(NVSDK_NGX_Parameter_MotionVectors, &motion);
+    if (outputGet != NVSDK_NGX_Result_Success || motionGet != NVSDK_NGX_Result_Success ||
         output == nullptr || motion == nullptr || queue == nullptr ||
-        commandList == nullptr)
+        commandList == nullptr) {
+        if (producerQueue) {
+            static std::atomic_uint64_t rejects{0};
+            const auto count = rejects.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 2 || count % 240 == 0)
+                LOG_WARN("V30067 Vulkan guide missing resources outputGet=0x{:X} motionGet=0x{:X} output={:p} motion={:p} queue={:p} list={:p}",
+                    static_cast<unsigned>(outputGet), static_cast<unsigned>(motionGet),
+                    static_cast<void*>(output), static_cast<void*>(motion), static_cast<void*>(queue), static_cast<void*>(commandList));
+        }
         return;
+    }
 
     parameters->Get(NVSDK_NGX_Parameter_Depth, &depth);
     parameters->Get(NVSDK_NGX_Parameter_Color, &inputColor);
@@ -415,13 +437,13 @@ static void PublishOfxrDlssGuides(
         static_cast<unsigned int>(std::max(0.0f, motionX));
     const unsigned int motionBaseY =
         static_cast<unsigned int>(std::max(0.0f, motionY));
-    const auto motionState = Config::Instance()->MVResourceBarrier.has_value()
+    const auto motionState = !producerQueue && Config::Instance()->MVResourceBarrier.has_value()
         ? static_cast<D3D12_RESOURCE_STATES>(Config::Instance()->MVResourceBarrier.value())
         : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    const auto depthState = Config::Instance()->DepthResourceBarrier.has_value()
+    const auto depthState = !producerQueue && Config::Instance()->DepthResourceBarrier.has_value()
         ? static_cast<D3D12_RESOURCE_STATES>(Config::Instance()->DepthResourceBarrier.value())
         : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    const auto inputColorState = Config::Instance()->ColorResourceBarrier.has_value()
+    const auto inputColorState = !producerQueue && Config::Instance()->ColorResourceBarrier.has_value()
         ? static_cast<D3D12_RESOURCE_STATES>(Config::Instance()->ColorResourceBarrier.value())
         : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
@@ -508,23 +530,86 @@ static void PublishOfxrDlssGuides(
         }
     }
     publication.verified_native_device = queueDevice.Get();
-    const bool exactCamera =
-        ofxr_bridge::apply_streamline_camera(publication);
-    static std::atomic_bool exactCameraLogged { false };
-    if (exactCamera && ofxr_bridge::logging_setting() &&
-        !exactCameraLogged.exchange(true, std::memory_order_relaxed))
-        LOG_INFO("V23173 OFXR guides are using the exact Streamline camera contract");
+    // KCD native NGX has no Streamline camera parameters. Its current scene
+    // packet is consumed on this exact list immediately before this SR call.
+    static const bool kcdNative = _wcsicmp(Util::ExePath().filename().c_str(), L"KingdomCome.exe") == 0;
+    luke_scene_camera::Receipt scene{};
+    bool exactCamera{};
+    if(kcdNative && !producerQueue && LukeRossDlssIngress::Detected()) {
+        scene=luke_scene_camera::take(commandList,renderWidth,renderHeight);
+        if(scene.valid) {
+            const auto& camera=scene.camera;
+            std::copy(camera.projection.begin(),camera.projection.end(),publication.camera_view_to_clip);
+            std::copy(camera.inverse_projection.begin(),camera.inverse_projection.end(),publication.camera_clip_to_view);
+            std::copy(camera.position.begin(),camera.position.end(),publication.camera_position);
+            std::copy(camera.right.begin(),camera.right.end(),publication.camera_right);
+            std::copy(camera.up.begin(),camera.up.end(),publication.camera_up);
+            std::copy(camera.forward.begin(),camera.forward.end(),publication.camera_forward);
+            publication.camera_near=camera.near_plane;publication.camera_far=camera.far_plane;
+            publication.camera_fov_vertical=camera.fov;publication.depth_inverted=1;
+            publication.depth_infinite=camera.far_plane==0?1:0;
+            publication.camera_data_valid=1;publication.camera_matrices_valid=1;exactCamera=true;
+        }
+        static std::atomic_uint samples{0};static std::atomic_uint64_t nextSampleMs{0};
+        const auto now=GetTickCount64();auto deadline=nextSampleMs.load(std::memory_order_relaxed);
+        if(samples.load(std::memory_order_relaxed)<32&&now>=deadline&&
+            nextSampleMs.compare_exchange_strong(deadline,now+1000,std::memory_order_relaxed)) {
+            const auto sample=samples.fetch_add(1,std::memory_order_relaxed)+1;
+            auto& logger=xrfg::bridge_flight_logger();
+            logger.event(xrfg::BridgeFlightOperation::luke_afw_stage,scene.valid?1:0,944,handleId,scene.token);
+            logger.event(xrfg::BridgeFlightOperation::luke_afw_stage,sample,945,
+                (std::uint64_t(scene.attempts)<<32)|scene.reads,(std::uint64_t(scene.candidates)<<32)|scene.failure);
+            logger.event(xrfg::BridgeFlightOperation::luke_afw_stage,scene.owner_mask,946,scene.location,scene.resource);
+            logger.event(xrfg::BridgeFlightOperation::luke_afw_stage,
+                (scene.graphics?0x100:0)|scene.slot,947,reinterpret_cast<std::uint64_t>(commandList),scene.signature);
+            LOG_WARN("V33012 current scene camera valid={} token={} attempts={} reads={} candidates={} failures=0x{:X} map=0x{:X} slot={} graphics={}",
+                scene.valid,scene.token,scene.attempts,scene.reads,scene.candidates,scene.failure,
+                static_cast<std::uint32_t>(scene.error),scene.slot,scene.graphics);
+        }
+    } else exactCamera=ofxr_bridge::apply_streamline_camera(publication);
     const bool published = ofxr_bridge::publish_dlss_guides(
-        publication, queueDevice.Get());
-    (void)published;
+        publication, queueDevice.Get(), scene.valid ? scene.token : 0);
+    if (LukeRossDlssIngress::Detected()) {
+        const auto afw = ofxr_bridge::afw_snapshot();
+        if (afw.desired.mode != 0)
+            xrfg::embedded::report_afw_ingress(published, exactCamera);
+        const unsigned admission = (ofxr_bridge::embedded_layer_active() ? 1u : 0u) |
+            (exactCamera ? 2u : 0u) | (published ? 4u : 0u) |
+            (publication.camera_matrices_valid ? 8u : 0u) |
+            (afw.desired.mode != 0 ? 16u : 0u);
+        xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::luke_afw_stage,
+            admission, 130, handleId,
+            (std::uint64_t(publication.output_width) << 32) | publication.output_height);
+        // Bounded changed-state evidence also works for native-NGX games
+        // that never call Streamline. No camera fallback or new GPU work.
+        static std::atomic_uint lastAdmission{~0u}, receiptCount{0};
+        if (lastAdmission.exchange(admission, std::memory_order_relaxed) != admission &&
+            receiptCount.fetch_add(1, std::memory_order_relaxed) < 8)
+            LOG_WARN("V33012 Luke ingress embedded={} camera={} matrices={} published={} afw_mode={} stream={} output={}x{}",
+                bool(admission & 1u), exactCamera, publication.camera_matrices_valid,
+                published, afw.desired.mode, handleId,
+                publication.output_width, publication.output_height);
+    }
+    if (producerQueue) {
+        static std::atomic_uint64_t receipts{0};
+        const auto count = receipts.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 2 || count % 240 == 0) {
+            const auto stats = ofxr_bridge::dlss_guide_statistics();
+            LOG_INFO("V30067 Vulkan guide publication receipt={} accepted={} embedded={} camera={} color={}x{} motion={}x{} depth={}x{} published={} invalid={} failures={}",
+                count, published, ofxr_bridge::embedded_layer_active(), exactCamera,
+                publication.output_width, publication.output_height, publication.motion_width, publication.motion_height,
+                publication.depth_width, publication.depth_height, stats.published, stats.invalid_publications, stats.snapshot_failures);
+        }
+    }
     MaybeLogOfxrGuideStatistics();
 }
 
 void LukeRossDlssIngress::PublishD3D12Guide(
     unsigned int handleId, ID3D12GraphicsCommandList* commandList,
-    NVSDK_NGX_Parameter* parameters, IFeature_Dx12* optiFeature)
+    NVSDK_NGX_Parameter* parameters, IFeature* optiFeature,
+    ID3D12CommandQueue* producerQueue)
 {
-    PublishOfxrDlssGuides(handleId, commandList, parameters, optiFeature);
+    PublishOfxrDlssGuides(handleId, commandList, parameters, optiFeature, producerQueue);
 }
 
 
@@ -1715,50 +1800,36 @@ static NVSDK_NGX_Result EvaluateFeatureImplementationDx12(ID3D12GraphicsCommandL
     return optiResult;
 }
 
-// ONE SR completion point, after native SR or owned SR+postprocessing+NR.
-// The immutable guide's color token comes from that evaluation's input, never latest.
-NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* InCmdList,
-                                                               const NVSDK_NGX_Handle* InFeatureHandle,
-                                                               NVSDK_NGX_Parameter* InParameters,
-                                                               PFN_NVSDK_NGX_ProgressCallback InCallback)
+HRESULT LukeRossDlssIngress::CompleteD3D12Color(
+    ID3D12GraphicsCommandList* commandList, NVSDK_NGX_Parameter* parameters,
+    IFeature* feature, bool ownedOutput, bool nestedEvaluation)
 {
-    static thread_local unsigned completion_depth = 0;
-    static thread_local bool nested_evaluation = false;
-    struct CompletionScope {
-        unsigned& depth;
-        bool outermost;
-        explicit CompletionScope(unsigned& value) : depth(value), outermost(value++ == 0) {}
-        ~CompletionScope() { --depth; }
-    } scope(completion_depth);
-    if (!scope.outermost) {
-        // Ordinary NR calls the raw proxy, not this export. If a provider
-        // reenters, do not clear or deliver the enclosing production's TLS ID.
-        // The enclosing completion rejects the ambiguous origin explicitly.
-        nested_evaluation = true;
-        return EvaluateFeatureImplementationDx12(InCmdList, InFeatureHandle, InParameters, InCallback);
-    }
-    nested_evaluation = false;
-    static_cast<void>(ofxr_bridge::take_luke_origin_frame());
-    const auto result = EvaluateFeatureImplementationDx12(InCmdList, InFeatureHandle, InParameters, InCallback);
     const auto color_origin = ofxr_bridge::take_luke_origin_frame();
-    if (result == NVSDK_NGX_Result_Success && color_origin &&
+    if (LukeRossDlssIngress::Detected()) {
+        const auto mode = ofxr_bridge::afw_snapshot().desired.mode;
+        xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::luke_afw_stage,
+            (color_origin ? 1 : 0) | (mode != 0 ? 2 : 0) | (nestedEvaluation ? 4 : 0),
+            131, color_origin ? color_origin->publication : 0,
+            color_origin ? color_origin->color_origin_token : 0);
+    }
+    if (color_origin &&
         ofxr_bridge::afw_snapshot().desired.mode != 0) {
         HRESULT marker_result = E_UNEXPECTED;
         constexpr unsigned kOriginNested = 1, kOriginMissingOutput = 2, kOriginMissingContext = 4,
             kOriginDimensions = 8, kOriginResourceAdapter = 16, kOriginListIdentity = 32,
             kOriginUnsupported = 64;
-        unsigned marker_failures = nested_evaluation ? kOriginNested : 0;
+        unsigned marker_failures = nestedEvaluation ? kOriginNested : 0;
         xrfg::LukeColorOriginRect rect{};
         D3D12_RESOURCE_DESC final_desc{};
         ID3D12Resource* final_output = nullptr;
-        auto* native_list = ResolveD3DNativeInterface(InCmdList);
-        if (InParameters && InParameters->Get(NVSDK_NGX_Parameter_Output, &final_output) == NVSDK_NGX_Result_Success && final_output) {
+        auto* native_list = ResolveD3DNativeInterface(commandList);
+        if (parameters && parameters->Get(NVSDK_NGX_Parameter_Output, &final_output) == NVSDK_NGX_Result_Success && final_output) {
             final_output = ResolveD3DNativeInterface(final_output);
         }
         if (!final_output) marker_failures |= kOriginMissingOutput;
         const auto final_device = ResolveD3DNativeDevice(final_output);
         const auto list_device = ResolveD3DNativeDevice(native_list);
-        const bool owned_sr = InFeatureHandle && InFeatureHandle->Id >= DLSS_MOD_ID_OFFSET;
+        const bool owned_sr = ownedOutput;
         if (SameCanonicalIdentity(final_output, color_origin->output.Get())) {
             rect = {color_origin->output_x, color_origin->output_y,
                     color_origin->output_width, color_origin->output_height};
@@ -1766,11 +1837,10 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
             // Evaluate params need not repeat creation-only OutWidth/OutHeight.
             // Owned postprocessing restores the feature's DISPLAY target, not
             // the SR/OutputScaling intermediate's TARGET allocation dimensions.
-            const auto context = InFeatureHandle ? Dx12Contexts.find(InFeatureHandle->Id) : Dx12Contexts.end();
-            if (owned_sr && context != Dx12Contexts.end() && context->second.feature) {
+            if (owned_sr && feature) {
                 rect.x = color_origin->output_x; rect.y = color_origin->output_y;
-                rect.width = context->second.feature->DisplayWidth();
-                rect.height = context->second.feature->DisplayHeight();
+                rect.width = feature->DisplayWidth();
+                rect.height = feature->DisplayHeight();
             } else marker_failures |= kOriginMissingContext;
         }
         if (final_output) final_desc = final_output->GetDesc();
@@ -1801,7 +1871,41 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         }
         xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::luke_afw_stage,
             marker_result, 91, color_origin->publication, color_origin->camera_frame_token);
+        return marker_result;
     }
+    return S_FALSE;
+}
+// ONE SR completion point, after native SR or owned SR+postprocessing+NR.
+// The immutable guide's color token comes from that evaluation's input, never latest.
+NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* InCmdList,
+                                                               const NVSDK_NGX_Handle* InFeatureHandle,
+                                                               NVSDK_NGX_Parameter* InParameters,
+                                                               PFN_NVSDK_NGX_ProgressCallback InCallback)
+{
+    static thread_local unsigned completion_depth = 0;
+    static thread_local bool nested_evaluation = false;
+    struct CompletionScope {
+        unsigned& depth;
+        bool outermost;
+        explicit CompletionScope(unsigned& value) : depth(value), outermost(value++ == 0) {}
+        ~CompletionScope() { --depth; }
+    } scope(completion_depth);
+    if (!scope.outermost) {
+        // Ordinary NR calls the raw proxy, not this export. If a provider
+        // reenters, do not clear or deliver the enclosing production's TLS ID.
+        // The enclosing completion rejects the ambiguous origin explicitly.
+        nested_evaluation = true;
+        return EvaluateFeatureImplementationDx12(InCmdList, InFeatureHandle, InParameters, InCallback);
+    }
+    nested_evaluation = false;
+    static_cast<void>(ofxr_bridge::take_luke_origin_frame());
+    const auto result = EvaluateFeatureImplementationDx12(InCmdList, InFeatureHandle, InParameters, InCallback);
+    if (result == NVSDK_NGX_Result_Success) {
+        const auto context = InFeatureHandle ? Dx12Contexts.find(InFeatureHandle->Id) : Dx12Contexts.end();
+        IFeature* feature = context != Dx12Contexts.end() ? context->second.feature.get() : nullptr;
+        LukeRossDlssIngress::CompleteD3D12Color(InCmdList, InParameters, feature,
+            InFeatureHandle && InFeatureHandle->Id >= DLSS_MOD_ID_OFFSET, nested_evaluation);
+    } else static_cast<void>(ofxr_bridge::take_luke_origin_frame());
     return result;
 }
 

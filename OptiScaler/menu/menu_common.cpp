@@ -7076,6 +7076,21 @@ static void RenderOfxrVrFramegenMenu()
         ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F),
                            "AFW setting rejected");
 
+    ImGui::Text("NGX guides: %llu published / %llu received",
+                static_cast<unsigned long long>(afwStatus.published_ingress_frames),
+                static_cast<unsigned long long>(afwStatus.ingress_frames));
+    ImGui::Text("Missing game camera: %llu guides",
+                static_cast<unsigned long long>(afwStatus.missing_camera_ingress_frames));
+    if (afwStatus.rejected_guide_pairs != 0) {
+        ImGui::Text("Rejected guide pairs: %llu",
+                    static_cast<unsigned long long>(afwStatus.rejected_guide_pairs));
+        const auto mask = afwStatus.last_guide_rejection;
+        ImGui::TextDisabled("Last missing: %s%s%s%s",
+            (mask & 1u) ? "guide " : "",
+            (mask & 2u) ? "game camera " : "",
+            (mask & 4u) ? "opposite guide " : "",
+            (mask & 8u) ? "opposite camera" : "");
+    }
     ImGui::Text("AFW output: %llu / %llu projection frames",
                 static_cast<unsigned long long>(afwStatus.ready_frames),
                 static_cast<unsigned long long>(afwStatus.projection_frames));

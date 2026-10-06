@@ -2,6 +2,7 @@
 
 #include "Util.h"
 #include "Config.h"
+#include "LibrarySearchPolicy.h"
 
 #include <proxies/Ntdll_Proxy.h>
 #include <proxies/KernelBase_Proxy.h>
@@ -535,7 +536,8 @@ std::optional<std::filesystem::path> Util::FindFilePath(const std::filesystem::p
                 else if (entry.path().filename() == fileName)
                 {
                     auto normalizedPath = entry.path().lexically_normal();
-                    if (isDlssgOutput || !IsSubpath(normalizedPath, normalizedStreamlinePath))
+                    if (!IsSubpath(normalizedPath, normalizedStreamlinePath) ||
+                        library_search::accept_streamline_candidate(fileName.wstring(), isDlssgOutput))
                     {
                         return entry.path();
                     }

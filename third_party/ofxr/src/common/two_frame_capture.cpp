@@ -307,7 +307,8 @@ void write_session(const std::shared_ptr<Session>& session) {
         "\tdestination_world_to_view\tdestination_view_to_world"
         "\tdestination_view_to_clip\tdestination_clip_to_view"
         "\tcamera_world_to_view\tcamera_view_to_world"
-        "\tcamera_view_to_clip\tcamera_clip_to_view\n";
+        "\tcamera_view_to_clip\tcamera_clip_to_view"
+        "\traw_camera_motion_included\traw_clip_to_previous_clip\traw_previous_clip_to_clip\tnative_previous_publication\tnative_same_publication\tnative_clip_to_opposite\tnative_clip_to_same\tnative_history_jitter_x\tnative_history_jitter_y\n";
     const auto write_array = [&guide_manifest](const auto& values) {
         for (std::size_t i = 0; i < values.size(); ++i) {
             if (i) guide_manifest << ',';
@@ -362,7 +363,13 @@ void write_session(const std::shared_ptr<Session>& session) {
         write_array(c.camera_world_to_view); guide_manifest << '\t';
         write_array(c.camera_view_to_world); guide_manifest << '\t';
         write_array(c.camera_view_to_clip); guide_manifest << '\t';
-        write_array(c.camera_clip_to_view); guide_manifest << '\n';
+        write_array(c.camera_clip_to_view); guide_manifest << '\t';
+        guide_manifest << c.raw_camera_motion_included << '\t';
+        write_array(c.raw_clip_to_previous_clip); guide_manifest << '\t';
+        write_array(c.raw_previous_clip_to_clip); guide_manifest << '\t';
+        guide_manifest << c.native_previous_publication << '\t' << c.native_same_publication << '\t';
+        write_array(c.native_clip_to_opposite); guide_manifest << '\t';
+        write_array(c.native_clip_to_same); guide_manifest << '\t' << c.native_history_jitter_x << '\t' << c.native_history_jitter_y << '\n';
     }
     const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::seconds(15);

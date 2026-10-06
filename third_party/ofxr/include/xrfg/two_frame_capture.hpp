@@ -68,6 +68,11 @@ struct TwoFrameGuideContract {
     float motion_scale_x{}, motion_scale_y{};
     float frame_time_delta_ms{}, camera_near{}, camera_far{};
     bool reset{}, jittered{}, depth_inverted{}, depth_infinite{};
+    std::uint64_t native_previous_publication{},native_same_publication{};
+    std::array<float,16> native_clip_to_opposite{},native_clip_to_same{};
+    float native_history_jitter_x{},native_history_jitter_y{};
+    int raw_camera_motion_included{-1};
+    std::array<float,16> raw_clip_to_previous_clip{}, raw_previous_clip_to_clip{};
     std::array<float, 3> camera_position{}, camera_right{}, camera_up{},
         camera_forward{};
     std::array<float, 3> source_pose{}, destination_pose{};

@@ -1,4 +1,5 @@
 #include <pch.h>
+#include <hooks/LukeSourceTrace.h>
 #include <Config.h>
 #include <Logger.h>
 
@@ -85,9 +86,11 @@ bool DLSSDFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Par
     if (NVNGXProxy::VULKAN_EvaluateFeature() != nullptr)
     {
         ProcessEvaluateParams(InParameters);
+        if(_lukeCapture) luke_source::native(*InParameters,0,Handle()->Id,reinterpret_cast<std::uintptr_t>(InCmdBuffer));
 
         NVSDK_NGX_Result nvResult =
             NVNGXProxy::VULKAN_EvaluateFeature()(InCmdBuffer, _p_dlssdHandle, InParameters, NULL);
+        if(_lukeCapture) luke_source::native(*InParameters,1,Handle()->Id,reinterpret_cast<std::uintptr_t>(InCmdBuffer));
 
         if (nvResult != NVSDK_NGX_Result_Success)
         {
@@ -120,6 +123,8 @@ DLSSDFeatureVk::~DLSSDFeatureVk()
 {
     if (State::Instance().isShuttingDown)
         return;
+
+    _lukeCapture.reset();
 
     if (NVNGXProxy::VULKAN_ReleaseFeature() != nullptr && _p_dlssdHandle != nullptr)
         NVNGXProxy::VULKAN_ReleaseFeature()(_p_dlssdHandle);

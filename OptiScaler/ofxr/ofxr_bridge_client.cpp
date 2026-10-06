@@ -6,6 +6,10 @@
 #include "../hooks/Streamline_Hooks.h"
 #include "../hooks/D3D_NativeInterface.h"
 #include "../inputs/NVNGX_DLSS.h"
+#include "../hooks/LukeVulkanProducer.h"
+#include "../hooks/LukeSourceContext.h"
+#include "../../third_party/ofxr/include/xrfg/bridge_flight_logger.hpp"
+#include <SysUtils.h>
 
 #include "../../third_party/ofxr/include/xrfg/dlss_motion_vectors.hpp"
 #include "../../third_party/ofxr/include/xrfg/embedded_control.hpp"
@@ -21,10 +25,9 @@
 
 namespace {
 
-std::atomic_bool g_embedded_layer_active{false};
-
 struct StreamlineCameraEntry {
     std::uint32_t frame{};
+    std::uint32_t diagnostic_viewport{luke_source::unknown};
     std::array<float, 16> view_to_clip{};
     std::array<float, 16> clip_to_view{};
     std::array<float, 3> position{};
@@ -35,6 +38,8 @@ struct StreamlineCameraEntry {
     float far_plane{};
     float fov_vertical{};
     bool depth_inverted{};
+    std::array<float, 16> clip_to_previous_clip{}, previous_clip_to_clip{};
+    int camera_motion_included{-1};
     bool valid{};
 };
 
@@ -42,6 +47,7 @@ std::mutex g_streamline_camera_mutex;
 std::array<StreamlineCameraEntry, 8> g_streamline_cameras{};
 thread_local StreamlineCameraEntry g_active_streamline_camera{};
 thread_local std::shared_ptr<const xrfg::DlssMotionVectorFrame> g_luke_origin_frame;
+luke_vulkan::Producer g_luke_vulkan_producer;
 
 bool finite_values(const float* values, std::size_t count) noexcept {
     if (values == nullptr) return false;
@@ -138,7 +144,7 @@ Dispatch current_dispatch() noexcept {
     // initial NVIDIA/FSR selection is known. Never publish DLSS guides or send
     // a later hot-switch request back to the external bootstrap: both modes
     // must share this embedded layer instance and its temporal ownership.
-    if (g_embedded_layer_active.load(std::memory_order_acquire)) return {};
+    if (xrfg::embedded::layer_active()) return {};
     std::scoped_lock lock(dispatch_mutex());
     auto& cached = cached_dispatch();
     const HMODULE module =
@@ -253,12 +259,17 @@ extern "C" __declspec(dllexport) int OFXR_OptiScalerProviderV2(
 
 extern "C" __declspec(dllexport) int OFXR_SetEmbeddedLayerActiveV1(
     int active) noexcept {
-    g_embedded_layer_active.store(active != 0, std::memory_order_release);
+    xrfg::embedded::set_layer_active(active != 0);
+    LOG_INFO("V30067 OpenXR embedded ownership active={}", active != 0);
     if (active != 0) {
         std::scoped_lock lock(dispatch_mutex());
         cached_dispatch() = {};
     }
     return 1;
+}
+
+extern "C" __declspec(dllexport) int OFXR_GetEmbeddedLayerActiveV1() noexcept {
+    return xrfg::embedded::layer_active() ? 1 : 0;
 }
 
 // Combined-module-only handoff. Luke Ross presents through a D3D11 OpenXR
@@ -274,8 +285,23 @@ extern "C" __declspec(dllexport) int OFXR_GetLukeRossD3D12ContextV1(
     if (device == nullptr || queue == nullptr) return 0;
     try {
         if (!LukeRossDlssIngress::Detected()) return 0;
-        ID3D12CommandQueue* producer_queue_raw =
-            State::Instance().currentCommandQueue;
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> vulkan_queue;
+        if (g_luke_vulkan_producer.present() &&
+            (State::Instance().api == API::Vulkan || !State::Instance().currentCommandQueue)) {
+            Microsoft::WRL::ComPtr<ID3D12Device> vulkan_owner;
+            const auto result = ofxr_bridge::request_luke_vulkan_context(0, vulkan_owner.GetAddressOf(), vulkan_queue.GetAddressOf());
+            if (FAILED(result)) {
+                LOG_WARN("V30068 Luke Vulkan early producer owner rejected result=0x{:X}", static_cast<unsigned>(result));
+                return 0;
+            }
+        }
+        ID3D12CommandQueue* producer_queue_raw = vulkan_queue
+            ? vulkan_queue.Get() : State::Instance().currentCommandQueue;
+        static std::atomic_uint contextReceipts{0};
+        if (contextReceipts.fetch_add(1, std::memory_order_relaxed) < 4)
+            LOG_INFO("V30067 Luke OpenXR producer context embedded={} vulkan={} queue={:p}",
+                xrfg::embedded::layer_active(), bool(vulkan_queue),
+                static_cast<void*>(producer_queue_raw));
         IUnknown* native_queue = nullptr;
         if (!d3d_native::get_borrowed(producer_queue_raw, &native_queue)) return 0;
         producer_queue_raw = static_cast<ID3D12CommandQueue*>(native_queue);
@@ -321,6 +347,18 @@ extern "C" __declspec(dllexport) int OFXR_GetLukeRossD3D12ContextV1(
 }
 
 namespace ofxr_bridge {
+void register_luke_vulkan_device(std::uintptr_t device, LUID luid, unsigned node, bool valid) noexcept {
+    try { g_luke_vulkan_producer.record(device, luid, node, valid); } catch (...) {}
+}
+void unregister_luke_vulkan_device(std::uintptr_t device) noexcept {
+    try { g_luke_vulkan_producer.forget(device); } catch (...) {}
+}
+HRESULT request_luke_vulkan_context(std::uintptr_t device, ID3D12Device** owner, ID3D12CommandQueue** queue) noexcept {
+    try {
+        ScopedSkipSpoofingGlobal skip;
+        return g_luke_vulkan_producer.get(device, owner, queue);
+    } catch (...) { return E_FAIL; }
+}
 
 bool available() noexcept { return true; }
 bool supports_fsr() noexcept {
@@ -373,6 +411,10 @@ OFXR_ControlSnapshotV2 snapshot() noexcept {
     value.errors = old.errors;
     value.last_error = old.last_error;
     return value;
+}
+
+bool embedded_layer_active() noexcept {
+    return xrfg::embedded::layer_active();
 }
 
 bool request(const OFXR_ControlSettingsV2& settings) noexcept {
@@ -440,7 +482,7 @@ void configure_dlss_guides(bool enabled) noexcept {
         xrfg::configure_dlss_motion_vector_tracking(enabled);
 }
 void cache_streamline_camera(
-    std::uint32_t frame,
+    std::uint32_t frame, std::uint32_t diagnostic_viewport,
     const float* camera_view_to_clip,
     const float* camera_clip_to_view,
     const float* camera_position,
@@ -450,13 +492,17 @@ void cache_streamline_camera(
     float camera_near,
     float camera_far,
     float camera_fov_vertical,
-    bool depth_inverted) noexcept {
+    bool depth_inverted,
+    const float* clip_to_previous_clip,
+    const float* previous_clip_to_clip,
+    int camera_motion_included) noexcept {
     StreamlineCameraEntry camera{};
     if (!finite_values(camera_view_to_clip, 16) ||
         !finite_values(camera_clip_to_view, 16) ||
         !finite_values(camera_position, 3) ||
         !plausible_basis(camera_up, camera_right, camera_forward)) return;
     camera.frame = frame;
+    camera.diagnostic_viewport = diagnostic_viewport;
     std::copy_n(camera_view_to_clip, 16, camera.view_to_clip.begin());
     std::copy_n(camera_clip_to_view, 16, camera.clip_to_view.begin());
     std::copy_n(camera_position, 3, camera.position.begin());
@@ -467,6 +513,11 @@ void cache_streamline_camera(
     camera.far_plane = camera_far;
     camera.fov_vertical = camera_fov_vertical;
     camera.depth_inverted = depth_inverted;
+    camera.camera_motion_included = camera_motion_included;
+    if (finite_values(clip_to_previous_clip, 16) && finite_values(previous_clip_to_clip, 16)) {
+        std::copy_n(clip_to_previous_clip, 16, camera.clip_to_previous_clip.begin());
+        std::copy_n(previous_clip_to_clip, 16, camera.previous_clip_to_clip.begin());
+    }
     camera.valid = true;
     std::scoped_lock lock(g_streamline_camera_mutex);
     g_streamline_cameras[frame % g_streamline_cameras.size()] = camera;
@@ -479,6 +530,22 @@ void begin_streamline_evaluation(std::uint32_t frame) noexcept {
         g_streamline_cameras[frame % g_streamline_cameras.size()];
     if (candidate.valid && candidate.frame == frame)
         g_active_streamline_camera = candidate;
+    auto& trace=xrfg::bridge_flight_logger();
+    if(trace.ram_enabled()) {
+        auto hash=luke_source::hash(candidate.view_to_clip.data(),16);
+        hash=luke_source::hash(candidate.clip_to_view.data(),16,hash);
+        hash=luke_source::hash(candidate.position.data(),3,hash);
+        hash=luke_source::hash(candidate.right.data(),3,hash);
+        hash=luke_source::hash(candidate.up.data(),3,hash);
+        hash=luke_source::hash(candidate.forward.data(),3,hash);
+        trace.event(xrfg::BridgeFlightOperation::luke_afw_stage,
+            static_cast<std::int64_t>(luke_source::key(frame,luke_source::active.viewport)),
+            400,luke_source::key(candidate.frame,candidate.diagnostic_viewport),hash);
+        trace.event(xrfg::BridgeFlightOperation::luke_afw_stage,
+            static_cast<std::int64_t>(luke_source::key(frame,luke_source::active.viewport)),
+            401,candidate.valid && candidate.frame==frame,
+            reinterpret_cast<std::uintptr_t>(g_active_streamline_camera.view_to_clip.data()));
+    }
 }
 
 void end_streamline_evaluation() noexcept {
@@ -512,14 +579,18 @@ bool apply_streamline_camera(
 
 bool publish_dlss_guides(
     const OFXR_DlssGuidePublicationV2& publication,
-    ID3D12Device* verifiedProducerDevice) noexcept {
+    ID3D12Device* verifiedProducerDevice,
+    std::uint32_t productionCameraToken) noexcept {
     g_luke_origin_frame.reset();
     const auto api = current_dispatch();
     if (!complete(api)) {
         xrfg::DlssMotionVectorPublication embedded{};
         embedded.protect_snapshot_lifetime = LukeRossDlssIngress::Detected();
-        embedded.camera_frame_token = g_active_streamline_camera.frame;
-        embedded.camera_frame_token_valid = g_active_streamline_camera.valid;
+        embedded.camera_frame_token = productionCameraToken ? productionCameraToken : g_active_streamline_camera.frame;
+        embedded.camera_frame_token_valid = productionCameraToken ? publication.camera_data_valid != 0 : g_active_streamline_camera.valid;
+        embedded.raw_camera_motion_included = productionCameraToken ? -1 : g_active_streamline_camera.camera_motion_included;
+        embedded.raw_clip_to_previous_clip = productionCameraToken ? std::array<float,16>{} : g_active_streamline_camera.clip_to_previous_clip;
+        embedded.raw_previous_clip_to_clip = productionCameraToken ? std::array<float,16>{} : g_active_streamline_camera.previous_clip_to_clip;
         embedded.stream = publication.stream;
         embedded.output = publication.output;
         embedded.motion_vectors = publication.motion_vectors;

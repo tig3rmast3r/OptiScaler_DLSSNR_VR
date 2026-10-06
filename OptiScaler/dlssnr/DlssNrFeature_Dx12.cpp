@@ -7,6 +7,7 @@
 #include "NrRetirementCadence.h"
 #include "NrHistoryContract.h"
 #include "NrGuideSnapshot.h"
+#include "NrForwarderContract.h"
 
 
 #include "DlssNr_Codec.h"
@@ -194,6 +195,7 @@ using PFN_NrProbeFloat = void(__cdecl*) (void*, const char*, float, int);
 struct NrRuntime
 {
     HMODULE forwarder = nullptr;
+    bool forwarderReady = false;
     PFN_NrCreate create = nullptr;
     PFN_NrEvaluate evaluate = nullptr;
     PFN_NrRelease release = nullptr;
@@ -534,7 +536,7 @@ std::filesystem::path g_dllDir;
 bool EnsureForwarder()
 {
     if (g_runtime.forwarder != nullptr)
-        return g_runtime.create != nullptr;
+        return g_runtime.forwarderReady;
 
     if (g_dllDir.empty())
         g_dllDir = Util::DllPath().remove_filename();
@@ -581,10 +583,22 @@ bool EnsureForwarder()
     g_runtime.lastInit = (int*) GetProcAddress(g_runtime.forwarder, "dlssnr_call_last_init");
     g_runtime.lastCreate = (int*) GetProcAddress(g_runtime.forwarder, "dlssnr_call_last_create");
 
-    if (g_runtime.create == nullptr || g_runtime.evaluate == nullptr ||
-        g_runtime.setContract == nullptr || g_runtime.probeFloat == nullptr ||
-        g_runtime.setFloatSlot == nullptr)
+    const unsigned exportMask = (g_runtime.create ? 1u : 0u) |
+        (g_runtime.evaluate ? 2u : 0u) | (g_runtime.release ? 4u : 0u) |
+        (g_runtime.setExtras ? 8u : 0u) | (g_runtime.setContract ? 16u : 0u) |
+        (g_runtime.setFloatSlot ? 32u : 0u) | (g_runtime.probeFloat ? 64u : 0u);
+    std::array<wchar_t, 32768> loadedPath{};
+    const auto loadedLength = GetModuleFileNameW(g_runtime.forwarder,
+        loadedPath.data(), static_cast<DWORD>(loadedPath.size()));
+    LOG_INFO("V33012 NR forwarder requested={} loaded={} exports=0x{:X} required=0x{:X}",
+        path.string(), loadedLength && loadedLength < loadedPath.size()
+            ? wstring_to_string(std::wstring(loadedPath.data(), loadedLength)) : "unknown",
+        exportMask, nr_forwarder::required_exports);
+    g_runtime.forwarderReady = nr_forwarder::complete(exportMask);
+    if (!g_runtime.forwarderReady)
     {
+        LOG_ERROR("V33012 NR forwarder ABI mismatch: missing export mask=0x{:X}; use the matched checkpoint forwarder",
+            nr_forwarder::required_exports & ~exportMask);
         g_runtime.reason = "the forwarder is missing its exports";
         return false;
     }

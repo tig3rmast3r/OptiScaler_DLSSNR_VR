@@ -64,6 +64,7 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
 
     // D3D12 context
     ID3D12CommandQueue* Dx12CommandQueue = nullptr;
+    Microsoft::WRL::ComPtr<ID3D12Device> InteropDevice;
     ID3D12CommandAllocator* Dx12CommandAllocator[VKDX12_BUFFER_COUNT] {};
     ID3D12GraphicsCommandList* Dx12CommandList[VKDX12_BUFFER_COUNT] {};
     ID3D12Fence* Dx12Fence = nullptr;
@@ -84,6 +85,7 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
     ID3D12Fence* dx12FenceTextureCopy[VKDX12_BUFFER_COUNT] {};
     HANDLE vkSHForTextureCopy[VKDX12_BUFFER_COUNT] {};
     ULONG _fenceValue = 0;
+    std::array<std::uint64_t, VKDX12_BUFFER_COUNT> CopyBackValues{};
 
     // Copy shaders
     std::unique_ptr<ResourceCopy_Vk> ColorCopy = nullptr;
@@ -124,13 +126,24 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
 
     template <typename F, typename Default> auto CallFeature(F&& f, Default&& def)
     {
-        if (auto feature = dx12Feature.get(); feature)
+        if (auto feature = InteropFeature(); feature)
             return f(feature);
         return def;
     }
 
   protected:
     std::unique_ptr<IFeature_Dx12> dx12Feature = nullptr;
+    // Native Vulkan capture reuses interop/sync, NOT the D3D12 SR pipeline.
+    virtual IFeature* InteropFeature() { return dx12Feature.get(); }
+    virtual bool CapturesCompletedOutput() const { return false; }
+    virtual bool InitInteropFeature(NVSDK_NGX_Parameter* parameters);
+    virtual bool EvaluateInteropFeature(ID3D12GraphicsCommandList* list,
+                                         NVSDK_NGX_Parameter* parameters);
+    ID3D12CommandQueue* InteropQueue() const { return Dx12CommandQueue; }
+    ID3D12Device* InteropDeviceOwner() const { return InteropDevice.Get(); }
+    void CaptureExternalOwnership(VkCommandBuffer list, bool release);
+    bool WaitCaptureSlot(unsigned frame);
+    void DrainCapture();
 
     // vk w/dx12 can't be wrapped by the IFeature_Vk, needs its own Init and Evaluate
     bool InitInternal(VkCommandBuffer InCmdList, NVSDK_NGX_Parameter* InParameters) final { return false; };
@@ -157,7 +170,7 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
 
     void TickFrozenCheck() override
     {
-        if (auto feature = dx12Feature.get(); feature)
+        if (auto feature = InteropFeature(); feature)
             return feature->TickFrozenCheck();
     };
 

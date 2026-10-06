@@ -882,6 +882,8 @@ class Vulkan_wDx12
     inline static VkSubmitInfo syncSubmitInfo = {};
     inline static VkPipelineStageFlags syncWaitStage = VK_PIPELINE_STAGE_NONE;
     inline static uint64_t signalValueCopyBack = 0;
+    inline static VkSemaphore captureCompletionSemaphore = VK_NULL_HANDLE;
+    inline static uint64_t captureCompletionValue = 0;
 
     inline static VkCommandBuffer lastCmdBuffer = VK_NULL_HANDLE;
     inline static VkCommandBuffer virtualCmdBuffer = VK_NULL_HANDLE;
