@@ -2,6 +2,7 @@
 #include "xrfg/vulkan_session_bridge.hpp"
 #include "xrfg/d3d11_bridge.hpp"
 #include "xrfg/d3d12_history.hpp"
+#include "xrfg/d3d12_native_binding.hpp"
 #include "djules_output_buffer.hpp"
 #include "djules_triple_release.hpp"
 #include "xrfg/two_output_schedule.hpp"
@@ -4229,8 +4230,11 @@ XrResult layer_create_session_impl(
                 const auto* binding = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(next);
                 state->graphics_binding = SessionGraphicsBinding::d3d12;
                 binding_structure_type = next->type;
-                state->d3d12_device = binding->device;
-                state->d3d12_queue = binding->queue;
+                if (FAILED(xrfg::d3d_native::canonical_binding(
+                        binding->device, binding->queue,
+                        state->d3d12_device, state->d3d12_queue))) {
+                    return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+                }
                 break;
             }
             if (next->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) {

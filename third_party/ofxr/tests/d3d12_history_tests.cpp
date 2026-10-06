@@ -1,6 +1,7 @@
 #include "xrfg/d3d12_history.hpp"
 #include "xrfg/bridge_flight_logger.hpp"
 #include "xrfg/dlss_motion_vectors.hpp"
+#include "xrfg/d3d12_native_binding.hpp"
 #include <filesystem>
 #include <fstream>
 #include "xrfg/d3d12_frame_synthesizer.hpp"
@@ -1572,10 +1573,13 @@ private:
 // differs. Same adapter is intentionally NOT proof of snapshot ownership.
 class ReportedDeviceAlias final : public ID3D12Device {
 public:
-    explicit ReportedDeviceAlias(ID3D12Device* native) : native_(native) {}
+    explicit ReportedDeviceAlias(ID3D12Device* native, bool exposes_native = false)
+        : native_(native), exposes_native_(exposes_native) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
         if (!object) return E_POINTER;
         *object = nullptr;
+        if (exposes_native_ && iid == xrfg::d3d_native::streamline_native_guid)
+            return native_->QueryInterface(__uuidof(ID3D12Device), object);
         if (iid != __uuidof(IUnknown) && iid != __uuidof(ID3D12Object) && iid != __uuidof(ID3D12Device))
             return E_NOINTERFACE;
         *object = static_cast<ID3D12Device*>(this); AddRef(); return S_OK;
@@ -1628,17 +1632,21 @@ public:
     LUID STDMETHODCALLTYPE GetAdapterLuid() override { return native_->GetAdapterLuid(); }
 private:
     ComPtr<ID3D12Device> native_;
+    bool exposes_native_{};
     volatile LONG references_{1};
 };
 
 class QueueWithReportedDeviceAlias final : public ID3D12CommandQueue {
 public:
-    QueueWithReportedDeviceAlias(ID3D12CommandQueue* native, ID3D12Device* reported)
-        : native_(native), reported_(reported) {}
+    QueueWithReportedDeviceAlias(ID3D12CommandQueue* native, ID3D12Device* reported,
+        bool exposes_native = false)
+        : native_(native), reported_(reported), exposes_native_(exposes_native) {}
     LONG device_queries() noexcept { return InterlockedCompareExchange(&device_queries_, 0, 0); }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
         if (!object) return E_POINTER;
         *object = nullptr;
+        if (exposes_native_ && iid == xrfg::d3d_native::streamline_native_guid)
+            return native_->QueryInterface(__uuidof(ID3D12CommandQueue), object);
         if (iid != __uuidof(IUnknown) && iid != __uuidof(ID3D12Object) &&
             iid != __uuidof(ID3D12DeviceChild) && iid != __uuidof(ID3D12Pageable) &&
             iid != __uuidof(ID3D12CommandQueue)) return E_NOINTERFACE;
@@ -1674,6 +1682,7 @@ public:
 private:
     ComPtr<ID3D12CommandQueue> native_;
     ComPtr<ID3D12Device> reported_;
+    bool exposes_native_{};
     volatile LONG references_{1}, device_queries_{};
 };
 
@@ -3356,6 +3365,18 @@ void test_dlss_motion_vector_submission_handoff(D3D12WarpFixture& fixture) {
     const auto output = create_texture(width, height);
     const auto motion = create_texture(width / 2, height / 2);
     const auto xr_output = create_texture(width, height);
+    ComPtr<ReportedDeviceAlias> binding_device;
+    binding_device.Attach(new ReportedDeviceAlias(fixture.device(), true));
+    ComPtr<QueueWithReportedDeviceAlias> binding_queue;
+    binding_queue.Attach(new QueueWithReportedDeviceAlias(
+        fixture.queue(), binding_device.Get(), true));
+    ComPtr<ID3D12Device> canonical_device;
+    ComPtr<ID3D12CommandQueue> canonical_queue;
+    require_hresult(xrfg::d3d_native::canonical_binding(
+        binding_device.Get(), binding_queue.Get(), canonical_device, canonical_queue),
+        "canonicalize Streamline D3D12 XR binding");
+    require(canonical_device.Get() == fixture.device() &&
+        canonical_queue.Get() == fixture.queue(), "XR binding retained wrapper identities");
     xrfg::DlssMotionVectorPublication publication{
         404, output.Get(), motion.Get(), producer_queue.Get(), 0, 0,
         width, height, 0, 0, width / 2, height / 2,
@@ -3366,6 +3387,8 @@ void test_dlss_motion_vector_submission_handoff(D3D12WarpFixture& fixture) {
     require(!xrfg::resolve_dlss_motion_vectors(
                 xr_output.Get(), fixture.queue()),
         "unsubmitted DLSS snapshots crossed queues without synchronization");
+    require(!xrfg::resolve_dlss_motion_vectors(xr_output.Get(), canonical_queue.Get()),
+        "canonical binding bypassed the producer submission fence");
 
     require_hresult(command_list->Close(), "close DLSS producer command list");
     ID3D12CommandList* submitted[] = {command_list.Get()};
@@ -3373,13 +3396,22 @@ void test_dlss_motion_vector_submission_handoff(D3D12WarpFixture& fixture) {
     xrfg::report_dlss_motion_vector_submission(
         producer_queue.Get(), 1, submitted);
 
+    require(!xrfg::resolve_dlss_motion_vectors(xr_output.Get(), binding_queue.Get()),
+        "wrapper mismatch counterexample no longer exercises the MSFS rejection");
+
     const auto resolved = xrfg::resolve_dlss_motion_vectors(
-        xr_output.Get(), fixture.queue());
+        xr_output.Get(), canonical_queue.Get());
     require(resolved && resolved->eye_count == 1 && resolved->eyes[0] &&
             resolved->eyes[0]->stream == 404 &&
             resolved->eyes[0]->producer_fence &&
             resolved->eyes[0]->producer_fence_value != 0,
         "submitted DLSS snapshots did not cross queues through the fence handoff");
+    ComPtr<ReportedDeviceAlias> unknown_device;
+    unknown_device.Attach(new ReportedDeviceAlias(fixture.device()));
+    require(FAILED(xrfg::d3d_native::canonical_binding(
+        unknown_device.Get(), binding_queue.Get(), canonical_device, canonical_queue)) &&
+        !canonical_device && !canonical_queue,
+        "same adapter admitted an unproven binding device identity");
     fixture.execute_and_wait([](ID3D12GraphicsCommandList*) {});
 
     xrfg::configure_dlss_motion_vector_tracking(false);

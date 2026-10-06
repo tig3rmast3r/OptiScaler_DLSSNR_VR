@@ -123,8 +123,13 @@ assert(layer.includes('origin_token, session->d3d12_queue.Get(), session->d3d12_
 const contextSource = read('OptiScaler/ofxr/ofxr_bridge_client.cpp');
 const contextStart = contextSource.indexOf('int OFXR_GetLukeRossD3D12ContextV1(');
 const context = contextSource.slice(contextStart, contextSource.indexOf('namespace ofxr_bridge', contextStart));
-const nativeResolver = read('OptiScaler/hooks/D3D_NativeInterface.h');
-assert(nativeResolver.includes('streamline_native::native_interface_guid') &&
+const nativeResolver = read('third_party/ofxr/include/xrfg/d3d12_native_binding.hpp');
+const nativeEntry = read('OptiScaler/hooks/D3D_NativeInterface.h');
+assert(nativeEntry.includes('d3d12_native_binding.hpp') &&
+    nativeEntry.includes('namespace d3d_native = xrfg::d3d_native;') &&
+    !nativeEntry.includes('inline bool get_borrowed'),
+    'producer must use the single shared native-interface implementation');
+assert(nativeResolver.includes('streamline_native_guid') &&
     nativeResolver.includes('reshade_unwrapped_guid') && nativeResolver.includes('next->Release()') &&
     nativeResolver.includes('visited[8]') && nativeResolver.includes('FAILED(result) || !next'),
     'Luke wrapper resolution must balance both native QI contracts and reject malformed or cyclic chains');
