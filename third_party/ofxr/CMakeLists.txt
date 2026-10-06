@@ -314,6 +314,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         src/common/two_frame_capture.cpp
         src/common/fsr_frame_generation.cpp
         src/d3d11/d3d11_d3d12_interop.cpp
+        src/d3d11/d3d11_bridge.cpp
         src/d3d11/d3d11_color_identity.cpp
         src/d3d12/d3d12_history.cpp
         src/d3d12/d3d12_fsr_frame_generator.cpp
@@ -558,6 +559,11 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         add_executable(xrfg_three_slot_director_tests
             tests/three_slot_director_tests.cpp
             src/common/embedded_control.cpp)
+        add_executable(xrfg_d3d11_bridge_tests tests/d3d11_bridge_tests.cpp)
+        target_link_libraries(xrfg_d3d11_bridge_tests PRIVATE xrfg_d3d12_history)
+        target_compile_definitions(xrfg_d3d11_bridge_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        add_test(NAME xrfg_d3d11_bridge_tests COMMAND xrfg_d3d11_bridge_tests)
+        set_tests_properties(xrfg_d3d11_bridge_tests PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(xrfg_d3d11_color_identity_tests tests/d3d11_color_identity_tests.cpp)
         add_executable(xrfg_flow_input_encoding_tests tests/flow_input_encoding_tests.cpp)
         target_include_directories(xrfg_flow_input_encoding_tests PRIVATE

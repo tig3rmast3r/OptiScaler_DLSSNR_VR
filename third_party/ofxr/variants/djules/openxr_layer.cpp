@@ -1,3 +1,4 @@
+#include "xrfg/d3d11_bridge.hpp"
 #include "xrfg/d3d12_history.hpp"
 #include "xrfg/three_slot_buffer.hpp"
 #include "xrfg/two_output_schedule.hpp"
@@ -140,6 +141,12 @@ template <typename Handle>
 }
 
 struct Dispatch {
+    // The D3D11 bridge (SessionState::d3d11_bridge): set when the ini asks
+    // for it, the application enabled XR_KHR_D3D11_enable, and the layer
+    // could add XR_KHR_D3D12_enable to the instance. The runtime's D3D12
+    // requirements call has to be made before a D3D12 session is created.
+    bool d3d11_bridge{};
+    PFN_xrGetD3D12GraphicsRequirementsKHR get_d3d12_graphics_requirements{};
     XrInstance instance{XR_NULL_HANDLE};
     PFN_xrGetInstanceProcAddr get_instance_proc_addr{};
     PFN_xrConvertTimeToWin32PerformanceCounterKHR convert_time_to_qpc{};
@@ -415,6 +422,22 @@ enum class GenerationQuarantineReason : std::int64_t {
 #endif
 
 struct SessionState {
+    // The D3D11 bridge. The application bound D3D11; the runtime was handed
+    // a D3D12 session on the layer's own device, so from here on the session
+    // is a D3D12 one (graphics_binding, d3d12_device, d3d12_queue) and
+    // d3d11_device stays null: no interop, no runtime-entry gate, no D3D11
+    // work by the runtime on any thread. The application's device lives
+    // here, for the per-swapchain shared textures it renders into
+    // (D3D11BridgeSwapchain). Why: the NVIDIA D3D11 driver faults when the
+    // runtime works the game's device from the presenter thread, and the
+    // inline alternative is throttled by SteamVR; a runtime that only ever
+    // sees D3D12 has neither problem. Capability bit 128.
+    struct D3D11Bridge {
+        Microsoft::WRL::ComPtr<ID3D11Device> device;
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+    };
+    std::unique_ptr<D3D11Bridge> d3d11_bridge;
+    std::atomic<bool> has_private_depth_swapchain{false};
     explicit SessionState(std::shared_ptr<Dispatch> next_dispatch)
         : dispatch(std::move(next_dispatch)), manual_control(current_layer_directory()),
           fsr_cadence(current_layer_directory()) {}
@@ -1133,6 +1156,12 @@ void log_swapchain_eligibility(
     std::uint64_t auxiliary = 0) noexcept;
 
 struct SwapchainState {
+    // On a bridged D3D11 session (SessionState::d3d11_bridge): the shared
+    // textures the application renders into and the copies into the
+    // runtime's images. enumerated_d3d12_images are then the shared
+    // textures, which is what the D3D12 history captures from.
+    std::shared_ptr<xrfg::D3D11BridgeSwapchain> bridge;
+    bool private_depth{};
     SwapchainState(
         std::shared_ptr<SessionState> owner,
         const XrSwapchainCreateInfo& input_create_info)
@@ -1477,6 +1506,17 @@ void drain_swapchain_gpu(const std::shared_ptr<SwapchainState>& state) noexcept 
                 generation->d3d11_interop->wait_for_idle();
             if (SUCCEEDED(result)) {
                 result = interop_result;
+            }
+        }
+        std::shared_ptr<xrfg::D3D11BridgeSwapchain> bridge;
+        {
+            std::scoped_lock lock(state->mutex);
+            bridge = state->bridge;
+        }
+        if (bridge) {
+            const HRESULT bridge_result = bridge->wait_for_idle();
+            if (SUCCEEDED(result)) {
+                result = bridge_result;
             }
         }
         xrfg::bridge_flight_logger().end(
@@ -2909,9 +2949,75 @@ XrResult layer_create_api_layer_instance_impl(
             }
         }
     }
+
+    // The D3D11 bridge needs XR_KHR_D3D12_enable on the instance, which the
+    // application did not ask for. Added here, only when the ini asks for
+    // the bridge, the application enabled D3D11 and the runtime lists D3D12;
+    // anything short of that leaves the instance as the application made it.
+    XrInstanceCreateInfo bridged_create_info{};
+    std::vector<const char*> bridged_extensions;
+    const XrInstanceCreateInfo* forwarded_create_info = bridge_enabled_clock ? &diagnostic_create : create_info;
+    const XrInstanceCreateInfo* const negotiated_info = forwarded_create_info;
+    bool bridge_extension_added = false;
+    bool bridge_requested_by_ini = false;
+    bool asked_d3d11 = false;
+    bool asked_d3d12 = false;
+    try {
+        for (std::uint32_t index = 0; index < create_info->enabledExtensionCount; ++index) {
+            const char* const extension = create_info->enabledExtensionNames[index];
+            if (extension == nullptr) continue;
+            if (std::string_view(extension) == "XR_KHR_D3D11_enable") asked_d3d11 = true;
+            if (std::string_view(extension) == "XR_KHR_D3D12_enable") asked_d3d12 = true;
+        }
+        // A game that enabled XR_KHR_D3D12_enable itself - Assetto Corsa
+        // and SkyrimVR enable every graphics extension the runtime lists -
+        // needs nothing added; the bridge then decides at xrCreateSession
+        // on the binding it sees.
+        bridge_requested_by_ini =
+            GetPrivateProfileIntW(L"ofxr", L"d3d11_bridge", 1, (current_layer_directory() / L"ofxr_bridge.ini").c_str()) == 1;
+        if (asked_d3d11 && !asked_d3d12 && bridge_requested_by_ini) {
+            PFN_xrEnumerateInstanceExtensionProperties enumerate_extensions = nullptr;
+            bool runtime_has_d3d12 = false;
+            if (XR_SUCCEEDED(next_get_instance_proc_addr(
+                    XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties",
+                    reinterpret_cast<PFN_xrVoidFunction*>(&enumerate_extensions))) &&
+                enumerate_extensions != nullptr) {
+                std::uint32_t count = 0;
+                if (XR_SUCCEEDED(enumerate_extensions(nullptr, 0, &count, nullptr)) && count > 0) {
+                    std::vector<XrExtensionProperties> properties(
+                        count, XrExtensionProperties{XR_TYPE_EXTENSION_PROPERTIES});
+                    if (XR_SUCCEEDED(enumerate_extensions(
+                            nullptr, count, &count, properties.data()))) {
+                        for (std::uint32_t index = 0; index < count; ++index) {
+                            if (std::string_view(properties[index].extensionName) ==
+                                "XR_KHR_D3D12_enable") {
+                                runtime_has_d3d12 = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (runtime_has_d3d12) {
+                bridged_extensions.assign(
+                    negotiated_info->enabledExtensionNames,
+                    negotiated_info->enabledExtensionNames + negotiated_info->enabledExtensionCount);
+                bridged_extensions.push_back("XR_KHR_D3D12_enable");
+                bridged_create_info = *negotiated_info;
+                bridged_create_info.enabledExtensionNames = bridged_extensions.data();
+                bridged_create_info.enabledExtensionCount =
+                    static_cast<std::uint32_t>(bridged_extensions.size());
+                forwarded_create_info = &bridged_create_info;
+                bridge_extension_added = true;
+            }
+        }
+    } catch (...) {
+        forwarded_create_info = negotiated_info;
+        bridge_extension_added = false;
+    }
+
     XrInstance created_instance = XR_NULL_HANDLE;
     const XrResult result = next_create_api_layer_instance(
-        bridge_enabled_clock ? &diagnostic_create : create_info,
+        forwarded_create_info,
         &next_layer_info,
         &created_instance);
     if (XR_FAILED(result)) {
@@ -2977,6 +3083,29 @@ XrResult layer_create_api_layer_instance_impl(
         }
         return XR_ERROR_INITIALIZATION_FAILED;
     }
+
+        // The bridge decision, on every instance: a the graphics extensions
+        // the application enabled (4 D3D11, 8 D3D12), b whether the ini asks
+        // for the bridge, c whether the extension was added. result 0 with
+        // c=1 is the bridge armed; -1 is an added extension whose
+        // requirements call the runtime then failed to hand out.
+        const bool d3d12_on_instance = bridge_extension_added || asked_d3d12;
+        if (bridge_requested_by_ini && asked_d3d11 && d3d12_on_instance) {
+            dispatch->d3d11_bridge = load_function(
+                next_get_instance_proc_addr, created_instance,
+                "xrGetD3D12GraphicsRequirementsKHR",
+                dispatch->get_d3d12_graphics_requirements);
+        }
+        xrfg::bridge_flight_logger().event(
+            xrfg::BridgeFlightOperation::d3d11_bridge,
+            bridge_requested_by_ini && asked_d3d11 && d3d12_on_instance &&
+                    !dispatch->d3d11_bridge
+                ? -1
+                : 0,
+            (asked_d3d11 ? 4ULL : 0ULL) | (asked_d3d12 ? 8ULL : 0ULL),
+            bridge_requested_by_ini ? 1 : 0,
+            (bridge_extension_added ? 1ULL : 0ULL) |
+                (dispatch->d3d11_bridge ? 2ULL : 0ULL));
 
     dispatch->instance = created_instance;
     bool application_enabled_clock_conversion = false;
@@ -3172,8 +3301,85 @@ XrResult layer_create_session_impl(
         }
     }
 
+    XrSessionCreateInfo substituted_info{};
+    const XrSessionCreateInfo* forwarded_info = create_info;
+    // The D3D11 bridge: see SessionState::d3d11_bridge. From here the
+    // session is a D3D12 one for every path below, and the runtime gets a
+    // D3D12 binding on the layer's device. Anything that fails leaves the
+    // D3D11 binding as the application made it.
+    XrGraphicsBindingD3D12KHR bridge_binding{XR_TYPE_GRAPHICS_BINDING_D3D12_KHR};
+    const void* d3d11_binding_next = nullptr;
+    if (create_info != nullptr) {
+        for (auto* next = static_cast<const XrBaseInStructure*>(create_info->next);
+             next != nullptr; next = next->next) {
+            if (next->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
+                d3d11_binding_next = next->next;
+            }
+        }
+    }
+    Microsoft::WRL::ComPtr<ID3D12Device> luke_producer_device;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> luke_producer_queue;
+    const bool luke_producer = state->graphics_binding == SessionGraphicsBinding::d3d11 &&
+        query_luke_ross_d3d12_context(luke_producer_device.GetAddressOf(), luke_producer_queue.GetAddressOf());
+    if (!luke_producer && !state->luke_afw_enabled && dispatch->d3d11_bridge &&
+        dispatch->get_d3d12_graphics_requirements != nullptr &&
+        state->graphics_binding == SessionGraphicsBinding::d3d11 &&
+        create_info != nullptr && state->d3d11_device && state->d3d11_context) {
+        XrGraphicsRequirementsD3D12KHR requirements{
+            XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR};
+        const XrResult requirements_result =
+            dispatch->get_d3d12_graphics_requirements(
+                instance, create_info->systemId, &requirements);
+        Microsoft::WRL::ComPtr<ID3D12Device> bridge_device;
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> bridge_queue;
+        HRESULT device_result = E_FAIL;
+        if (XR_SUCCEEDED(requirements_result)) {
+            device_result = xrfg::create_d3d12_device_for_d3d11(
+                state->d3d11_device.Get(),
+                bridge_device.ReleaseAndGetAddressOf(),
+                bridge_queue.ReleaseAndGetAddressOf());
+        }
+        if (XR_SUCCEEDED(requirements_result) && SUCCEEDED(device_result) &&
+            bridge_device && bridge_queue) {
+            auto bridge = std::make_unique<SessionState::D3D11Bridge>();
+            bridge->device = std::move(state->d3d11_device);
+            bridge->context = std::move(state->d3d11_context);
+            state->d3d11_device.Reset();
+            state->d3d11_context.Reset();
+            state->d3d11_bridge = std::move(bridge);
+            state->d3d12_device = std::move(bridge_device);
+            state->d3d12_queue = std::move(bridge_queue);
+            state->graphics_binding = SessionGraphicsBinding::d3d12;
+            state->single_threaded_d3d11 = false;
+            state->graphics_binding_capabilities |= 128ULL;
+            bridge_binding.device = state->d3d12_device.Get();
+            bridge_binding.queue = state->d3d12_queue.Get();
+            // Whatever the application chained after its binding stays
+            // chained, after ours.
+            bridge_binding.next = d3d11_binding_next;
+            substituted_info = *create_info;
+            substituted_info.next = &bridge_binding;
+            forwarded_info = &substituted_info;
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::d3d11_bridge,
+                1,
+                0,
+                0,
+                static_cast<std::uint64_t>(requirements.adapterLuid.LowPart));
+        } else {
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::d3d11_bridge,
+                XR_FAILED(requirements_result)
+                    ? static_cast<std::int64_t>(requirements_result)
+                    : static_cast<std::int64_t>(device_result),
+                0,
+                XR_FAILED(requirements_result) ? 1 : 2,
+                0);
+        }
+    }
+
     XrSession created_session = XR_NULL_HANDLE;
-    const XrResult result = dispatch->create_session(instance, create_info, &created_session);
+    const XrResult result = dispatch->create_session(instance, forwarded_info, &created_session);
     if (XR_FAILED(result)) {
         return result;
     }
@@ -3834,11 +4040,25 @@ XrResult layer_create_swapchain_impl(
         (create_info->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) != 0 &&
         (create_info->usageFlags &
          XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0;
-    auto swapchain_state = std::make_shared<SwapchainState>(state, *create_info);
+    // Bridged and multisampled: the runtime gets a single-sample swapchain
+    // and the application a multisampled texture of its own, resolved at
+    // release (D3D11BridgePath::resolve). Every path below sees the
+    // single-sample create info, which is what the runtime's images are.
+    XrSwapchainCreateInfo bridged_create_info{};
+    const XrSwapchainCreateInfo* runtime_create_info = create_info;
+    if (state->d3d11_bridge &&
+        (create_info->createFlags & XR_SWAPCHAIN_CREATE_PROTECTED_CONTENT_BIT))
+        return XR_ERROR_FEATURE_UNSUPPORTED;
+    if (state->d3d11_bridge && create_info->sampleCount > 1) {
+        bridged_create_info = *create_info;
+        bridged_create_info.sampleCount = 1;
+        runtime_create_info = &bridged_create_info;
+    }
+    auto swapchain_state = std::make_shared<SwapchainState>(state, *runtime_create_info);
     XrSwapchain created_swapchain = XR_NULL_HANDLE;
     const XrResult result = state->dispatch->create_swapchain(
         session,
-        create_info,
+        runtime_create_info,
         &created_swapchain);
     if (XR_FAILED(result)) {
         // The application losing a swapchain of its own is the shape a layer
@@ -3891,6 +4111,82 @@ XrResult layer_create_swapchain_impl(
     } catch (...) {
         state->dispatch->destroy_swapchain(created_swapchain);
         return XR_ERROR_RUNTIME_FAILURE;
+    }
+    if (state->d3d11_bridge) {
+        // Bridge it now, while the runtime's images can be enumerated
+        // without the application seeing D3D12 ones: the application's
+        // enumeration is answered from the bridge. A shape the bridge cannot
+        // share fails the creation, which the application sees as a
+        // swapchain it could not create.
+        std::uint32_t runtime_count = 0;
+        std::vector<XrSwapchainImageD3D12KHR> runtime_images;
+        XrResult bridge_result = state->dispatch->enumerate_swapchain_images(
+            created_swapchain, 0, &runtime_count, nullptr);
+        if (XR_SUCCEEDED(bridge_result) && runtime_count > 0) {
+            runtime_images.assign(
+                runtime_count,
+                XrSwapchainImageD3D12KHR{XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+            bridge_result = state->dispatch->enumerate_swapchain_images(
+                created_swapchain, runtime_count, &runtime_count,
+                reinterpret_cast<XrSwapchainImageBaseHeader*>(runtime_images.data()));
+        }
+        HRESULT shared_result = E_FAIL;
+        std::uint32_t failure_stage = 0;
+        auto bridge = std::make_shared<xrfg::D3D11BridgeSwapchain>();
+        if (XR_SUCCEEDED(bridge_result) && runtime_count > 0) {
+            std::vector<ID3D12Resource*> resources;
+            for (const XrSwapchainImageD3D12KHR& image : runtime_images) {
+                resources.push_back(image.texture);
+            }
+            xrfg::D3D11BridgeSwapchainDescription requested{};
+            requested.requested_format =
+                static_cast<DXGI_FORMAT>(create_info->format);
+            requested.requested_sample_count = create_info->sampleCount;
+            requested.unordered_access =
+                (create_info->usageFlags & XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT) != 0;
+            requested.depth_stencil =
+                (create_info->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+            shared_result = bridge->initialize(
+                state->d3d11_bridge->device.Get(),
+                state->d3d11_bridge->context.Get(),
+                state->d3d12_device.Get(),
+                state->d3d12_queue.Get(),
+                resources,
+                requested,
+                &failure_stage);
+        }
+        if (XR_FAILED(bridge_result) || FAILED(shared_result)) {
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::d3d11_bridge,
+                XR_FAILED(bridge_result)
+                    ? static_cast<std::int64_t>(bridge_result)
+                    : static_cast<std::int64_t>(shared_result),
+                handle_value(created_swapchain),
+                failure_stage,
+                static_cast<std::uint64_t>(create_info->format));
+            {
+                std::scoped_lock lock(g_state_mutex);
+                g_swapchains.erase(created_swapchain);
+            }
+            state->dispatch->destroy_swapchain(created_swapchain);
+            return XR_ERROR_RUNTIME_FAILURE;
+        }
+        // 2: bridged. b the image count and, in the high half, the path
+        // (D3D11BridgePath); c the requested format and, in the high half,
+        // the format the shared textures took from the runtime's images.
+        xrfg::bridge_flight_logger().event(
+            xrfg::BridgeFlightOperation::d3d11_bridge,
+            2,
+            handle_value(created_swapchain),
+            (static_cast<std::uint64_t>(bridge->path()) << 32) | runtime_count,
+            (static_cast<std::uint64_t>(bridge->shared_format()) << 32) |
+                static_cast<std::uint64_t>(static_cast<std::uint32_t>(create_info->format)));
+        if (bridge->path() == xrfg::D3D11BridgePath::depth_private) {
+            state->has_private_depth_swapchain.store(true, std::memory_order_release);
+            swapchain_state->private_depth = true;
+        }
+        std::scoped_lock lock(swapchain_state->mutex);
+        swapchain_state->bridge = std::move(bridge);
     }
     *swapchain = created_swapchain;
     if (active_color_reconfiguration) {
@@ -3958,6 +4254,7 @@ XrResult layer_destroy_swapchain_impl(XrSwapchain swapchain) {
     destroy_frame_generation_swapchains(state);
     const XrResult result = state->session->dispatch->destroy_swapchain(swapchain);
     if (XR_SUCCEEDED(result)) {
+        { std::scoped_lock lock(state->mutex); state->bridge.reset(); }
         std::scoped_lock lock(g_state_mutex);
         g_swapchains.erase(swapchain);
     }
@@ -3980,13 +4277,47 @@ XrResult layer_enumerate_swapchain_images_impl(
     // application replaces them during a resize/reconfigure transaction.
     PresenterResourceLifetimeGuard presenter_guard(state->session);
     std::scoped_lock call_lock(state->call_mutex);
-    const XrResult result = state->session->dispatch->enumerate_swapchain_images(
-        swapchain,
-        image_capacity_input,
-        image_count_output,
-        images);
-    if (XR_FAILED(result) || image_count_output == nullptr || images == nullptr || image_capacity_input == 0) {
-        return result;
+    std::shared_ptr<xrfg::D3D11BridgeSwapchain> bridge;
+    {
+        std::scoped_lock lock(state->mutex);
+        bridge = state->bridge;
+    }
+    std::vector<ID3D12Resource*> bridged_resources;
+    XrResult result = XR_SUCCESS;
+    if (bridge) {
+        // The application gets the bridge's D3D11 textures, never the
+        // runtime's D3D12 images; the D3D12 bookkeeping below sees the
+        // shared textures, which is what history captures from.
+        const auto d3d11_views = bridge->d3d11_images();
+        const auto count = static_cast<std::uint32_t>(d3d11_views.size());
+        if (image_count_output == nullptr) {
+            return XR_ERROR_VALIDATION_FAILURE;
+        }
+        *image_count_output = count;
+        if (image_capacity_input == 0 || images == nullptr) {
+            return XR_SUCCESS;
+        }
+        if (image_capacity_input < count) {
+            return XR_ERROR_SIZE_INSUFFICIENT;
+        }
+        auto* d3d11_images = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
+        for (std::uint32_t index = 0; index < count; ++index) {
+            if (d3d11_images[index].type != XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR) {
+                return XR_ERROR_VALIDATION_FAILURE;
+            }
+            d3d11_images[index].texture = d3d11_views[index];
+        }
+        const auto shared = bridge->shared_images();
+        bridged_resources.assign(shared.begin(), shared.end());
+    } else {
+        result = state->session->dispatch->enumerate_swapchain_images(
+            swapchain,
+            image_capacity_input,
+            image_count_output,
+            images);
+        if (XR_FAILED(result) || image_count_output == nullptr || images == nullptr || image_capacity_input == 0) {
+            return result;
+        }
     }
 
     try {
@@ -4120,7 +4451,10 @@ XrResult layer_enumerate_swapchain_images_impl(
 
         std::vector<ID3D12Resource*> resources(count);
         auto* d3d12_images = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images);
-        for (std::uint32_t index = 0; index < count; ++index) {
+        if (bridge) {
+            resources = bridged_resources;
+        }
+        for (std::uint32_t index = 0; index < count && !bridge; ++index) {
             if (d3d12_images[index].type != XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR ||
                 d3d12_images[index].texture == nullptr) {
                 log_swapchain_eligibility(
@@ -4327,7 +4661,9 @@ XrResult layer_wait_swapchain_image_impl(
         std::scoped_lock lock(state->mutex);
         if (state->ownership_tracking_valid &&
             state->waited_count < state->acquired_indices.size()) {
-            ++state->waited_count;
+            const auto image = state->acquired_indices[state->waited_count++];
+            if (state->bridge && FAILED(state->bridge->before_write(image)))
+                return XR_ERROR_RUNTIME_FAILURE;
         }
     }
     return result;
@@ -4480,9 +4816,11 @@ XrResult release_swapchain_with_identity(
     std::scoped_lock call_lock(state->call_mutex);
     std::optional<std::uint32_t> candidate_index;
     std::shared_ptr<xrfg::D3D12SwapchainHistory> history;
+    std::shared_ptr<xrfg::D3D11BridgeSwapchain> bridge;
     std::shared_ptr<xrfg::D3D11D3D12SwapchainInterop> d3d11_interop;
     {
         std::scoped_lock lock(state->mutex);
+        bridge = state->bridge;
         if (state->ownership_tracking_valid && state->waited_count > 0 &&
             !state->acquired_indices.empty()) {
             candidate_index = state->acquired_indices.front();
@@ -4490,6 +4828,22 @@ XrResult release_swapchain_with_identity(
             if (state->frame_generation) {
                 d3d11_interop = state->frame_generation->d3d11_interop;
             }
+        }
+    }
+
+    // Bridged: the application's rendering goes to the runtime's image now,
+    // whatever generation does with it afterwards. A failed copy is logged
+    // and the release still goes down, so the runtime shows its last content
+    // rather than the session failing.
+    if (bridge && candidate_index) {
+        const HRESULT copy_result = bridge->release(*candidate_index);
+        if (FAILED(copy_result)) {
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::d3d11_bridge,
+                3,
+                handle_value(state->handle),
+                *candidate_index,
+                static_cast<std::uint64_t>(static_cast<std::uint32_t>(copy_result)));
         }
     }
 
@@ -4688,6 +5042,12 @@ XrResult release_swapchain_with_identity(
             state->enumerated_d3d11_images[*candidate_index].Get(), *candidate_index,
             pending_capture->serial, pending_capture->fence_value);
     }
+    if (bridge && candidate_index) {
+        // Every read of the shared texture this frame - the copy and the
+        // capture - is queued; the next acquire of this image waits for it.
+        static_cast<void>(bridge->mark_read(*candidate_index));
+    }
+
     XrResult result = XR_ERROR_RUNTIME_FAILURE;
     try {
         result = with_runtime_entry(state->session.get(), [&] {
@@ -9625,6 +9985,103 @@ void log_video_memory_periodically(SessionState& state) noexcept {
     log_video_memory(state, VideoMemoryStage::periodic, 0);
 }
 
+// A bridged depth swapchain on D3D11BridgePath::depth_private has runtime
+// images nothing ever writes, so depth information naming it must not reach
+// the runtime. The application's end-frame data is read-only, so the
+// projection layers whose views carry such a node are copied with the node
+// unlinked; every other layer pointer is forwarded as it came. The storage
+// lives for the xrEndFrame call, which is as long as anything downstream
+// reads the application's data: an owned frame copies what it keeps, a
+// borrowed one is waited for before this call returns.
+struct PrivateDepthStrip {
+    XrFrameEndInfo info{XR_TYPE_FRAME_END_INFO};
+    std::vector<const XrCompositionLayerBaseHeader*> layers;
+    std::deque<ProjectionLayerCopy> projections;
+};
+
+[[nodiscard]] bool names_private_depth_swapchain(const void* next) noexcept {
+    const auto* header = static_cast<const XrBaseInStructure*>(next);
+    if (header == nullptr ||
+        header->type != XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR) {
+        return false;
+    }
+    const auto* depth = reinterpret_cast<const XrCompositionLayerDepthInfoKHR*>(header);
+    const auto swapchain_state = find_swapchain(depth->subImage.swapchain);
+    if (!swapchain_state) {
+        return false;
+    }
+    std::scoped_lock lock(swapchain_state->mutex);
+    return swapchain_state->private_depth;
+}
+
+// Returns the end info to submit: the application's own unless a projection
+// view's chain starts with depth information naming a private depth
+// swapchain, in which case a copy without those nodes. Only a leading run
+// of such nodes is unlinked: the chain's other structures are of types this
+// layer does not know the size of, so a node behind one of them stays.
+[[nodiscard]] const XrFrameEndInfo* strip_private_depth(
+    const SessionState& state,
+    const XrFrameEndInfo* end_info,
+    PrivateDepthStrip& storage) {
+    if (end_info == nullptr || end_info->layers == nullptr ||
+        !state.has_private_depth_swapchain.load(std::memory_order_acquire)) {
+        return end_info;
+    }
+    bool any = false;
+    for (std::uint32_t layer_index = 0; layer_index < end_info->layerCount && !any; ++layer_index) {
+        const auto* layer = end_info->layers[layer_index];
+        if (layer == nullptr || layer->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+            continue;
+        }
+        const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(layer);
+        for (std::uint32_t view_index = 0;
+             projection->views != nullptr && view_index < projection->viewCount; ++view_index) {
+            if (names_private_depth_swapchain(projection->views[view_index].next)) {
+                any = true;
+                break;
+            }
+        }
+    }
+    if (!any) {
+        return end_info;
+    }
+    storage.info = *end_info;
+    storage.layers.assign(end_info->layers, end_info->layers + end_info->layerCount);
+    for (std::uint32_t layer_index = 0; layer_index < end_info->layerCount; ++layer_index) {
+        const auto* layer = end_info->layers[layer_index];
+        if (layer == nullptr || layer->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+            continue;
+        }
+        const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(layer);
+        if (projection->views == nullptr) {
+            continue;
+        }
+        bool affected = false;
+        for (std::uint32_t view_index = 0; view_index < projection->viewCount; ++view_index) {
+            affected = affected ||
+                names_private_depth_swapchain(projection->views[view_index].next);
+        }
+        if (!affected) {
+            continue;
+        }
+        ProjectionLayerCopy& copy = storage.projections.emplace_back();
+        copy.layer_index = layer_index;
+        copy.layer = *projection;
+        copy.views.assign(projection->views, projection->views + projection->viewCount);
+        for (XrCompositionLayerProjectionView& view : copy.views) {
+            while (names_private_depth_swapchain(view.next)) {
+                view.next = static_cast<const XrBaseInStructure*>(view.next)->next;
+            }
+        }
+        copy.layer.views = copy.views.data();
+        storage.layers[layer_index] =
+            reinterpret_cast<const XrCompositionLayerBaseHeader*>(&copy.layer);
+    }
+    storage.info.layers = storage.layers.data();
+    return &storage.info;
+}
+
+
 XrResult layer_end_frame_impl(
     XrSession session,
     const XrFrameEndInfo* end_info) {
@@ -9658,6 +10115,8 @@ XrResult layer_end_frame_impl(
         state->pipelined_presenter_start_requested = state->presenter_start_requested = false;
         state->pipelined_presenter_mode = false;
     }
+    PrivateDepthStrip private_depth_storage;
+    end_info = strip_private_depth(*state, end_info, private_depth_storage);
     const auto application_end_now = std::chrono::steady_clock::now();
     const bool frame_had_overlapping_wait =
         state->application_frame_has_overlapping_wait;

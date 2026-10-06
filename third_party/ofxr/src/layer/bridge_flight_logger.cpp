@@ -31,6 +31,7 @@ constexpr std::uint64_t kMegabyte = 1024ull * 1024ull;
 [[nodiscard]] const char* operation_name(
     BridgeFlightOperation operation) noexcept {
     switch (operation) {
+    case BridgeFlightOperation::d3d11_bridge: return "d3d11_bridge";
     case BridgeFlightOperation::vram_usage: return "vram_usage";
     case BridgeFlightOperation::fsr_eye_binding: return "fsr_eye_binding";
     case BridgeFlightOperation::fsr_hudless_pair: return "fsr_hudless_pair";

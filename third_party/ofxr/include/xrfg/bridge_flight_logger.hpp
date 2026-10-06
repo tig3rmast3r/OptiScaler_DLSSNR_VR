@@ -178,6 +178,7 @@ enum class BridgeFlightOperation : std::uint32_t {
     luke_temporal_pair,    // result=0,a=producer fence,b=previous capture,c=current capture; result1=destinations
     luke_temporal_pose,    // result=phase*100+view*10+pair,a=producer fence,b=capture,c=2 raw floats
     vram_usage, // D35: stage, current adapter usage, budget, subject.
+    d3d11_bridge,
 };
 
 struct BridgeFlightToken {
