@@ -11,6 +11,9 @@ void require(bool pass, const char* message) { if (!pass) throw std::runtime_err
 int main(int argc, char** argv) {
     try {
         using namespace xrfg;
+        require(displayed_rate(88.6F, 90) == 90 && displayed_rate(86.9F, 90) == 86.9F &&
+            displayed_rate(89, 0) == 89 && !std::isfinite(displayed_rate(std::numeric_limits<float>::infinity(),90)),
+            "refresh display rounding hid a real loss or invalid measurement");
         FpsCounter counter;
         require(!counter.snapshot(0).active, "startup green");
         for (int i = 0; i < 45; ++i) {

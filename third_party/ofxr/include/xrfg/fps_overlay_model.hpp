@@ -21,6 +21,8 @@ struct FpsSnapshot {
 
 // Caller serializes access. Fixed storage, monotonic wall-clock measurements;
 // successful downstream submissions are NOT evidence of physical scanout.
+[[nodiscard]] float displayed_rate(float rate, float refresh_hz) noexcept;
+
 class FpsCounter {
 public:
     void submitted(std::int64_t now_ns, bool synthetic, bool new_content = true) noexcept;

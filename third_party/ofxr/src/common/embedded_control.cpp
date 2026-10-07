@@ -45,6 +45,8 @@ struct Control {
         settings.preset = static_cast<int>(options.preset);
         settings.scale = static_cast<int>(options.input_scale);
         settings.backward = options.bidirectional;
+        settings.lower_vram = std::clamp(static_cast<int>(GetPrivateProfileIntW(
+            L"ofxr", L"single_swapchain_rings", -1, ini().c_str())), -1, 1);
         settings.enabled = GetPrivateProfileIntW(L"ofxr", L"enabled", 1, ini().c_str()) != 0;
         wchar_t motion[16]{};
         GetPrivateProfileStringW(L"ofxr", L"motion_vectors", L"off", motion, 16, ini().c_str());
@@ -115,7 +117,8 @@ Snapshot snapshot() {
 bool request(Settings s) {
     if (s.backend < 0 || s.backend > 3 || s.preset < 0 || s.preset > 2 ||
         s.scale < 0 || s.scale > 2 || s.motion_vectors < 0 || s.motion_vectors > 1 ||
-        s.frame_generation < 0 || s.frame_generation > 1) return false;
+        s.frame_generation < 0 || s.frame_generation > 1 ||
+        s.lower_vram < -1 || s.lower_vram > 1) return false;
     // This UI option controls OFXR's temporal guide choice, but Luke AFW
     // independently needs the NGX guide publication even with color-only OFXR.
     if (luke_afw_requires_dlss_guides()) s.motion_vectors = 1;
@@ -130,6 +133,8 @@ bool request(Settings s) {
     const wchar_t* scales[]{L"100", L"75", L"50"};
     if (old.preset != s.preset) ok &= write(L"ofxr", L"nvidia_preset", presets[s.preset]);
     if (old.scale != s.scale) ok &= write(L"ofxr", L"nvidia_input_scale", scales[s.scale]);
+    if (old.lower_vram != s.lower_vram) ok &= write(L"ofxr", L"single_swapchain_rings",
+        s.lower_vram < 0 ? nullptr : s.lower_vram ? L"1" : L"0");
     if (old.backward != s.backward) ok &= write(L"ofxr", L"nvidia_bidirectional", s.backward ? L"1" : L"0");
     if (old.motion_vectors != s.motion_vectors) ok &= write(L"ofxr", L"motion_vectors", s.motion_vectors ? L"dlss" : L"off");
     if (old.frame_generation != s.frame_generation) ok &= write(L"ofxr", L"frame_generation", s.frame_generation ? L"fsr3" : L"ofxr");

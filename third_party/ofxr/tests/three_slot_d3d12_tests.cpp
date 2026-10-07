@@ -39,6 +39,9 @@ bool triple_core{};
 bool triple_inline{};
 bool triple_switch{};
 bool deep_switch{};
+bool lower_vram_test{}, direct_output_test{};
+XrSwapchain last_synthetic_handle{};
+unsigned last_synthetic_frame{};
 bool fsr_queue_gpu_pending{};
 ComPtr<ID3D12Fence> fsr_gpu_gate;
 std::jthread fsr_gpu_watchdog;
@@ -197,6 +200,11 @@ XrResult XRAPI_CALL fake_end(XrSession,const XrFrameEndInfo* end) {
     const auto* projection=reinterpret_cast<const XrCompositionLayerProjection*>(end->layers[0]);
     bool synthetic=synthetic_handles.contains(projection->views[0].subImage.swapchain);
     const unsigned frame_id=static_cast<unsigned>(projection->views[0].pose.position.y);
+    if (direct_output_test && (triple_core || triple_inline) && synthetic) {
+        if(last_synthetic_frame==frame_id)
+            require(last_synthetic_handle!=projection->views[0].subImage.swapchain,"3X synthetic outputs alias one direct handle");
+        last_synthetic_handle=projection->views[0].subImage.swapchain; last_synthetic_frame=frame_id;
+    }
     if (legacy_early_current && synthetic && session_state->queued_nvidia_presenter) {
         std::shared_ptr<GeneratedFrameEndInfo> next;
         {
@@ -313,16 +321,22 @@ int main(int argc,char** argv) {
         auto& s=session_state;s->handle=reinterpret_cast<XrSession>(0x211);s->graphics_binding=SessionGraphicsBinding::d3d12;
         s->optical_flow_backend=xrfg::D3D12OpticalFlowBackend::nvidia;
         s->nvidia_new_route = true; s->djules_route=kTestDjules;
+        const std::string_view mode = argc>1 ? argv[1] : "";
+        lower_vram_test=mode.ends_with("lower-vram"); direct_output_test=mode.ends_with("direct-output");
+        if(lower_vram_test) s->lower_vram=1;
+        if(direct_output_test) s->lower_vram=0;
+        if(mode=="legacy-queue-lower-vram" || mode=="legacy-queue-direct-output") s->nvidia_new_route=false;
+        if(mode=="fidelityfx-lower-vram") { s->optical_flow_backend=xrfg::D3D12OpticalFlowBackend::fidelity_fx; s->nvidia_new_route=false; s->djules_route=false; }
 #ifdef OFXR_TEST_DJULES_ROUTE
         deep_readiness=argc>1 && std::string_view(argv[1])=="deep-readiness";
         deep_switch=argc>1 && std::string_view(argv[1])=="deep-switch";
         deep_readiness=deep_readiness || deep_switch;
         s->djules_deep_pipeline=deep_readiness;
         triple_switch=argc>1 && std::string_view(argv[1])=="triple-switch";
-        triple_core=triple_switch || (argc>1 && std::string_view(argv[1])=="triple-core");
-        triple_inline=argc>1 && std::string_view(argv[1])=="triple-inline";
+        triple_core=triple_switch || (argc>1 && std::string_view(argv[1]).starts_with("triple-core"));
+        triple_inline=argc>1 && std::string_view(argv[1]).starts_with("triple-inline");
         s->djules_triple_requested=triple_core||triple_inline;
-        if(triple_inline) { dispatch->virtual_desktop_runtime=true; dispatch->inline_unless_pipelined=true; }
+        if(triple_inline) { dispatch->virtual_desktop_runtime=false; dispatch->inline_unless_pipelined=true; }
 #endif
         fsr_test=argc>1 && std::string_view(argv[1]).starts_with("fsr-");
         legacy_queue=argc>1 && std::string_view(argv[1]).starts_with("legacy-queue");
@@ -390,19 +404,26 @@ int main(int argc,char** argv) {
             const auto history=left->d3d12_history;
             const auto capture=left->last_released_capture;
             require(capture.has_value(),"owned capture before route change");
-            for(const int route:{1,3,2,1,3,2}) {
+            for(const int lower:{-1,0,1}) for(const int route:{1,3,2,1,3,2}) {
                 auto desired=*restore_route.previous;
-                desired.enabled=true;desired.backend=route;desired.frame_generation=0;
+                desired.enabled=true;desired.backend=route;desired.frame_generation=0;desired.lower_vram=lower;
                 require(xrfg::embedded::request(desired),"GPU route request");
                 apply_embedded_control(s);
                 require(!s->control_reconfigure_required && s->menu_enabled,"GPU route reconfiguration");
                 require(left->d3d12_history==history && left->last_released_capture.has_value(),"route replaced source ownership");
                 for(const auto& chain:{left,right}) {
                     const auto generation=chain->frame_generation;
-                    require(generation && generation->staged_outputs==(route>=2),"stale private output shape");
+                    require(generation && generation->staged_outputs==(lower<0 ? route>=2 : lower!=0),"stale private output shape");
+                    require(generation->direct_extra_outputs==(!generation->staged_outputs && route==3),"stale direct 3X capacity");
+                    require(generation->staging_stride==(generation->staged_outputs && route==3 ? 2U : 1U),"stale staged 3X capacity");
                     for(const auto& image:generation->synthetic)synthetic_handles.insert(image.handle);
                 }
             }
+        }
+        for(const auto& chain:{left,right}) {
+            if(lower_vram_test || direct_output_test)
+                require(chain->frame_generation && chain->frame_generation->staged_outputs==lower_vram_test,
+                    "explicit output storage was ignored");
         }
         ComPtr<ID3D12Resource> depth, motion;
         if(fsr_test && !fsr_missing) {
@@ -422,9 +443,11 @@ int main(int argc,char** argv) {
         s->last_inline_frame_state.predictedDisplayTime=runtime_time;s->last_inline_frame_state.shouldRender=XR_TRUE;s->last_inline_frame_state_valid=true;
         if(fsr_test) require(!three_slot_generation_session(s),
             "FSR was admitted to the three-slot director");
-        if(!promotion_test && !fsr_test && !legacy_queue && !triple_inline) {
+        if(!promotion_test && !fsr_test && !legacy_queue && !triple_inline && s->optical_flow_backend==xrfg::D3D12OpticalFlowBackend::nvidia) {
             require(start_continuous_presenter(s,nullptr,false),"promotion");
-            require(s->three_slot_director && s->synthesis_thread.joinable(),"native did not enter three lanes");
+            if(s->optical_flow_backend==xrfg::D3D12OpticalFlowBackend::nvidia)
+                require(s->three_slot_director && s->synthesis_thread.joinable(),"native did not enter three lanes");
+            else require(!s->three_slot_director && !s->synthesis_thread.joinable(),"FidelityFX entered NVIDIA director");
         }
         const unsigned real_count=fsr_stereo_guard?13:8;
         std::optional<XrFrameState> guard_next;
@@ -477,8 +500,8 @@ int main(int argc,char** argv) {
             // Inline submissions borrow the application's released auxiliary
             // image until synchronous End; only asynchronous consumers require
             // an independently retained release capture.
-            fill(dynamic->enumerated_d3d12_images[0].Get(),n,60);release(dynamic,!triple_inline && (!legacy_queue || n>1));
-            if(n==1){fill(fixed->enumerated_d3d12_images[0].Get(),55,120);release(fixed,!triple_inline && !legacy_queue);}
+            fill(dynamic->enumerated_d3d12_images[0].Get(),n,60);release(dynamic,s->optical_flow_backend==xrfg::D3D12OpticalFlowBackend::nvidia && !triple_inline && (!legacy_queue || n>1));
+            if(n==1){fill(fixed->enumerated_d3d12_images[0].Get(),55,120);release(fixed,s->optical_flow_backend==xrfg::D3D12OpticalFlowBackend::nvidia && !triple_inline && !legacy_queue);}
             XrFrameState prediction{XR_TYPE_FRAME_STATE};
             if(guard_next) {prediction=*guard_next;guard_next.reset();}
             else require(XR_SUCCEEDED(layer_wait_frame_impl(s->handle,nullptr,&prediction)),"producer wait");
@@ -549,7 +572,7 @@ int main(int argc,char** argv) {
                     "guard admitted mono projection");
                 left->last_released_motion_vectors=original;
             }
-            const unsigned independence_frame=(fsr_test || legacy_queue || triple_inline) ? 0 : promotion_test ? 5 : 2;
+            const unsigned independence_frame=(fsr_test || legacy_queue || triple_inline || s->optical_flow_backend!=xrfg::D3D12OpticalFlowBackend::nvidia) ? 0 : promotion_test ? 5 : 2;
             if(deep_switch && n==4) {
                 hr(s->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&policy_gate)),"policy GPU gate");
                 hr(s->d3d12_synthesis_queue->Wait(policy_gate.Get(),1),"hold policy GPU work");

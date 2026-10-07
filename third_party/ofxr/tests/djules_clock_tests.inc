@@ -2,18 +2,23 @@
 void djules_phase_acquisition_test() {
     using namespace std::chrono;
     const auto period = nanoseconds(11'111'111);
-    check(calculate_djules_phase_step(nanoseconds(13'000'000), period) == nanoseconds(2'500'000),
-        "extra compositor interval was folded away or corrected in the wrong direction");
-    check(calculate_djules_phase_step(nanoseconds(2'000'000), period) == nanoseconds(-250'000),
+    DjulesPhaseAcquisition acquisition;
+    check(acquisition.step(nanoseconds(13'000'000), period) == nanoseconds(10'000'000),
+        "whole scanout disturbance walked off over repeated real frames");
+    check(acquisition.step(nanoseconds(13'000'000), period) == nanoseconds(2'500'000),
+        "cooldown repeated a whole-scanout jump");
+    check(acquisition.step(nanoseconds(2'000'000), period) == nanoseconds(-250'000),
         "late submission was shifted later");
-    check(calculate_djules_phase_step(nanoseconds(3'250'000), period) == nanoseconds::zero() &&
-        calculate_djules_phase_step(nanoseconds(2'750'000), period) == nanoseconds::zero(),
+    check(acquisition.cooldown == 0 && acquisition.step(nanoseconds(13'000'000), period) == nanoseconds(10'000'000),
+        "settled reading did not end jump cooldown");
+    check(acquisition.step(nanoseconds(3'250'000), period) == nanoseconds::zero() &&
+        acquisition.step(nanoseconds(2'750'000), period) == nanoseconds::zero(),
         "phase dead band caused continual jitter");
-    check(calculate_djules_phase_step(nanoseconds(100'000'000), period) == period / 2 &&
-        calculate_djules_phase_step(nanoseconds(-100'000'000), period) == -period / 2,
-        "absurd phase sample escaped half-period bound");
-    check(calculate_djules_phase_step(std::nullopt, period) == nanoseconds::zero() &&
-        calculate_djules_phase_step(nanoseconds(13'000'000), nanoseconds::zero()) == nanoseconds::zero(),
+    check(acquisition.step(nanoseconds(100'000'000), period) == period * 2 &&
+        acquisition.step(nanoseconds(-100'000'000), period) == -period / 2,
+        "absurd phase sample escaped bounded correction");
+    check(acquisition.step(std::nullopt, period) == nanoseconds::zero() &&
+        acquisition.step(nanoseconds(13'000'000), nanoseconds::zero()) == nanoseconds::zero(),
         "unavailable/invalid clock moved phase");
     DjulesAbsoluteSchedule grid;
     const auto origin = steady_clock::time_point(milliseconds(1000));
@@ -104,6 +109,12 @@ void djules_inline_policy_test() {
     check(!djules_inline_runtime(*s) && queued_nvidia_session(s),
         "genuinely pipelined VD/Pimax could not acquire frame-call owner");
     s->pipelined_presenter_mode = false;
+    s->dispatch->virtual_desktop_runtime = true;
+    s->application_wait_thread_id = 10; s->application_end_thread_id = 10;
+    check(!djules_inline_runtime(*s) && three_slot_generation_session(s), "VD single-thread loop stayed inline");
+    s->split_frame_loop = true;
+    check(djules_inline_runtime(*s), "VD split loop acquired unsolicited presenter");
+    s->split_frame_loop = false; s->dispatch->virtual_desktop_runtime = false;
     s->nvidia_new_route = false;
     check(!djules_inline_runtime(*s), "reference inherited optional inline runtime policy");
     s->nvidia_new_route = true; s->djules_route=kTestDjules; s->luke_afw_enabled = true;

@@ -6970,6 +6970,22 @@ static void RenderOfxrVrFramegenMenu()
         }
     }
 
+    if (engine != 0)
+    {
+        auto storageSettings = xrfg::embedded::snapshot().desired;
+        bool lowerVram = storageSettings.lower_vram < 0 ? (engine == 3 || engine == 4) : storageSettings.lower_vram != 0;
+        if (ImGui::Checkbox("Lower VRAM (may cause stuttering)", &lowerVram))
+        {
+            storageSettings.lower_vram = lowerVram ? 1 : 0;
+            if (!xrfg::embedded::request(storageSettings))
+                ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F), "Could not save memory preference");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Uses one runtime swapchain per output, with private staging.\n"
+                              "Applies to all engines on native D3D12; excludes Luke AFW and D3D11/Vulkan interop.\n"
+                              "Applies at the next frame boundary after pending frames complete.");
+    }
+
     if (engine == 3)
     {
         auto pipeline = xrfg::embedded::djules_pipeline_snapshot();

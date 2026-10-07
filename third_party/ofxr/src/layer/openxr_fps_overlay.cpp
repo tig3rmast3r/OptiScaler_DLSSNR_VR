@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -49,6 +50,7 @@ struct OpenXrFpsOverlay::Impl {
     FpsCounter counter;
     SteamVrDelivery* delivery{}; // Session-owned; overlay retires first.
     bool afw_active{};
+    std::atomic<std::int64_t> display_period_ns{};
     FpsOverlayPosition position{FpsOverlayPosition::upper_right};
     std::int64_t next_refresh{};
     bool attempted{}, initialized{}, image_valid{}, acquired{}, waited{}, disabled{};
@@ -324,6 +326,11 @@ struct OpenXrFpsOverlay::Impl {
                 snapshot.delivered_valid = true;
             }
         }
+        if (const auto period = display_period_ns.load(std::memory_order_relaxed); period > 0) {
+            const auto hz = 1.0e9f / static_cast<float>(period);
+            snapshot.submitted_fps = displayed_rate(snapshot.submitted_fps, hz);
+            if (snapshot.delivered_valid) snapshot.delivered_fps = displayed_rate(snapshot.delivered_fps, hz);
+        }
         upload(snapshot);
     }
 };
@@ -351,6 +358,10 @@ void OpenXrFpsOverlay::set_delivery_source(SteamVrDelivery* delivery) noexcept {
     std::scoped_lock lock(impl_->mutex);
     impl_->delivery = delivery;
 }
+void OpenXrFpsOverlay::set_display_period(std::int64_t period_ns) noexcept {
+    impl_->display_period_ns.store(period_ns > 0 ? period_ns : 0, std::memory_order_relaxed);
+}
+
 void OpenXrFpsOverlay::reset_metrics() noexcept {
     std::scoped_lock lock(impl_->mutex);
     impl_->counter.reset();

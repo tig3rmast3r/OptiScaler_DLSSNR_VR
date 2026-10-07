@@ -57,6 +57,12 @@ FpsSnapshot FpsCounter::snapshot(std::int64_t now) const noexcept {
     return result;
 }
 
+float displayed_rate(float rate, float refresh_hz) noexcept {
+    if (!(refresh_hz > 0.0f) || !std::isfinite(rate)) return rate;
+    const float band = refresh_hz * 0.02f;
+    return rate >= refresh_hz - band && rate <= refresh_hz + band ? refresh_hz : rate;
+}
+
 OverlayPlacement overlay_placement(
     FpsOverlayPosition position, float left, float right, float down, float up) noexcept {
     left = std::clamp(left, -1.0f, -0.1f);

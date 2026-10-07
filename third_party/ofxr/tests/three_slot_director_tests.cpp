@@ -286,6 +286,28 @@ void pipelined_route_handoff_test(bool steamvr = false) {
     std::cout << "Twelve live route changes preserve outstanding virtual tickets and balanced physical cycles\n";
 }
 
+void own_time_pairing_recovery_test() {
+    auto live = session();
+    live->pending_frames={{100,10,1},{110,10,2}};
+    check(!latest_pending_application_frame(live,999,false,false), "ambiguous custom time was paired");
+    consume_application_frame(live,999,false,false);
+    check(live->pending_frames.empty(), "unmatchable wait survived its End");
+    live->pending_frames.push_back({120,10,3});
+    const auto recovered=latest_pending_application_frame(live,1001,false,false);
+    check(recovered && recovered->serial==3, "custom-time game did not recover on next wait");
+    consume_application_frame(live,1001,false,false);
+    check(live->pending_frames.empty(), "sole custom-time admission did not retire");
+    live->pending_frames={{130,10,4},{140,10,5}};
+    live->application_wait_pending_begin=true;
+    consume_application_frame(live,1002,false,false);
+    check(live->pending_frames.size()==1 && live->pending_frames.front().serial==5,
+        "recovery erased already returned next virtual ticket");
+    live->application_wait_pending_begin=false;
+    consume_application_frame(live,140,false,false);
+    check(live->pending_frames.empty(), "following ticket was not consumable");
+    std::cout << "Custom-time orphan recovery preserves next outstanding virtual Wait\n";
+}
+
 void unified_route_policy_test() {
     const auto ini = current_layer_directory() / L"ofxr_bridge.ini";
     wchar_t old_deep[64]{}, old_triple[64]{};
@@ -1846,6 +1868,7 @@ int main(int argc, char** argv) {
             if (mode == "route-handoff") { pipelined_route_handoff_test(); return 0; }
             if (mode == "route-handoff-steamvr") { pipelined_route_handoff_test(true); return 0; }
             if (mode == "pipeline-preference") { djules_pipeline_preference_test(); return 0; }
+            if (mode == "pairing-recovery") { own_time_pairing_recovery_test(); return 0; }
             if (mode == "unified-routes") { unified_route_policy_test(); return 0; }
             if (mode == "vulkan-contract") { vulkan_bridge_contract_test(); return 0; }
 #ifdef OFXR_TEST_DJULES_ROUTE

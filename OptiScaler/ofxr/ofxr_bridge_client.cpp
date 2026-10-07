@@ -420,7 +420,7 @@ bool embedded_layer_active() noexcept {
 bool request(const OFXR_ControlSettingsV2& settings) noexcept {
     const auto api = current_dispatch();
     if (!complete(api)) {
-        xrfg::embedded::Settings embedded{};
+        auto embedded = xrfg::embedded::snapshot().desired;
         embedded.enabled = settings.enabled != 0;
         embedded.backend = settings.backend;
         embedded.preset = settings.preset;

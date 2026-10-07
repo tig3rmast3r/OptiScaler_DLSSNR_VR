@@ -12,6 +12,7 @@ struct Settings {
     int preset{1}; // 0 slow, 1 medium, 2 fast
     int scale{2}; // 0 full, 1 three-quarter, 2 half
     bool backward{};
+    int lower_vram{-1}; // -1 preserves route defaults; 0/1 explicitly select native D3D12 output storage
     int motion_vectors{}; // 0 optical flow, 1 DLSS ingress
     int frame_generation{}; // 0 OFXR synthesis, 1 FSR 3 frame generation
     bool operator==(const Settings&) const = default;

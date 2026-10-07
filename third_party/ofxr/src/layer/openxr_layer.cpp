@@ -770,6 +770,8 @@ struct SessionState {
     bool nvidia_new_route{};
     bool djules_route{};
     std::atomic_bool djules_deep_pipeline{};
+    int lower_vram{-1};
+    unsigned djules_phase_cooldown{}; // Presenter thread only; reset on policy epoch.
     std::atomic_bool djules_triple_requested{};
     std::atomic_uint64_t djules_configuration_epoch{};
     xrfg::DjulesTripleRelease djules_triple_release;
@@ -1162,19 +1164,26 @@ void drain_binding_queue(SessionState* state) noexcept {
 }
 
 
-// Final upstream phase acquisition: absolute remaining-time error, one
-// quarter per real frame, 250us dead band, half-period maximum correction.
-// Folding into one period would hide the compositor's extra-interval failure.
-[[nodiscard]] std::chrono::nanoseconds calculate_djules_phase_step(
-    std::optional<std::chrono::nanoseconds> left,
-    std::chrono::nanoseconds period) noexcept {
-    if (!left || period <= std::chrono::nanoseconds::zero()) return {};
-    constexpr auto target = std::chrono::nanoseconds(3'000'000);
-    constexpr auto dead_band = std::chrono::nanoseconds(250'000);
-    const auto error = *left - target;
-    if (error >= -dead_band && error <= dead_band) return {};
-    return std::clamp(error / 4, -period / 2, period / 2);
-}
+// Djules V430/V431: correct a whole-scanout disturbance once, then use the
+// bounded quarter-step until the measured phase returns to the target band.
+struct DjulesPhaseAcquisition {
+    unsigned cooldown{};
+    std::chrono::nanoseconds step(std::optional<std::chrono::nanoseconds> left,
+        std::chrono::nanoseconds period) noexcept {
+        if (!left || period <= std::chrono::nanoseconds::zero()) return {};
+        const auto error = *left - std::chrono::nanoseconds(3'000'000);
+        const bool far_reading = error > period / 2;
+        if (!far_reading) cooldown = 0;
+        if (far_reading && cooldown == 0) {
+            cooldown = 8;
+            return (std::min)(error, period * 2);
+        }
+        if (cooldown) --cooldown;
+        constexpr auto dead_band = std::chrono::nanoseconds(250'000);
+        if (error >= -dead_band && error <= dead_band) return {};
+        return std::clamp(error / 4, -period / 2, period / 2);
+    }
+};
 
 // Non-SteamVR/non-VD runtimes pace through xrWaitFrame. Impose only a
 // half-period floor after the actual previous EndFrame return, not a second
@@ -1226,6 +1235,11 @@ private:
         state.graphics_binding == SessionGraphicsBinding::d3d12;
 }
 
+[[nodiscard]] bool staged_native_outputs(const SessionState& state) noexcept {
+    return state.graphics_binding == SessionGraphicsBinding::d3d12 && !state.luke_afw_enabled &&
+        (state.lower_vram < 0 ? advanced_native_outputs(state) : state.lower_vram != 0);
+}
+
 [[nodiscard]] bool djules_native_scheduler(const SessionState& state) noexcept {
     return state.djules_route && state.nvidia_new_route && !state.luke_afw_enabled &&
         state.frame_generation_mode == xrfg::D3D12FrameGenerationMode::ofxr &&
@@ -1270,7 +1284,9 @@ void refresh_djules_display_period(const std::shared_ptr<SessionState>& state) n
         !state->dispatch->steamvr_runtime || !state->steamvr_delivery) return {};
     const auto left = state->steamvr_delivery->frame_time_remaining();
     const auto period = std::chrono::nanoseconds(state->presenter_display_period);
-    const auto step = calculate_djules_phase_step(left, period);
+    DjulesPhaseAcquisition acquisition{state->djules_phase_cooldown};
+    const auto step = acquisition.step(left, period);
+    state->djules_phase_cooldown = acquisition.cooldown;
     if (left) xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::presenter_clock_anchor,
         27, sequence, static_cast<std::uint64_t>(left->count() - 3'000'000),
         static_cast<std::uint64_t>(step.count()));
@@ -1281,6 +1297,10 @@ void refresh_djules_display_period(const std::shared_ptr<SessionState>& state) n
 // Poll on the application frame thread, at most four times a second, and only
 // while diagnostics are enabled. Session establishment remains the D33 gate.
 void log_compositor_delivery(SessionState& state) noexcept {
+    if (state.fps_overlay) {
+        std::scoped_lock lock(state.presenter_mutex);
+        state.fps_overlay->set_display_period(state.presenter_active ? state.presenter_display_period : state.minimum_runtime_display_period);
+    }
     if (!xrfg::bridge_flight_logger().enabled() || !state.steamvr_delivery) return;
     try {
         const auto now = std::chrono::steady_clock::now();
@@ -1384,6 +1404,7 @@ struct DjulesOutputStaging {
 
 struct FrameGenerationSwapchainState {
     bool staged_outputs{};
+    std::uint32_t staging_stride{1};
     std::array<std::shared_ptr<DjulesOutputStaging>,2> current_staging;
     std::array<std::shared_ptr<DjulesOutputStaging>,4> synthetic_staging;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> current_runtime_images, synthetic_runtime_images;
@@ -1397,7 +1418,8 @@ struct FrameGenerationSwapchainState {
     // slot s image i is s * current_images_per_slot + i.
     std::uint32_t current_images_per_slot{};
     std::size_t current_slot{};
-    std::array<PrivateSwapchainState, kSyntheticSlotCount> synthetic{};
+    std::array<PrivateSwapchainState, 4> synthetic{};
+    bool direct_extra_outputs{};
     std::uint32_t synthetic_images_per_slot{};
     std::size_t synthetic_slot{};
     std::shared_ptr<xrfg::D3D12FrameSynthesizer> synthesizer;
@@ -1944,7 +1966,10 @@ XrResult wait_presenter_runtime_frame(const std::shared_ptr<SessionState>& state
 [[nodiscard]] bool djules_inline_runtime(const SessionState& state) noexcept {
     return state.djules_route && state.nvidia_new_route && !state.luke_afw_enabled &&
         state.frame_generation_mode == xrfg::D3D12FrameGenerationMode::ofxr &&
-        state.dispatch->inline_unless_pipelined && !state.pipelined_presenter_mode;
+        state.dispatch->inline_unless_pipelined && !state.pipelined_presenter_mode &&
+        !(state.dispatch->virtual_desktop_runtime && !state.split_frame_loop &&
+          state.application_wait_thread_id && state.application_end_thread_id &&
+          state.application_wait_thread_id == state.application_end_thread_id);
 }
 
 // frame_call_mutex protects the application thread shape. Observe the first
@@ -2178,12 +2203,12 @@ void destroy_frame_generation_swapchains(
             return;
         }
         std::array<PrivateSwapchainState*,
-                   kCurrentSlotCount + 1 + kSyntheticSlotCount> owned{};
-        for (std::size_t slot = 0; slot < kSyntheticSlotCount; ++slot) {
+                   kCurrentSlotCount + 1 + 4> owned{};
+        for (std::size_t slot = 0; slot < generation->synthetic.size(); ++slot) {
             owned[slot] = &generation->synthetic[slot];
         }
         for (std::size_t slot = 0; slot < generation->current.size(); ++slot) {
-            owned[kSyntheticSlotCount + slot] = &generation->current[slot];
+            owned[generation->synthetic.size() + slot] = &generation->current[slot];
         }
         for (PrivateSwapchainState* image : owned) {
             if (image->handle == XR_NULL_HANDLE) {
@@ -2305,7 +2330,7 @@ struct CreatedPrivateSwapchain {
 }
 
 struct CreatedCurrentRing {
-    std::array<CreatedPrivateSwapchain, kCurrentSlotCount + 1> slots{};
+    std::array<CreatedPrivateSwapchain, 4> slots{};
     // Every slot's destination images end to end, in slot order, which is the
     // flat addressing both the synthesizer and the D3D11 interop expect.
     std::vector<ID3D12Resource*> d3d12_resources;
@@ -2385,7 +2410,7 @@ void adopt_synthetic_ring(
     const std::shared_ptr<FrameGenerationSwapchainState>& generation,
     CreatedCurrentRing& ring) noexcept {
     static_assert(kSyntheticSlotCount == kCurrentSlotCount);
-    for (std::size_t slot = 0; slot < kSyntheticSlotCount; ++slot) {
+    for (std::size_t slot = 0; slot < generation->synthetic.size(); ++slot) {
         generation->synthetic[slot] = ring.slots[slot].state;
         ring.slots[slot].state.handle = XR_NULL_HANDLE;
     }
@@ -2438,8 +2463,10 @@ create_d3d12_frame_generation_swapchains(
         }
 
         auto generation = std::make_shared<FrameGenerationSwapchainState>();
-        generation->staged_outputs = advanced_native_outputs(*state->session);
+        generation->staged_outputs = staged_native_outputs(*state->session);
         const auto output_slots = generation->staged_outputs ? 1U : kCurrentSlotCount;
+        generation->direct_extra_outputs = !generation->staged_outputs && djules_native_scheduler(*state->session);
+        generation->staging_stride = generation->staged_outputs && djules_native_scheduler(*state->session) ? 2U : 1U;
         XrSwapchainCreateInfo private_info = state->create_info;
         private_info.next = nullptr;
         private_info.usageFlags |=
@@ -2459,7 +2486,8 @@ create_d3d12_frame_generation_swapchains(
             return nullptr;
         }
         log_video_memory(*state->session, VideoMemoryStage::current_ring, handle_value(state->handle));
-        if (!create_current_ring(state, private_info, &synthetic, &refusal, output_slots)) {
+        if (!create_current_ring(state, private_info, &synthetic, &refusal,
+                generation->direct_extra_outputs ? 4U : output_slots)) {
             if (failure_reason != nullptr) {
                 *failure_reason =
                     SwapchainEligibilityReason::synthetic_private_swapchain_failed;
@@ -2491,7 +2519,8 @@ create_d3d12_frame_generation_swapchains(
                 if(SUCCEEDED(created)) destinations.push_back(stage->resource.Get());
             };
             for(auto& stage:generation->current_staging) make_stage(stage,current.d3d12_resources);
-            for(auto& stage:generation->synthetic_staging) make_stage(stage,synthetic.d3d12_resources);
+            for(std::size_t i=0; i<kSyntheticSlotCount*generation->staging_stride; ++i)
+                make_stage(generation->synthetic_staging[i],synthetic.d3d12_resources);
             if(FAILED(created)) {
                 if(failure_detail) *failure_detail=static_cast<std::uint64_t>(created);
                 destroy_current_ring(dispatch,&synthetic); destroy_current_ring(dispatch,&current);
@@ -2573,7 +2602,7 @@ create_d3d12_frame_generation_swapchains(
         adopt_synthetic_ring(generation, synthetic);
         if(generation->staged_outputs) {
             generation->current_images_per_slot=1;
-            generation->synthetic_images_per_slot=2;
+            generation->synthetic_images_per_slot=generation->staging_stride;
         }
         generation->synthesizer = std::move(synthesizer);
         if (failure_reason != nullptr) {
@@ -4235,6 +4264,7 @@ XrResult layer_create_session_impl(
         experimental_ini.c_str()) != 0;
     if (state->luke_afw_enabled) state->dlss_motion_vectors = true;
     state->control_revision = initial_control.revision;
+    state->lower_vram = initial_control.desired.lower_vram;
     xrfg::embedded::applied(state->control_id, state->control_revision, state->menu_enabled, 0);
     XrStructureType binding_structure_type = XR_TYPE_UNKNOWN;
     if (create_info != nullptr) {
@@ -7864,6 +7894,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             if(epoch!=configuration_epoch) {
                 djules_last_owned.reset(); djules_schedule={}; djules_last_returned={};
                 fsr_schedule={}; director_schedule={}; midpoint_schedule={};
+                state->djules_phase_cooldown=0;
                 configuration_epoch=epoch;
             }
             bool repeat_held=false;
@@ -8190,9 +8221,9 @@ void delay_djules_application_release(const std::shared_ptr<SessionState>& state
 // already been handed over, so a presenter that stops or fails while this waits
 // must not turn a submitted frame into an error - it just stops waiting.
 void wait_for_presenter_pair(
-    const std::shared_ptr<SessionState>& state) noexcept {
+    const std::shared_ptr<SessionState>& state, std::uint64_t frames = 2) noexcept {
     try {
-        const std::uint64_t kPresenterFramesPerPair = djules_triple_active(*state)?3:2;
+        const std::uint64_t kPresenterFramesPerPair = frames;
         const auto entered = std::chrono::steady_clock::now();
         std::unique_lock lock(state->presenter_mutex);
         state->presenter_condition.wait(lock, [&] {
@@ -9095,6 +9126,7 @@ struct PreparedGeneration {
     GenerationPrepareReason reason{GenerationPrepareReason::exception};
     XrSwapchain current_handle{XR_NULL_HANDLE};
     XrSwapchain synthetic_handle{XR_NULL_HANDLE};
+    XrSwapchain extra_handle{XR_NULL_HANDLE};
     // The synthesizer holding this pair's deferred current copy, so the
     // presenter can submit it once the synthetic frame has gone.
     std::shared_ptr<xrfg::D3D12FrameSynthesizer> synthesizer;
@@ -9135,9 +9167,9 @@ void attach_djules_outputs(PreparedProjectionFrame& prepared,
         auto generation=output.staging_generation;
         real.pending_outputs.push_back({generation,generation->current_staging[output.current_slot],
             output.synthesizer,output.staging_ticket,false});
-        if(synthetic) synthetic->pending_outputs.push_back({generation,generation->synthetic_staging[output.synthetic_slot*2],
+        if(synthetic) synthetic->pending_outputs.push_back({generation,generation->synthetic_staging[output.synthetic_slot*generation->staging_stride],
             output.synthesizer,output.staging_ticket,true});
-        if(extra) extra->pending_outputs.push_back({generation,generation->synthetic_staging[output.synthetic_slot*2+1],
+        if(extra) extra->pending_outputs.push_back({generation,generation->synthetic_staging[output.synthetic_slot*generation->staging_stride+1],
             output.synthesizer,output.staging_ticket,true});
     }
 }
@@ -9329,14 +9361,15 @@ struct AfwSourceCapture {
             }
         }
 
-        const bool request_extra=request_pair && generation->staged_outputs &&
-            djules_triple_active(*state->session);
+        const bool request_extra=request_pair && djules_triple_active(*state->session) &&
+            (generation->staged_outputs || generation->direct_extra_outputs);
+        auto& extra_image = generation->synthetic[generation->staged_outputs ? 0 : synthetic_slot + 2];
         if (generation->staged_outputs) {
             std::unique_lock lock(state->session->presenter_mutex);
             state->session->presenter_condition.wait(lock,[&] {
                 return (generation->current_staging[current_slot].use_count()==1 &&
-                    (!request_pair || generation->synthetic_staging[synthetic_slot*2].use_count()==1) &&
-                    (!request_extra || generation->synthetic_staging[synthetic_slot*2+1].use_count()==1)) ||
+                    (!request_pair || generation->synthetic_staging[synthetic_slot*generation->staging_stride].use_count()==1) &&
+                    (!request_extra || generation->synthetic_staging[synthetic_slot*generation->staging_stride+1].use_count()==1)) ||
                     state->session->presenter_stop_requested || XR_FAILED(state->session->presenter_failure);
             });
             if(state->session->presenter_stop_requested || XR_FAILED(state->session->presenter_failure)) {
@@ -9346,8 +9379,8 @@ struct AfwSourceCapture {
             auto* queue=state->session->d3d12_synthesis_queue ? state->session->d3d12_synthesis_queue.Get()
                 : state->session->d3d12_queue.Get();
             for(const auto& stage:{generation->current_staging[current_slot],
-                    request_pair ? generation->synthetic_staging[synthetic_slot*2] : nullptr,
-                    request_extra ? generation->synthetic_staging[synthetic_slot*2+1] : nullptr}) {
+                    request_pair ? generation->synthetic_staging[synthetic_slot*generation->staging_stride] : nullptr,
+                    request_extra ? generation->synthetic_staging[synthetic_slot*generation->staging_stride+1] : nullptr}) {
                 if(stage && FAILED(queue->Wait(generation->handover_fence.Get(),
                         stage->last_handover_copy.load(std::memory_order_acquire)))) {
                     output.reason=GenerationPrepareReason::synthesis_failed; return output;
@@ -9386,6 +9419,15 @@ struct AfwSourceCapture {
         // write on the queue the application supplied, which is not the one
         // about to write them, so carry that guarantee across before any
         // synthesis is queued.
+        if (request_extra && !generation->staged_outputs && !acquire_and_wait_private_image(
+                state->session.get(), state->session->dispatch, extra_image)) {
+            static_cast<void>(release_private_image(state->session.get(), state->session->dispatch, synthetic_image));
+            static_cast<void>(release_private_image(state->session.get(), state->session->dispatch, current_image));
+            { std::scoped_lock gpu_lock(state->session->gpu_mutex); static_cast<void>(synthesizer->retire_previous()); }
+            output.reason = GenerationPrepareReason::synthetic_private_acquire_failed;
+            return output;
+        }
+
         if (!generation->staged_outputs && state->session->d3d12_synthesis_queue) {
             std::scoped_lock gpu_lock(state->session->gpu_mutex);
             static_cast<void>(
@@ -9463,7 +9505,9 @@ struct AfwSourceCapture {
                                           defer_current_copy,
                                           interpolation_fraction, presentation_transform,
                                           request_extra ? std::optional<xrfg::D3D12ExtraSynthetic>{
-                                              xrfg::D3D12ExtraSynthetic{synthetic_destination_index+1,extra_fraction}} : std::nullopt)
+                                              xrfg::D3D12ExtraSynthetic{generation->staged_outputs ? synthetic_destination_index+1 :
+                                                  static_cast<std::uint32_t>(synthetic_slot+2) * generation->synthetic_images_per_slot + extra_image.acquired_index,
+                                                  extra_fraction}} : std::nullopt)
                                     : synthesizer->submit_prime(
                                           *capture,
                                           current_source_views,
@@ -9564,6 +9608,7 @@ struct AfwSourceCapture {
             output.synthetic_slot = synthetic_slot;
             output.current_handle = current_image.handle;
             output.synthetic_handle = synthetic_image.handle;
+            output.extra_handle = request_extra ? extra_image.handle : XR_NULL_HANDLE;
             output.synthesizer = synthesizer;
             output.anchor_is_current = true;
             output.kind = request_pair ? PreparedGenerationKind::pair
@@ -9581,6 +9626,8 @@ struct AfwSourceCapture {
                 state->session->dispatch,
                 synthetic_image);
         }
+        if (request_extra && !generation->staged_outputs)
+            synthetic_released = release_private_image(state->session.get(), state->session->dispatch, extra_image) && synthetic_released;
         const bool current_released = generation->staged_outputs || (defer_d3d11_publication && SUCCEEDED(submit_result))
             ? true
             : release_private_image(state->session.get(),
@@ -9608,6 +9655,7 @@ struct AfwSourceCapture {
         output.anchor_is_current = true;
         output.current_handle = current_image.handle;
         output.synthetic_handle = synthetic_image.handle;
+        output.extra_handle = request_extra ? extra_image.handle : XR_NULL_HANDLE;
         output.publication_deferred = defer_d3d11_publication;
         output.current_destination_index = current_destination_index;
         if (current_released && synthetic_released) {
@@ -9807,6 +9855,9 @@ struct AfwSourceCapture {
         if (g.kind == PreparedGenerationKind::pair)
             success = release_private_image(state.get(), state->dispatch,
                 g.worker_generation->synthetic[g.synthetic_slot]) && success;
+        if (g.extra_handle != XR_NULL_HANDLE)
+            success = release_private_image(state.get(), state->dispatch,
+                g.worker_generation->synthetic[g.synthetic_slot+2]) && success;
         success = release_private_image(state.get(), state->dispatch,
             g.worker_generation->current[g.current_slot]) && success;
     }
@@ -9862,7 +9913,7 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
                 xrfg::BridgeFlightOperation::timing_worker_build,
                 job->current->source_sequence, job->current->previous_sequence);
             if (success) {
-                std::vector<ProjectionResourceDestination> real_destinations, synthetic_destinations;
+                std::vector<ProjectionResourceDestination> real_destinations, synthetic_destinations, extra_destinations;
                 for (const auto& resource : prepared.resources) {
                     XrSwapchain source = resource.application_swapchain;
                     if (job->post_afw_frame) {
@@ -9876,6 +9927,7 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
                                                 resource.generation.current_handle});
                     synthetic_destinations.push_back({source,
                                                      resource.generation.synthetic_handle});
+                    extra_destinations.push_back({source, resource.generation.extra_handle});
                 }
                 GeneratedFrameEndInfo real_info, synthetic_info;
                 success = success && build_generated_frame_end_info(&job->metadata->info, job->snapshot,
@@ -9898,7 +9950,7 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
                     if(success && job->triple) {
                         GeneratedFrameEndInfo extra_info;
                         success=build_generated_frame_end_info(&job->metadata->info,job->snapshot,true,
-                            synthetic_destinations,&extra_info);
+                            extra_destinations,&extra_info);
                         extra_info.pending_outputs=std::move(pending_extra.pending_outputs);
                         extra_info.synthetic=true;
                         extra_info.composition_images=job->metadata->composition_images;
@@ -10819,6 +10871,7 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
         if (frame != state->pending_frames.end()) {
             return *frame;
         }
+        if (state->pending_frames.size() == 1) return state->pending_frames.front();
         // Native Stereo Fix may rewrite displayTime. A begun frame with no
         // overlapping wait identifies the newest pending record by call order.
         return match_latest_by_submission && !state->pending_frames.empty()
@@ -11258,6 +11311,12 @@ void consume_application_frame(
             return candidate.display_time == display_time;
         });
     if (frame == state->pending_frames.end()) {
+        // Unmatched own-time End cannot identify an orphan. Retain the known
+        // next virtual ticket when Begin is still outstanding; shed older waits.
+        if (state->application_wait_pending_begin && !state->pending_frames.empty()) {
+            const auto next = state->pending_frames.back();
+            state->pending_frames.clear(); state->pending_frames.push_back(next);
+        } else state->pending_frames.clear();
         return;
     }
     state->pending_frames.erase(state->pending_frames.begin(), std::next(frame));
@@ -11364,7 +11423,8 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
         options.input_scale != state->nvidia_options.input_scale ||
         options.bidirectional != state->nvidia_options.bidirectional ||
         generation_mode != state->frame_generation_mode ||
-        nvidia_new_route != state->nvidia_new_route || djules_route != state->djules_route;
+        nvidia_new_route != state->nvidia_new_route || djules_route != state->djules_route ||
+        state->lower_vram != control.desired.lower_vram;
     // Enumeration is excluded by frame_call_mutex, so newly created contexts
     // also see this tuple. A partial failure remains bypass, never mixed flow.
     state->optical_flow_backend = backend;
@@ -11372,6 +11432,7 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
     state->frame_generation_mode = generation_mode;
     state->nvidia_new_route = nvidia_new_route;
     state->djules_route = djules_route;
+    state->lower_vram = control.desired.lower_vram;
     state->dlss_motion_vectors = control.desired.motion_vectors == 1 ||
         generation_mode == xrfg::D3D12FrameGenerationMode::fsr3 ||
         state->luke_afw_enabled;
@@ -11379,7 +11440,9 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
         std::unique_lock lock(chain->mutex);
         const bool admitted_shape_change = changed && chain->frame_generation &&
             state->graphics_binding == SessionGraphicsBinding::d3d12 &&
-            chain->frame_generation->staged_outputs != advanced_native_outputs(*state);
+            (chain->frame_generation->staged_outputs != staged_native_outputs(*state) ||
+             chain->frame_generation->direct_extra_outputs != (!staged_native_outputs(*state) && djules_native_scheduler(*state)) ||
+             chain->frame_generation->staging_stride != (staged_native_outputs(*state) && djules_native_scheduler(*state) ? 2U : 1U));
         if (admitted_shape_change) {
             result = chain->frame_generation->synthesizer->wait_for_idle();
             if (FAILED(result)) break;
@@ -12047,7 +12110,7 @@ XrResult layer_end_frame_impl(
                 0,
                 0,
                 0);
-            if (XR_SUCCEEDED(end_result) && end_info != nullptr) {
+            if (end_info != nullptr) {
                 consume_application_frame(
                     state,
                     end_info->displayTime,
@@ -12642,8 +12705,11 @@ XrResult layer_end_frame_impl(
 
     bool extra_ready=pair_ready && djules_triple_active(*state);
     if(extra_ready) {
+        auto extra_destinations = synthetic_destinations;
+        for (std::size_t i=0; i<prepared.resources.size(); ++i)
+            extra_destinations[i].destination_swapchain = prepared.resources[i].generation.extra_handle;
         extra_ready=build_generated_frame_end_info(produced_end_info,produced_snapshot,true,
-            synthetic_destinations,&extra_generated);
+            extra_destinations,&extra_generated);
         if(!extra_ready) {
             enter_generation_quarantine(state,GenerationQuarantineReason::generated_end_info_failed);
             return bypass_generation(GenerationPrepareReason::generated_end_info_failed);
@@ -12864,6 +12930,8 @@ XrResult layer_end_frame_impl(
         pair_ready ? 1u : 0u,
         latest_application_frame ? 1u : 0u);
     if (XR_FAILED(result)) {
+        consume_application_frame(state, current_snapshot.display_time,
+            consume_in_submission_order, match_latest_by_submission);
         // A rejected display time says nothing about the generation
         // resources. No swapchain changed shape, no private image is in an
         // uncertain ownership phase - the runtime was handed a time it
@@ -12972,7 +13040,12 @@ XrResult layer_end_frame_impl(
         return XR_FAILED(start_result) ? start_result : result;
     }
 
-    if (!pair_ready) {
+    const bool hold_djules_prime = use_continuous_presenter && state->djules_route &&
+        state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
+        state->frame_generation_mode == xrfg::D3D12FrameGenerationMode::ofxr &&
+        !state->luke_afw_enabled && prepared.kind == PreparedGenerationKind::prime &&
+        !state->fsr_two_slot_presenter && !state->queued_nvidia_presenter;
+    if (!pair_ready && !hold_djules_prime) {
         if (promote_three_slot_after_inline) {
             const XrResult start_result = start_requested_pipelined_presenter(nullptr);
             return XR_FAILED(start_result) ? start_result : result;
@@ -13012,8 +13085,8 @@ XrResult layer_end_frame_impl(
         // The frame lock goes first: an application whose wait runs on another
         // thread must not be shut out of xrWaitFrame while this waits.
         frame_call_lock.unlock();
-        wait_for_presenter_pair(state);
-        delay_djules_application_release(state);
+        wait_for_presenter_pair(state, pair_ready ? (djules_triple_active(*state) ? 3U : 2U) : 1U);
+        if (pair_ready) delay_djules_application_release(state);
         return result;
     }
 

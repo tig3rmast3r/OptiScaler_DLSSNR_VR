@@ -27,6 +27,7 @@ public:
     void set_delivery_source(SteamVrDelivery* delivery) noexcept;
     [[nodiscard]] XrResult end_frame(const XrFrameEndInfo* info, bool synthetic, bool new_content = true);
     void reset_metrics() noexcept;
+    void set_display_period(std::int64_t period_ns) noexcept;
     // Terminal for this session. Keep resources alive until normal teardown;
     // stop adding the quad or uploading textures immediately.
     void suspend() noexcept;
