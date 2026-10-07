@@ -25,7 +25,7 @@ XrTime runtime_time = 1000000000;
 bool correct = true;
 bool alternating_eyes{};
 bool promotion_test{};
-bool fsr_test{}, fsr_missing{};
+bool fsr_test{}, fsr_missing{}, fsr_packed{};
 bool fsr_queue{}, fsr_queue_slow{};
 bool fsr_queue_switch{};
 bool fsr_stereo_guard{};
@@ -98,7 +98,7 @@ void fill(ID3D12Resource* r, unsigned red, unsigned green, bool stereo = false) 
     void* mapped=nullptr; hr(upload->Map(0,nullptr,&mapped),"upload map");
     for(unsigned slice=0;slice<desc.DepthOrArraySize;++slice) for(unsigned y=0;y<128;++y) {
         auto* row=reinterpret_cast<unsigned*>(static_cast<unsigned char*>(mapped)+layout[slice].Offset+y*layout[slice].Footprint.RowPitch);
-        for(unsigned x=0;x<256;++x) row[x]=0xff200000u|((stereo && slice ? 160 : green)<<8)|red;
+        for(unsigned x=0;x<256;++x) row[x]=0xff200000u|((stereo && (fsr_packed ? x>=128 : slice!=0) ? 160 : green)<<8)|red;
     }
     upload->Unmap(0,nullptr);
     commands([&](auto* list){
@@ -112,7 +112,8 @@ void fill(ID3D12Resource* r, unsigned red, unsigned green, bool stereo = false) 
     });
 }
 unsigned pixel(ID3D12Resource* r, unsigned slice,
-    D3D12_RESOURCE_STATES submitted_state = D3D12_RESOURCE_STATE_COMMON) {
+    D3D12_RESOURCE_STATES submitted_state = D3D12_RESOURCE_STATE_COMMON,
+    unsigned sample_x = 128) {
     auto desc=r->GetDesc(); D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout{}; UINT64 bytes=0;
     session_state->d3d12_device->GetCopyableFootprints(&desc,slice,1,0,&layout,nullptr,nullptr,&bytes);
     auto readback=resource(1,true,D3D12_HEAP_TYPE_READBACK,bytes,D3D12_RESOURCE_STATE_COPY_DEST);
@@ -128,7 +129,7 @@ unsigned pixel(ID3D12Resource* r, unsigned slice,
     });
 #endif
     void* mapped=nullptr; hr(readback->Map(0,nullptr,&mapped),"readback");
-    const unsigned value=*reinterpret_cast<unsigned*>(static_cast<unsigned char*>(mapped)+layout.Offset+64*layout.Footprint.RowPitch+128*4);
+    const unsigned value=*reinterpret_cast<unsigned*>(static_cast<unsigned char*>(mapped)+layout.Offset+64*layout.Footprint.RowPitch+sample_x*4);
     readback->Unmap(0,nullptr); return value;
 }
 XrResult XRAPI_CALL fake_create(XrSession,const XrSwapchainCreateInfo* info,XrSwapchain* h) {
@@ -230,7 +231,8 @@ XrResult XRAPI_CALL fake_end(XrSession,const XrFrameEndInfo* end) {
         const unsigned p=pixel(image.Get(),sub.imageArrayIndex,
             is_private_image(sub.swapchain)
                 ? D3D12_RESOURCE_STATE_COMMON
-                : D3D12_RESOURCE_STATE_RENDER_TARGET);
+                : D3D12_RESOURCE_STATE_RENDER_TARGET,
+            sub.imageRect.offset.x+sub.imageRect.extent.width/2);
         if(((p>>8)&255)!=(eye?160u:80u))
             std::cerr<<"eye mismatch frame="<<frame_id<<" synthetic="<<synthetic<<" eye="<<eye<<" pixel="<<std::hex<<p<<std::dec<<'\n';
         correct &= ((p>>8)&255)==(eye?160u:80u);
@@ -391,9 +393,10 @@ int main(int argc,char** argv) {
         {std::scoped_lock lock(g_state_mutex);g_sessions[s->handle]=s;}
         promotion_test=argc>1 && std::string_view(argv[1]).starts_with("promotion");
         const bool gap_test=argc>1 && std::string_view(argv[1]).starts_with("gap-");
+        fsr_packed=mode=="fsr-packed" || mode=="fsr-queue-packed";
         const bool array=fsr_test || (argc>1 && (std::string_view(argv[1])=="array" || std::string_view(argv[1])=="promotion-array" || std::string_view(argv[1])=="gap-array"));
         alternating_eyes=argc>1 && std::string_view(argv[1])=="repeat";
-        auto left=source(0x201,array?2:1,true);chains.push_back(left);
+        auto left=source(0x201,array && !fsr_packed?2:1,true);chains.push_back(left);
         auto right=array?left:source(0x202,1,true);if(!array)chains.push_back(right);
         auto dynamic=source(0x203,2,false);auto fixed=source(0x204,2,false,true);
         chains.push_back(dynamic);chains.push_back(fixed);
@@ -482,9 +485,13 @@ int main(int argc,char** argv) {
                 auto guides=std::make_shared<xrfg::DlssMotionVectorSet>();guides->eye_count=2;
                 for(unsigned eye=0;eye<2;++eye) {
                     auto g=std::make_shared<xrfg::DlssMotionVectorFrame>();g->stream=eye+1;g->epoch=1;g->serial=n;g->previous_serial=n-1;g->publication=2*n+eye;
-                    g->producer_queue=s->d3d12_queue;g->output=left->enumerated_d3d12_images[0];g->output_slice=eye;
+                    g->producer_queue=s->d3d12_queue;g->output=left->enumerated_d3d12_images[0];g->output_slice=fsr_packed?0:eye;
                     g->motion_vectors=motion;g->depth=depth;g->output_width=g->depth_width=g->motion_width=256;
                     g->output_height=g->depth_height=g->motion_height=128;g->frame_time_delta_ms=16.6667F;
+                    if(fsr_packed) {
+                        g->output_width=g->depth_width=g->motion_width=128;
+                        g->output_x=g->depth_x=g->motion_x=eye*128;
+                    }
                     guides->eyes[eye]=std::move(g);
                 }
                 if(fsr_stereo_guard && (n==3 || n==4)) guides->eyes[1]=guides->eyes[0];
@@ -522,6 +529,11 @@ int main(int argc,char** argv) {
                 auto& v=views[eye];v={XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};v.pose.orientation.w=1;v.pose.position.y=float(n);
                 v.pose.position.x=eye?.032F:-.032F;v.fov={-.7F,.7F,.7F,-.7F};
                 v.subImage.swapchain=eye?right->handle:left->handle;v.subImage.imageArrayIndex=array?eye:0;v.subImage.imageRect.extent={256,128};
+                if(fsr_packed) {
+                    v.subImage.imageArrayIndex=0;
+                    v.subImage.imageRect.offset.x=eye*128;
+                    v.subImage.imageRect.extent.width=128;
+                }
             }
             XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};projection.space=reinterpret_cast<XrSpace>(0x100);
             projection.viewCount=2;projection.views=views.data();

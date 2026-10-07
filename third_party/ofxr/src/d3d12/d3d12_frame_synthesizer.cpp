@@ -2986,8 +2986,14 @@ struct D3D12FrameSynthesizer::Impl {
     [[nodiscard]] bool has_complete_game_motion_set(
         const RollingSource& source) const noexcept {
         const auto& frames = source.motion_vectors;
+        // Packed stereo has two viewports in one texture slice. Match the
+        // same eye domain used by record_fsr_pair and can_pair_fsr, so a valid
+        // packed guide set can prime instead of being rejected indefinitely.
+        const UINT expected_guide_eyes = std::min<UINT>(
+            std::max<UINT>(image_description.DepthOrArraySize, source.view_count),
+            kDlssMotionVectorEyeCount);
         if (!frames || frames->eye_count == 0 ||
-            frames->eye_count != image_description.DepthOrArraySize ||
+            frames->eye_count != expected_guide_eyes ||
             frames->eye_count > kDlssMotionVectorEyeCount) {
             return false;
         }
