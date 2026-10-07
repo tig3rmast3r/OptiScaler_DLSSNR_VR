@@ -9,8 +9,10 @@
 
 #include <menu/menu_overlay_dx.h>
 #include <dlssnr/DlssNrFeature_Dx12.h>
+#include <menu/MenuCommandState.h>
 
 #include <algorithm>
+#include <unordered_set>
 #include <future>
 
 #include <magic_enum_utility.hpp>
@@ -1875,6 +1877,18 @@ void ResTrack_Dx12::HookCommandList(ID3D12Device* InDevice)
     }
 }
 
+namespace {
+void EnsureMenuNativeHooks(ID3D12Device* device)
+{
+    MenuCommandState::DeviceCoverage coverage;
+    const auto result=MenuCommandState::InstallDevice(device,&coverage);
+    if(FAILED(result)) LOG_ERROR("V33023 menu native hooks failed device:{:p} result:{:X}",(void*)device,(unsigned)result);
+    else if(coverage.installed)
+        LOG_INFO("V33023 menu native state/Reset/submission hooks covered device:{:p} deviceVtable:{:p} listVtable:{:p} graphicsRoot:{:p} graphicsTable:{:p}",
+            (void*)device,coverage.deviceVtable,coverage.listVtable,coverage.graphicsSignature,coverage.graphicsTable);
+}
+}
+
 void ResTrack_Dx12::HookToQueue(ID3D12Device* InDevice)
 {
     if (o_ExecuteCommandLists != nullptr)
@@ -1927,8 +1941,10 @@ void ResTrack_Dx12::HookToQueue(ID3D12Device* InDevice)
 
 void ResTrack_Dx12::HookQueueSubmission(ID3D12Device* device)
 {
-    if (device != nullptr)
+    if (device != nullptr) {
         HookToQueue(device);
+        EnsureMenuNativeHooks(device);
+    }
 }
 
 void ResTrack_Dx12::EnsureCommandQueueSubmissionHook(ID3D12Device* InDevice)
@@ -1938,6 +1954,7 @@ void ResTrack_Dx12::EnsureCommandQueueSubmissionHook(ID3D12Device* InDevice)
     static std::mutex hookMutex;
     std::lock_guard lock(hookMutex);
     HookToQueue(InDevice);
+    EnsureMenuNativeHooks(InDevice);
 }
 
 void ofxr_bridge::ensure_d3d12_submission_hook(ID3D12Device* device) noexcept
@@ -2036,6 +2053,8 @@ void ResTrack_Dx12::HookDevice(ID3D12Device* device)
 
 void ResTrack_Dx12::ReleaseDeviceHooks()
 {
+    const auto menuUnhook = MenuCommandState::Uninstall();
+    if (FAILED(menuUnhook)) LOG_ERROR("V33021 menu state detach failed: {:X}", (unsigned)menuUnhook);
     LOG_DEBUG("");
 
     DetourTransactionBegin();
@@ -2059,7 +2078,7 @@ void ResTrack_Dx12::ReleaseDeviceHooks()
     if (o_CopyDescriptorsSimple != nullptr)
         DetourDetach(&(PVOID&) o_CopyDescriptorsSimple, hkCopyDescriptorsSimple);
 
-    // Queue
+    // Queue and recording ownership hooks
     if (o_ExecuteCommandLists != nullptr)
         DetourDetach(&(PVOID&) o_ExecuteCommandLists, hkExecuteCommandLists);
 

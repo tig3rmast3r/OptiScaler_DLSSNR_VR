@@ -3,6 +3,7 @@
 
 #include <Util.h>
 #include <Config.h>
+#include <menu/MenuCommandState.h>
 
 #include <magic_enum.hpp>
 
@@ -2155,6 +2156,9 @@ static HRESULT hkD3D12GetInterface(REFCLSID rclsid, REFIID riid, void** ppvDebug
 
 static void HookToDevice(ID3D12Device* InDevice)
 {
+    // Device probes can precede a different Agility runtime used for rendering.
+    // Menu coverage must follow every actual device, even when generic hooks exist.
+    if (InDevice) ResTrack_Dx12::HookQueueSubmission(InDevice);
     if (o_CreateSampler != nullptr || InDevice == nullptr)
         return;
 
@@ -2245,9 +2249,6 @@ static void HookToDevice(ID3D12Device* InDevice)
         const bool cameraProbe = luke_scene_camera::install(realDevice ? realDevice : InDevice);
         LOG_INFO("V33008 current scene camera hooks installed={}", cameraProbe);
     }
-    // NR is independent of OptiScaler FG. Install only the queue-submission hook here, before the
-    // first DLSS feature can record NR work; the FG/HUD resource trackers remain gated below.
-    ResTrack_Dx12::HookQueueSubmission(InDevice);
     if (State::Instance().activeFgInput == FGInput::Upscaler &&
         !Config::Instance()->FGDisableHUDFix.value_or_default() &&
         State::Instance().swapchainInteropApi == SwapchainInteropApi::None)
@@ -2393,7 +2394,10 @@ void D3D12Hooks::Unhook()
     }
 }
 
-void D3D12Hooks::SetRootSignatureTracking(bool enable) { isUpscalerActive = !enable; }
+void D3D12Hooks::SetRootSignatureTracking(bool enable) {
+    isUpscalerActive = !enable;
+    MenuCommandState::applicationTracking = enable;
+}
 
 bool D3D12Hooks::CanRestoreRootSignature(ID3D12GraphicsCommandList* cmdList)
 {

@@ -555,6 +555,9 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="menu\menu_dx_base.h" />
     <ClInclude Include="menu\menu_common.h" />
     <ClInclude Include="menu\menu_dx11.h" />
+    <ClInclude Include="menu\MenuCommandState.h" />
+    <ClInclude Include="menu\MenuGpuLifetime.h" />
+    <ClInclude Include="menu\InUpscalerDx12Renderer.h" />
     <ClInclude Include="menu\menu_dx12.h" />
     <ClInclude Include="menu\menu_overlay_base.h" />
     <ClInclude Include="menu\menu_overlay_dx.h" />
@@ -792,6 +795,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="menu\menu_common.cpp" />
     <ClCompile Include="menu\menu_dx_base.cpp" />
     <ClCompile Include="menu\menu_dx11.cpp" />
+    <ClCompile Include="menu\MenuCommandState.cpp" />
     <ClCompile Include="menu\menu_dx12.cpp" />
     <ClCompile Include="menu\menu_overlay_base.cpp" />
     <ClCompile Include="menu\menu_overlay_dx.cpp" />

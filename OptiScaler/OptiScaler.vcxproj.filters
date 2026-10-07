@@ -284,6 +284,9 @@
     <ClInclude Include="menu\menu_dx11.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="menu\MenuCommandState.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="menu\MenuGpuLifetime.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="menu\InUpscalerDx12Renderer.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="menu\menu_dx12.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -1124,6 +1127,7 @@
     <ClCompile Include="menu\menu_dx11.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="menu\MenuCommandState.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="menu\menu_dx12.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
