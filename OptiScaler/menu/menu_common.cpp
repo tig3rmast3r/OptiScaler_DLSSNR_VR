@@ -7011,7 +7011,17 @@ static void RenderOfxrVrFramegenMenu()
     else if (engine == 5)
     {
         const auto guides = ofxr_bridge::dlss_guide_statistics();
-        if (guides.fsr_used != 0)
+        if (guides.fsr_status == 6 || guides.fsr_status == 7)
+        {
+            ImGui::TextColored(ImVec4(0.95F, 0.65F, 0.15F, 1.0F),
+                guides.fsr_status == 6 ? "FSR paused: stereo inputs unavailable"
+                                      : "FSR paused: checking stereo recovery");
+            ImGui::TextDisabled("Resumes automatically when stereo inputs are valid");
+        }
+        else if (guides.fsr_status == 1)
+            ImGui::TextColored(ImVec4(0.95F, 0.65F, 0.15F, 1.0F),
+                               "FSR waiting for a complete stereo pair");
+        else if (guides.fsr_used != 0)
             ImGui::TextColored(ImVec4(0.20F, 0.90F, 0.35F, 1.0F), "FSR active");
         else if (guides.depth_publications == 0)
             ImGui::TextColored(ImVec4(0.95F, 0.65F, 0.15F, 1.0F),

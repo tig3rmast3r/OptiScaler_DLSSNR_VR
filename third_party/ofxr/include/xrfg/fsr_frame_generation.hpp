@@ -11,6 +11,8 @@ enum class FsrFrameGenerationStatus : std::uint32_t {
     initialization_failed,
     dispatch_failed,
     used,
+    stereo_unavailable,
+    stereo_recovering,
 };
 
 struct FsrFrameGenerationStatistics {

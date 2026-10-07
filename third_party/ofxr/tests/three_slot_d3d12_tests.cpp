@@ -28,6 +28,9 @@ bool promotion_test{};
 bool fsr_test{}, fsr_missing{};
 bool fsr_queue{}, fsr_queue_slow{};
 bool fsr_queue_switch{};
+bool fsr_stereo_guard{};
+std::mutex guard_journal_mutex;
+bool guard_runtime_waited{}, guard_runtime_begun{};
 bool legacy_queue{};
 bool legacy_early_current{};
 bool midpoint_cadence{};
@@ -139,6 +142,11 @@ XrResult XRAPI_CALL fake_destroy(XrSwapchain h) {
     std::scoped_lock lock(resources_mutex); destroyed+=static_cast<unsigned>(images.erase(h)); return XR_SUCCESS;
 }
 XrResult XRAPI_CALL fake_wait(XrSession,const XrFrameWaitInfo*,XrFrameState* s) {
+    if(fsr_stereo_guard) {
+        std::scoped_lock lock(guard_journal_mutex);
+        require(!guard_runtime_waited && !guard_runtime_begun,"guard double physical Wait");
+        guard_runtime_waited=true;
+    }
     if(fsr_queue_gpu_pending && fsr_gpu_gate && fsr_gpu_gate->GetCompletedValue()==0) {
         fsr_wait_before_gpu_complete=true;
         hr(fsr_gpu_gate->Signal(1), "release pending application GPU work at XR Wait");
@@ -147,7 +155,14 @@ XrResult XRAPI_CALL fake_wait(XrSession,const XrFrameWaitInfo*,XrFrameState* s) 
     ++waits; runtime_time+=8333333; s->predictedDisplayTime=runtime_time;
     s->predictedDisplayPeriod=8333333; s->shouldRender=XR_TRUE; return XR_SUCCESS;
 }
-XrResult XRAPI_CALL fake_begin(XrSession,const XrFrameBeginInfo*) { ++begins; return XR_SUCCESS; }
+XrResult XRAPI_CALL fake_begin(XrSession,const XrFrameBeginInfo*) {
+    if(fsr_stereo_guard) {
+        std::scoped_lock lock(guard_journal_mutex);
+        require(guard_runtime_waited && !guard_runtime_begun,"guard unmatched physical Begin");
+        guard_runtime_waited=false;guard_runtime_begun=true;
+    }
+    ++begins; return XR_SUCCESS;
+}
 ComPtr<ID3D12Resource> submitted_image(XrSwapchain handle) {
     {
         std::scoped_lock lock(resources_mutex);
@@ -165,6 +180,11 @@ bool is_private_image(XrSwapchain handle) {
     return images.contains(handle);
 }
 XrResult XRAPI_CALL fake_end(XrSession,const XrFrameEndInfo* end) {
+    if(fsr_stereo_guard) {
+        std::scoped_lock lock(guard_journal_mutex);
+        require(guard_runtime_begun && !guard_runtime_waited,"guard unmatched physical End");
+        guard_runtime_begun=false;
+    }
     // Cadence receipts measure entry into EndFrame, before its simulated
     // compositor stall. Empty call-order probes carry no output receipt.
     if (end->layerCount) {
@@ -196,7 +216,7 @@ XrResult XRAPI_CALL fake_end(XrSession,const XrFrameEndInfo* end) {
         }
     }
     unsigned real_id=0;
-    for(unsigned eye=0;eye<2;++eye) {
+    for(unsigned eye=0;eye<projection->viewCount;++eye) {
         auto sub=projection->views[eye].subImage;
         ComPtr<ID3D12Resource> image=submitted_image(sub.swapchain);
         const unsigned p=pixel(image.Get(),sub.imageArrayIndex,
@@ -330,6 +350,7 @@ int main(int argc,char** argv) {
         fsr_queue_slow=fsr_queue_slow || (argc>1 && std::string_view(argv[1]) == "legacy-queue-slow");
         fsr_queue_switch=argc>1 && std::string_view(argv[1]) == "fsr-queue-switch";
         fsr_queue_gpu_pending=argc>1 && std::string_view(argv[1]) == "fsr-queue-gpu-pending";
+        fsr_stereo_guard=argc>1 && std::string_view(argv[1]).ends_with("stereo-guard");
         fsr_missing=argc>1 && std::string_view(argv[1])=="fsr-inline-wait";
         if(fsr_test) {
             s->frame_generation_mode=xrfg::D3D12FrameGenerationMode::fsr3;
@@ -405,7 +426,13 @@ int main(int argc,char** argv) {
             require(start_continuous_presenter(s,nullptr,false),"promotion");
             require(s->three_slot_director && s->synthesis_thread.joinable(),"native did not enter three lanes");
         }
-        for(unsigned n=1;n<=8;++n) {
+        const unsigned real_count=fsr_stereo_guard?13:8;
+        std::optional<XrFrameState> guard_next;
+        if(fsr_stereo_guard && fsr_queue) {
+            s->pipelined_presenter_mode=true;
+            require(start_continuous_presenter(s,nullptr,true),"guard initial virtual owner");
+        }
+        for(unsigned n=1;n<=real_count;++n) {
 #ifdef OFXR_TEST_DJULES_ROUTE
             if(triple_switch && (n==5 || n==7))
                 require(XR_SUCCEEDED(switch_djules_pipeline(s,n==7,false)),"live GPU multiplier switch");
@@ -431,11 +458,16 @@ int main(int argc,char** argv) {
             if(fsr_test && !fsr_missing) {
                 auto guides=std::make_shared<xrfg::DlssMotionVectorSet>();guides->eye_count=2;
                 for(unsigned eye=0;eye<2;++eye) {
-                    auto g=std::make_shared<xrfg::DlssMotionVectorFrame>();g->stream=eye+1;g->epoch=1;g->serial=n;g->previous_serial=n-1;
+                    auto g=std::make_shared<xrfg::DlssMotionVectorFrame>();g->stream=eye+1;g->epoch=1;g->serial=n;g->previous_serial=n-1;g->publication=2*n+eye;
                     g->producer_queue=s->d3d12_queue;g->output=left->enumerated_d3d12_images[0];g->output_slice=eye;
                     g->motion_vectors=motion;g->depth=depth;g->output_width=g->depth_width=g->motion_width=256;
                     g->output_height=g->depth_height=g->motion_height=128;g->frame_time_delta_ms=16.6667F;
                     guides->eyes[eye]=std::move(g);
+                }
+                if(fsr_stereo_guard && (n==3 || n==4)) guides->eyes[1]=guides->eyes[0];
+                if(fsr_stereo_guard && n==6) {
+                    auto missing=std::make_shared<xrfg::DlssMotionVectorFrame>(*guides->eyes[1]);
+                    missing->motion_vectors.Reset();guides->eyes[1]=std::move(missing);
                 }
                 std::scoped_lock lock(left->mutex);left->last_released_motion_vectors=std::move(guides);
             }
@@ -448,8 +480,10 @@ int main(int argc,char** argv) {
             fill(dynamic->enumerated_d3d12_images[0].Get(),n,60);release(dynamic,!triple_inline && (!legacy_queue || n>1));
             if(n==1){fill(fixed->enumerated_d3d12_images[0].Get(),55,120);release(fixed,!triple_inline && !legacy_queue);}
             XrFrameState prediction{XR_TYPE_FRAME_STATE};
-            require(XR_SUCCEEDED(layer_wait_frame_impl(s->handle,nullptr,&prediction)),"producer wait");
-            require(prediction.predictedDisplayPeriod==(triple_switch && (n==5 || n==6)?8333333 : (triple_core||triple_inline)?24999999 : legacy_queue && n>1 ? 16666666 : 8333333),"advertised period");
+            if(guard_next) {prediction=*guard_next;guard_next.reset();}
+            else require(XR_SUCCEEDED(layer_wait_frame_impl(s->handle,nullptr,&prediction)),"producer wait");
+            if(!fsr_stereo_guard)
+                require(prediction.predictedDisplayPeriod==(triple_switch && (n==5 || n==6)?8333333 : (triple_core||triple_inline)?24999999 : legacy_queue && n>1 ? 16666666 : 8333333),"advertised period");
             require(XR_SUCCEEDED(layer_begin_frame_impl(s->handle,nullptr)),"producer begin");
             if(fsr_queue_gpu_pending && n==3) {
                 require(XR_SUCCEEDED(wait_for_presenter_idle(s)), "pending GPU test drain");
@@ -468,6 +502,7 @@ int main(int argc,char** argv) {
             }
             XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};projection.space=reinterpret_cast<XrSpace>(0x100);
             projection.viewCount=2;projection.views=views.data();
+            if(fsr_stereo_guard && n==10) projection.viewCount=1;
             std::array<XrCompositionLayerQuad,2> quads;
             for(unsigned i=0;i<2;++i){auto& v=quads[i];v={XR_TYPE_COMPOSITION_LAYER_QUAD};v.pose.orientation.w=1;v.pose.position.y=float(n);
                 v.subImage.swapchain=i?fixed->handle:dynamic->handle;v.subImage.imageArrayIndex=i;v.subImage.imageRect.extent={256,128};}
@@ -475,6 +510,45 @@ int main(int argc,char** argv) {
                 reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[0]),reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[1])};
             XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=prediction.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
             end.layerCount=promotion_test && !s->three_slot_director ? 1 : 3;end.layers=layers;
+            if(fsr_stereo_guard && n==1) {
+                ProjectionSnapshot audit;
+                require(capture_projection_snapshot(&end,&audit),"guard audit projection");
+                const auto mapped=build_projection_resource_mappings(audit);
+                require(mapped.ready(),"guard audit mappings");
+                const auto original=left->last_released_motion_vectors;
+                require(classify_fsr_stereo_guides(audit,mapped.mappings)==FsrStereoGuideReason::ready,
+                    "guard rejected independent stereo guides");
+                auto shared=std::make_shared<xrfg::DlssMotionVectorSet>(*original);
+                shared->eyes[1]=shared->eyes[0];
+                left->last_released_motion_vectors=shared;
+                require(classify_fsr_stereo_guides(audit,mapped.mappings)==FsrStereoGuideReason::shared_eye_domain,
+                    "guard admitted duplicated mono guides");
+                auto a=std::make_shared<xrfg::DlssMotionVectorFrame>(*shared->eyes[0]);
+                auto b=std::make_shared<xrfg::DlssMotionVectorFrame>(*a);
+                a->motion_width=b->motion_width=128;b->motion_x=128;
+                shared->eyes={a,b};
+                require(classify_fsr_stereo_guides(audit,mapped.mappings)==FsrStereoGuideReason::ready,
+                    "guard rejected non-overlapping packed stereo motion");
+                b->motion_x=64;
+                require(classify_fsr_stereo_guides(audit,mapped.mappings)==FsrStereoGuideReason::shared_eye_domain,
+                    "guard admitted overlapping shared motion domain");
+                b->motion_x=0;b->motion_width=256;b->motion_slice=1;
+                a->motion_vectors=b->motion_vectors=resource(2,false,D3D12_HEAP_TYPE_DEFAULT,
+                    0,D3D12_RESOURCE_STATE_COMMON,DXGI_FORMAT_R16G16_FLOAT);
+                require(classify_fsr_stereo_guides(audit,mapped.mappings)==FsrStereoGuideReason::ready,
+                    "guard rejected distinct array stereo motion slices");
+                b->motion_slice=2;
+                require(classify_fsr_stereo_guides(audit,mapped.mappings)==FsrStereoGuideReason::invalid_guide_region,
+                    "guard admitted out-of-bounds motion slice");
+                b->motion_slice=1;
+                b->depth.Reset();
+                require(classify_fsr_stereo_guides(audit,mapped.mappings)==FsrStereoGuideReason::missing_guides,
+                    "guard admitted missing depth");
+                audit.layers[0].views.resize(1);
+                require(classify_fsr_stereo_guides(audit,mapped.mappings)==FsrStereoGuideReason::non_stereo_projection,
+                    "guard admitted mono projection");
+                left->last_released_motion_vectors=original;
+            }
             const unsigned independence_frame=(fsr_test || legacy_queue || triple_inline) ? 0 : promotion_test ? 5 : 2;
             if(deep_switch && n==4) {
                 hr(s->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&policy_gate)),"policy GPU gate");
@@ -486,7 +560,27 @@ int main(int argc,char** argv) {
             }
             if(n==independence_frame){hr(s->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&blocked_synthesis)),"test gate");
                 hr(s->d3d12_synthesis_queue->Wait(blocked_synthesis.Get(),1),"block synthesis");}
+            if(fsr_stereo_guard && fsr_queue && n<real_count) {
+                XrFrameState next{XR_TYPE_FRAME_STATE};
+                require(XR_SUCCEEDED(layer_wait_frame_impl(s->handle,nullptr,&next)),"guard outstanding virtual Wait");
+                guard_next=next;
+            }
+            const auto fsr_used_before=xrfg::fsr_frame_generation_statistics().used;
             require(XR_SUCCEEDED(layer_end_frame_impl(s->handle,&end)),"actual EndFrame");
+            if(fsr_stereo_guard) {
+                require(XR_SUCCEEDED(wait_for_presenter_idle(s)),"guard boundary drain");
+                const bool generated=n==2 || n==9 || n==13;
+                require(xrfg::fsr_frame_generation_statistics().used==fsr_used_before+(generated?1:0),
+                    "guard dispatched with invalid inputs or failed to resume");
+                const bool paused=(n>=3 && n<=7) || n==10 || n==11;
+                require(s->fsr_stereo_admission.suspended==paused,"guard suspension/recovery state");
+                if(paused) {
+                    require(!s->previous_projection,"guard retained pre-menu projection anchor");
+                    const auto status=xrfg::fsr_frame_generation_statistics().status;
+                    require(status==xrfg::FsrFrameGenerationStatus::stereo_unavailable ||
+                        status==xrfg::FsrFrameGenerationStatus::stereo_recovering,"guard status lost");
+                }
+            }
             if(legacy_queue) {
                 require(continuous_presenter_active(s) && s->queued_nvidia_presenter &&
                     !s->three_slot_director && !s->synthesis_thread.joinable(),
@@ -574,11 +668,19 @@ int main(int argc,char** argv) {
             require(submissions.size()==fresh.size()+repeats,"deep physical output accounting");
             submissions=std::move(fresh);
         }
-        const unsigned expected_count=deep_switch?13:triple_switch?17:(triple_core||triple_inline)?22:fsr_queue_switch ? 16 : fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
+        const unsigned expected_count=fsr_stereo_guard?16:deep_switch?13:triple_switch?17:(triple_core||triple_inline)?22:fsr_queue_switch ? 16 : fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
         const unsigned expected_cycles = expected_count + repeats + empty_submissions;
         require(submissions.size()==expected_count && waits==expected_cycles && begins==expected_cycles && ends==expected_cycles,"unique output/cycle count");
         require(empty_submissions == (fsr_queue_switch ? 1U : 0U), "unexpected empty physical submission");
-        if(fsr_missing) {
+        if(fsr_stereo_guard) {
+            std::vector<std::pair<unsigned,bool>> expected;
+            for(unsigned n=1;n<=real_count;++n) {
+                if(n==2 || n==9 || n==13) expected.emplace_back(n,true);
+                expected.emplace_back(n,false);
+            }
+            require(submissions==expected,"guard lost/repeated/reordered real or synthetic outputs");
+            require(!guard_runtime_waited && !guard_runtime_begun,"guard left an open physical cycle");
+        } else if(fsr_missing) {
             for(unsigned i=0;i<8;++i) require(submissions[i]==std::pair<unsigned,bool>{i+1,false},"FSR missing guide repeated/lost real");
         } else if(gap_test) {
             std::vector<std::pair<unsigned,bool>> expected;
@@ -620,7 +722,7 @@ int main(int argc,char** argv) {
                     submissions[3*i+2]==std::pair<unsigned,bool>{i+2,true},"3X independent synthetic deliveries");
             }
         } else for(unsigned i=0;i<7;++i){require(submissions[2*i]==std::pair<unsigned,bool>{i+1,false},"real order");require(submissions[2*i+1].second,"synthetic order");}
-        require(submissions.back()==std::pair<unsigned,bool>{8,false},"last real");require(correct,"stale/cross-eye/auxiliary pixels");
+        require(submissions.back()==std::pair<unsigned,bool>{real_count,false},"last real");require(correct,"stale/cross-eye/auxiliary pixels");
         if(midpoint_cadence) {
             require(output_times.size()==submissions.size(), "midpoint runtime receipts");
             for(unsigned i=1;i<submissions.size();++i)
@@ -653,7 +755,7 @@ int main(int argc,char** argv) {
             }
         }
         if(fsr_test) {const auto stats=xrfg::fsr_frame_generation_statistics();
-            require(fsr_missing ? stats.attempts==0 : stats.used==7 && stats.failures==0,"FSR dispatch count/failed");}
+            require(fsr_missing ? stats.attempts==0 : stats.used==(fsr_stereo_guard?3:7) && stats.failures==0,"FSR dispatch count/failed");}
         for(auto& c:chains){drain_swapchain_gpu(c);destroy_frame_generation_swapchains(c);destroy_composition_capture(c);}
         require(created==destroyed,"private XR swapchain leak");
         ComPtr<ID3D12InfoQueue> info;

@@ -549,6 +549,34 @@ struct ProjectionResourceMapping {
     std::vector<ProjectionViewReference> views;
 };
 
+enum class FsrStereoGuideReason : std::int64_t {
+    ready, non_stereo_projection, missing_guides, shared_eye_domain, recovering,
+    invalid_guide_region,
+};
+
+struct FsrStereoAdmission {
+    bool suspended{};
+    unsigned recovery_frames{};
+    FsrStereoGuideReason reason{FsrStereoGuideReason::ready};
+
+    bool observe(FsrStereoGuideReason input) noexcept {
+        if (input != FsrStereoGuideReason::ready) {
+            suspended = true;
+            recovery_frames = 0;
+            reason = input;
+            return false;
+        }
+        if (suspended && ++recovery_frames < 2) {
+            reason = FsrStereoGuideReason::recovering;
+            return false;
+        }
+        suspended = false;
+        recovery_frames = 0;
+        reason = FsrStereoGuideReason::ready;
+        return true;
+    }
+};
+
 enum class ProjectionMappingReason : std::int64_t {
     ready = 0,
     no_projection_views = 1,
@@ -660,6 +688,7 @@ struct SessionState {
     std::shared_ptr<Dispatch> dispatch;
     xrfg::implicit_layer::ManualArmControl manual_control;
     xrfg::FsrCadenceProbe fsr_cadence;
+    FsrStereoAdmission fsr_stereo_admission; // frame_call_mutex; never persisted
     std::uint64_t control_id{xrfg::embedded::attach()};
     std::uint64_t control_revision{}; // frame_call_mutex
     bool control_reconfigure_required{};
@@ -9005,6 +9034,8 @@ enum class GenerationPrepareReason : std::int64_t {
     synthesis_busy = 19,
     presenter_route_changed = 23,
     synthesis_stale_guides = 24,
+    fsr_stereo_unavailable = 25,
+    fsr_stereo_recovering = 26,
 };
 
 [[nodiscard]] constexpr GenerationPrepareReason classify_synthesis_failure(
@@ -11720,6 +11751,75 @@ struct PrivateDepthStrip {
 }
 
 
+// Validate the exact immutable guides retained with the released XR colours.
+// Two views may share a packed/array stereo resource, but may not consume the
+// same mono motion domain twice. No cross-eye or colour-only synthesis is used
+// when the pair cannot be proved; the existing borrowed-frame owner presents it.
+[[nodiscard]] FsrStereoGuideReason classify_fsr_stereo_guides(
+    const ProjectionSnapshot& snapshot,
+    std::span<const ProjectionResourceMapping> mappings) noexcept {
+    if (snapshot.layers.empty()) return FsrStereoGuideReason::non_stereo_projection;
+    for (std::size_t projection = 0; projection < snapshot.layers.size(); ++projection) {
+        const auto& views = snapshot.layers[projection].views;
+        if (views.size() != 2) return FsrStereoGuideReason::non_stereo_projection;
+        std::array<std::shared_ptr<const xrfg::DlssMotionVectorFrame>, 2> eyes;
+        for (const auto& mapping : mappings) {
+            const auto swapchain = find_swapchain(mapping.application_swapchain);
+            if (!swapchain) return FsrStereoGuideReason::missing_guides;
+            std::scoped_lock lock(swapchain->mutex);
+            const auto& guides = swapchain->last_released_motion_vectors;
+            if (!guides) return FsrStereoGuideReason::missing_guides;
+            for (std::size_t local = 0; local < mapping.views.size(); ++local) {
+                const auto& reference = mapping.views[local];
+                if (reference.projection_index != projection) continue;
+                if (reference.view_index >= eyes.size()) return FsrStereoGuideReason::non_stereo_projection;
+                // Same selection as record_fsr_pair: double-wide uses local
+                // viewport order, array/split resources use their slice index.
+                const auto index = swapchain->create_info.arraySize == 1 &&
+                        guides->eye_count == mapping.views.size()
+                    ? static_cast<std::uint32_t>(local)
+                    : views[reference.view_index].subImage.imageArrayIndex;
+                if (index >= guides->eye_count || index >= guides->eyes.size())
+                    return FsrStereoGuideReason::missing_guides;
+                eyes[reference.view_index] = guides->eyes[index];
+            }
+        }
+        for (const auto& eye : eyes) {
+            if (!eye || !eye->publication || !eye->stream || !eye->serial ||
+                !eye->depth || !eye->motion_vectors || !eye->depth_width ||
+                !eye->depth_height || !eye->motion_width || !eye->motion_height)
+                return FsrStereoGuideReason::missing_guides;
+            const auto valid_region = [](ID3D12Resource* resource, std::uint32_t x,
+                std::uint32_t y, std::uint32_t width, std::uint32_t height,
+                std::uint32_t slice) {
+                const auto desc = resource->GetDesc();
+                return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                    slice < desc.DepthOrArraySize &&
+                    static_cast<std::uint64_t>(x) + width <= desc.Width &&
+                    static_cast<std::uint64_t>(y) + height <= desc.Height;
+            };
+            if (!valid_region(eye->motion_vectors.Get(), eye->motion_x, eye->motion_y,
+                    eye->motion_width, eye->motion_height, eye->motion_slice) ||
+                !valid_region(eye->depth.Get(), eye->depth_x, eye->depth_y,
+                    eye->depth_width, eye->depth_height, 0))
+                return FsrStereoGuideReason::invalid_guide_region;
+        }
+        const auto& a = *eyes[0];
+        const auto& b = *eyes[1];
+        const bool same_publication = a.stream == b.stream && a.epoch == b.epoch &&
+            a.serial == b.serial && a.publication == b.publication;
+        const bool overlapping_motion = a.motion_vectors.Get() == b.motion_vectors.Get() &&
+            a.motion_slice == b.motion_slice &&
+            static_cast<std::uint64_t>(a.motion_x) < static_cast<std::uint64_t>(b.motion_x) + b.motion_width &&
+            static_cast<std::uint64_t>(b.motion_x) < static_cast<std::uint64_t>(a.motion_x) + a.motion_width &&
+            static_cast<std::uint64_t>(a.motion_y) < static_cast<std::uint64_t>(b.motion_y) + b.motion_height &&
+            static_cast<std::uint64_t>(b.motion_y) < static_cast<std::uint64_t>(a.motion_y) + a.motion_height;
+        if (same_publication && overlapping_motion)
+            return FsrStereoGuideReason::shared_eye_domain;
+    }
+    return FsrStereoGuideReason::ready;
+}
+
 XrResult layer_end_frame_impl(
     XrSession session,
     const XrFrameEndInfo* end_info) {
@@ -12075,6 +12175,34 @@ XrResult layer_end_frame_impl(
     const bool generation_arming_pending =
         resource_mappings.ready() &&
         projection_frame_generation_pending(state, projection_mappings);
+    const bool stereo_projection = !current_snapshot.layers.empty() &&
+        std::all_of(current_snapshot.layers.begin(), current_snapshot.layers.end(),
+            [](const auto& layer) { return layer.views.size() == 2; });
+    if (state->frame_generation_mode == xrfg::D3D12FrameGenerationMode::fsr3 &&
+        (!stereo_projection || (resource_mappings.ready() && !generation_arming_pending))) {
+        auto& admission = state->fsr_stereo_admission;
+        const auto previous_reason = admission.reason;
+        const bool admitted = admission.observe(stereo_projection
+            ? classify_fsr_stereo_guides(current_snapshot, projection_mappings)
+            : FsrStereoGuideReason::non_stereo_projection);
+        if (admission.reason != previous_reason)
+            xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::fsr_recovery,
+                static_cast<std::int64_t>(admission.reason), 300,
+                static_cast<std::uint64_t>(current_snapshot.display_time), admission.suspended);
+        if (!admitted) {
+            const bool recovering = admission.reason == FsrStereoGuideReason::recovering;
+            xrfg::report_fsr_frame_generation_status(recovering
+                ? xrfg::FsrFrameGenerationStatus::stereo_recovering
+                : xrfg::FsrFrameGenerationStatus::stereo_unavailable);
+            return bypass_generation(recovering
+                ? GenerationPrepareReason::fsr_stereo_recovering
+                : GenerationPrepareReason::fsr_stereo_unavailable);
+        }
+        if (previous_reason != FsrStereoGuideReason::ready)
+            xrfg::report_fsr_frame_generation_status(xrfg::FsrFrameGenerationStatus::waiting_for_guides);
+    } else if (state->frame_generation_mode != xrfg::D3D12FrameGenerationMode::fsr3) {
+        state->fsr_stereo_admission = {};
+    }
     if (!resource_mappings.ready() || generation_arming_pending) {
         clear_generation_continuity(state);
         if (!resource_mappings.ready() &&
