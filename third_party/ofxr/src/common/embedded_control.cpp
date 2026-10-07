@@ -28,6 +28,7 @@ bool luke_afw_requires_dlss_guides() {
 struct Receipt {
     std::uint64_t revision{}; bool enabled{}; long error{};
     std::optional<bool> djules_prefer_fps;
+    bool djules_triple{};
 };
 struct Control {
     std::mutex mutex;
@@ -40,6 +41,7 @@ struct Control {
         wchar_t route[16]{};
         GetPrivateProfileStringW(L"ofxr", L"nvidia_route", L"legacy", route, 16, ini().c_str());
         if (settings.backend == 1 && _wcsicmp(route, L"new") == 0) settings.backend = 2;
+        if (settings.backend == 1 && _wcsicmp(route, L"djules") == 0) settings.backend = 3;
         settings.preset = static_cast<int>(options.preset);
         settings.scale = static_cast<int>(options.input_scale);
         settings.backward = options.bidirectional;
@@ -111,7 +113,7 @@ Snapshot snapshot() {
     return s;
 }
 bool request(Settings s) {
-    if (s.backend < 0 || s.backend > 2 || s.preset < 0 || s.preset > 2 ||
+    if (s.backend < 0 || s.backend > 3 || s.preset < 0 || s.preset > 2 ||
         s.scale < 0 || s.scale > 2 || s.motion_vectors < 0 || s.motion_vectors > 1 ||
         s.frame_generation < 0 || s.frame_generation > 1) return false;
     // This UI option controls OFXR's temporal guide choice, but Luke AFW
@@ -123,7 +125,7 @@ bool request(Settings s) {
     // Do not rewrite diagnostics, comments, or unrelated configuration.
     if (old.enabled != s.enabled) ok &= write(L"ofxr", L"enabled", s.enabled ? L"1" : L"0");
     if (old.backend != s.backend) ok &= write(L"ofxr", L"backend", s.backend ? L"nvidia" : L"fidelityfx");
-    if (old.backend != s.backend) ok &= write(L"ofxr", L"nvidia_route", s.backend == 2 ? L"new" : L"legacy");
+    if (old.backend != s.backend) ok &= write(L"ofxr", L"nvidia_route", s.backend == 3 ? L"djules" : s.backend == 2 ? L"new" : L"legacy");
     const wchar_t* presets[]{L"slow", L"medium", L"fast"};
     const wchar_t* scales[]{L"100", L"75", L"50"};
     if (old.preset != s.preset) ok &= write(L"ofxr", L"nvidia_preset", presets[s.preset]);
@@ -245,7 +247,8 @@ DjulesPipelineSnapshot djules_pipeline_snapshot() {
         GetPrivateProfileIntW(L"ofxr", L"deep_pipeline", 1, ini().c_str()) != 0;
     auto& c = control(); std::scoped_lock lock(c.mutex);
     for (const auto& [id, receipt] : c.sessions)
-        if (receipt.djules_prefer_fps && *receipt.djules_prefer_fps != s.prefer_fps)
+        if (receipt.djules_prefer_fps &&
+            (*receipt.djules_prefer_fps != s.prefer_fps || receipt.djules_triple != s.triple_frame_gen))
             s.pending = true;
     return s;
 }
@@ -253,10 +256,15 @@ bool set_djules_prefer_fps(bool enabled) {
     if (!enabled && GetPrivateProfileIntW(L"ofxr", L"triple_frame_gen", 0, ini().c_str())) return false;
     return write(L"ofxr", L"deep_pipeline", enabled ? L"1" : L"0");
 }
-void register_djules_pipeline(std::uint64_t id, bool prefer_fps) {
+bool set_djules_triple_frame_gen(bool enabled) {
+    return write(L"ofxr", L"triple_frame_gen", enabled ? L"1" : L"0");
+}
+void register_djules_pipeline(std::uint64_t id, bool prefer_fps, bool triple) {
     auto& c = control(); std::scoped_lock lock(c.mutex);
-    if (auto it = c.sessions.find(id); it != c.sessions.end())
+    if (auto it = c.sessions.find(id); it != c.sessions.end()) {
         it->second.djules_prefer_fps = prefer_fps;
+        it->second.djules_triple = triple;
+    }
 }
 void set_layer_active(bool active) noexcept { g_layer_active.store(active, std::memory_order_release); }
 bool layer_active() noexcept { return g_layer_active.load(std::memory_order_acquire); }

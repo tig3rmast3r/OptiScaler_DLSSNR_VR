@@ -6939,24 +6939,19 @@ static void RenderOfxrVrFramegenMenu()
     int engine = settings.enabled == 0
         ? 0
         : settings.frame_generation == 1
-            ? 4
-            : settings.backend == 2 ? 3 : settings.backend == 1 ? 2 : 1;
-#ifdef OFXR_DJULES_COMPARISON
+            ? 5
+            : settings.backend == 3 ? 3 : settings.backend == 2 ? 4 : settings.backend == 1 ? 2 : 1;
     bool changed = ImGui::Combo(
-        "Engine", &engine, "Off\0FidelityFX\0Nvidia\0Nvidia (djules)\0FSR 3.1\0");
-#else
-    bool changed = ImGui::Combo(
-        "Engine", &engine, "Off\0FidelityFX\0Nvidia\0Nvidia (new)\0FSR 3.1\0");
-#endif
+        "Engine", &engine, "Off\0FidelityFX\0Nvidia (0.2.1)\0Nvidia (djules)\0Nvidia (new / 0.3.0)\0FSR 3.1\0");
     if (changed)
     {
         settings.enabled = engine == 0 ? 0 : 1;
-        settings.frame_generation = engine == 4 ? 1 : 0;
-        settings.backend = engine == 3 ? 2 : engine == 2 ? 1 : 0;
-        settings.motion_vectors = engine == 4 ? 1 : 0;
+        settings.frame_generation = engine == 5 ? 1 : 0;
+        settings.backend = engine == 3 ? 3 : engine == 4 ? 2 : engine == 2 ? 1 : 0;
+        settings.motion_vectors = engine == 5 ? 1 : 0;
     }
 
-    if (engine == 2 || engine == 3)
+    if (engine == 2 || engine == 3 || engine == 4)
     {
         int uiPreset = settings.preset == 2 ? 0 : settings.preset == 1 ? 1 : 2;
         if (ImGui::Combo("NVIDIA preset", &uiPreset, "Fast\0Medium\0Slow\0"))
@@ -6975,10 +6970,14 @@ static void RenderOfxrVrFramegenMenu()
         }
     }
 
-#ifdef OFXR_DJULES_COMPARISON
     if (engine == 3)
     {
-        const auto pipeline = xrfg::embedded::djules_pipeline_snapshot();
+        auto pipeline = xrfg::embedded::djules_pipeline_snapshot();
+        bool triple = pipeline.triple_frame_gen;
+        if (ImGui::Checkbox("3X Frame Gen", &triple) &&
+            !xrfg::embedded::set_djules_triple_frame_gen(triple))
+            ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F), "Could not save multiplier");
+        pipeline = xrfg::embedded::djules_pipeline_snapshot();
         bool preferFps = pipeline.prefer_fps;
         ImGui::BeginDisabled(pipeline.triple_frame_gen);
         if (ImGui::Checkbox("Prefer FPS over latency", &preferFps) &&
@@ -6995,7 +6994,6 @@ static void RenderOfxrVrFramegenMenu()
                               "Adds about one frame of latency (11 ms at 90 Hz).\n"
                               "Applies during play after pending frames complete.");
     }
-#endif
 
     if (changed && !ofxr_bridge::request(settings))
         ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F),
@@ -7005,12 +7003,12 @@ static void RenderOfxrVrFramegenMenu()
     {
         ImGui::TextDisabled("Disabled");
     }
-    else if (engine == 4 && !ofxr_bridge::supports_fsr())
+    else if (engine == 5 && !ofxr_bridge::supports_fsr())
     {
         ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F),
                            "FSR requires OFXR provider API v2");
     }
-    else if (engine == 4)
+    else if (engine == 5)
     {
         const auto guides = ofxr_bridge::dlss_guide_statistics();
         if (guides.fsr_used != 0)

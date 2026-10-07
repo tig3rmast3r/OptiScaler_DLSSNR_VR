@@ -1,4 +1,4 @@
-#ifdef OFXR_DJULES_COMPARISON
+#ifdef OFXR_TEST_DJULES_ROUTE
 void djules_binding_queue_test() {
     auto s = session();
     s->presenter_active = false;

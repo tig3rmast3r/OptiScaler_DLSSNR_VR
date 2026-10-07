@@ -1,6 +1,0 @@
-{
-  "base_commit": "a98b5e5c6cc798d4dfb8508abea12e7f8469e6b3",
-  "purpose": "Deliberate third comparison variant; shared host guide/AFW ingress and controls. Not a failover or diagnostic binary.",
-  "initial_behavior": "Same as selected V32010; subsequent djules imports replace this variant only.",
-  "shared": "Headers, guide registry/retention, AFW, D3D11 interop, FSR, history and dependencies remain shared."
-}

@@ -1,10 +1,6 @@
 // Real D3D12/NVIDIA and the actual release/EndFrame/worker/director code.
 // The runtime alone is mocked. Sources are poisoned after intercepted release.
-#ifdef OFXR_DJULES_COMPARISON
-#include "../variants/djules/openxr_layer.cpp"
-#else
 #include "../src/layer/openxr_layer.cpp"
-#endif
 #include <d3d12sdklayers.h>
 #include <iostream>
 #include <stdexcept>
@@ -12,6 +8,11 @@
 #include "ram_timing_fixture.hpp"
 
 namespace {
+#ifdef OFXR_TEST_DJULES_ROUTE
+constexpr bool kTestDjules=true;
+#else
+constexpr bool kTestDjules=false;
+#endif
 using Microsoft::WRL::ComPtr;
 std::shared_ptr<SessionState> session_state;
 std::mutex test_gpu, resources_mutex;
@@ -40,6 +41,7 @@ ComPtr<ID3D12Fence> fsr_gpu_gate;
 std::jthread fsr_gpu_watchdog;
 std::atomic<bool> fsr_wait_before_gpu_complete{};
 std::vector<std::chrono::steady_clock::time_point> output_times;
+std::vector<XrTime> output_display_times;
 ComPtr<ID3D12Fence> promotion_gate;
 std::jthread promotion_unblock;
 std::atomic<bool> promotion_gate_released{};
@@ -114,7 +116,7 @@ unsigned pixel(ID3D12Resource* r, unsigned slice,
         D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource=readback.Get(); dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint=layout;
         list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
         barrier(list,r,D3D12_RESOURCE_STATE_COPY_SOURCE,submitted_state);
-#ifdef OFXR_DJULES_COMPARISON
+#ifdef OFXR_TEST_DJULES_ROUTE
     },(deep_readiness||triple_core)?runtime_queue(*session_state):nullptr);
 #else
     });
@@ -165,7 +167,10 @@ bool is_private_image(XrSwapchain handle) {
 XrResult XRAPI_CALL fake_end(XrSession,const XrFrameEndInfo* end) {
     // Cadence receipts measure entry into EndFrame, before its simulated
     // compositor stall. Empty call-order probes carry no output receipt.
-    if (end->layerCount) output_times.push_back(std::chrono::steady_clock::now());
+    if (end->layerCount) {
+        output_times.push_back(std::chrono::steady_clock::now());
+        output_display_times.push_back(end->displayTime);
+    }
     if(fsr_queue_slow && ends.load() == 5) std::this_thread::sleep_for(std::chrono::milliseconds(25));
     ++ends;
     if (!end->layerCount) { ++empty_submissions; return XR_SUCCESS; }
@@ -231,11 +236,9 @@ XrResult XRAPI_CALL fake_end(XrSession,const XrFrameEndInfo* end) {
         ++promotion_gate_count;
         hr(session_state->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&promotion_gate)),"promotion fence");
         auto* endpoint_queue=session_state->d3d12_synthesis_queue.Get();
-#ifdef OFXR_DJULES_COMPARISON
         // Staging already contains B. Its remaining operation is the handover
         // copy on the binding queue; block that actual endpoint dependency.
-        if(djules_native_scheduler(*session_state)) endpoint_queue=runtime_queue(*session_state);
-#endif
+        if(advanced_native_outputs(*session_state)) endpoint_queue=runtime_queue(*session_state);
         hr(endpoint_queue->Wait(promotion_gate.Get(),1),"delay final endpoint dependency");
         promotion_unblock=std::jthread([] {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -275,6 +278,10 @@ void release(const std::shared_ptr<SwapchainState>& c, bool poison = true) {
 }
 
 int main(int argc,char** argv) {
+    struct RestoreRoute {
+        std::optional<xrfg::embedded::Settings> previous;
+        ~RestoreRoute() { if(previous) static_cast<void>(xrfg::embedded::request(*previous)); }
+    } restore_route;
     RamTimingFixture capture(argc>1 && (std::string_view(argv[1])=="ram" || std::string_view(argv[1]).starts_with("gap-")));
     ComPtr<ID3D12Fence> blocked_synthesis, policy_gate;
     std::jthread policy_unblock;
@@ -285,8 +292,8 @@ int main(int argc,char** argv) {
         auto dispatch=std::make_shared<Dispatch>(); session_state=std::make_shared<SessionState>(dispatch);
         auto& s=session_state;s->handle=reinterpret_cast<XrSession>(0x211);s->graphics_binding=SessionGraphicsBinding::d3d12;
         s->optical_flow_backend=xrfg::D3D12OpticalFlowBackend::nvidia;
-        s->nvidia_new_route = true;
-#ifdef OFXR_DJULES_COMPARISON
+        s->nvidia_new_route = true; s->djules_route=kTestDjules;
+#ifdef OFXR_TEST_DJULES_ROUTE
         deep_readiness=argc>1 && std::string_view(argv[1])=="deep-readiness";
         deep_switch=argc>1 && std::string_view(argv[1])=="deep-switch";
         deep_readiness=deep_readiness || deep_switch;
@@ -333,7 +340,7 @@ int main(int argc,char** argv) {
         D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
         hr(s->d3d12_device->CreateCommandQueue(&q,IID_PPV_ARGS(&s->d3d12_queue)),"application queue");
         hr(s->d3d12_device->CreateCommandQueue(&q,IID_PPV_ARGS(&s->d3d12_synthesis_queue)),"synthesis queue");
-#ifdef OFXR_DJULES_COMPARISON
+#ifdef OFXR_TEST_DJULES_ROUTE
         if(deep_readiness||triple_core) {
             dispatch->steamvr_runtime=true;
             hr(s->d3d12_device->CreateCommandQueue(&q,IID_PPV_ARGS(&s->binding_queue)),"DJ runtime binding queue");
@@ -355,6 +362,27 @@ int main(int argc,char** argv) {
         auto right=array?left:source(0x202,1,true);if(!array)chains.push_back(right);
         auto dynamic=source(0x203,2,false);auto fixed=source(0x204,2,false,true);
         chains.push_back(dynamic);chains.push_back(fixed);
+        if(argc>1 && std::string_view(argv[1])=="route-shapes") {
+            restore_route.previous=xrfg::embedded::snapshot().desired;
+            fill(left->enumerated_d3d12_images[0].Get(),42,80);
+            release(left);
+            const auto history=left->d3d12_history;
+            const auto capture=left->last_released_capture;
+            require(capture.has_value(),"owned capture before route change");
+            for(const int route:{1,3,2,1,3,2}) {
+                auto desired=*restore_route.previous;
+                desired.enabled=true;desired.backend=route;desired.frame_generation=0;
+                require(xrfg::embedded::request(desired),"GPU route request");
+                apply_embedded_control(s);
+                require(!s->control_reconfigure_required && s->menu_enabled,"GPU route reconfiguration");
+                require(left->d3d12_history==history && left->last_released_capture.has_value(),"route replaced source ownership");
+                for(const auto& chain:{left,right}) {
+                    const auto generation=chain->frame_generation;
+                    require(generation && generation->staged_outputs==(route>=2),"stale private output shape");
+                    for(const auto& image:generation->synthetic)synthetic_handles.insert(image.handle);
+                }
+            }
+        }
         ComPtr<ID3D12Resource> depth, motion;
         if(fsr_test && !fsr_missing) {
             depth=resource(1,false,D3D12_HEAP_TYPE_DEFAULT,0,D3D12_RESOURCE_STATE_RENDER_TARGET,DXGI_FORMAT_R32_FLOAT);
@@ -378,7 +406,7 @@ int main(int argc,char** argv) {
             require(s->three_slot_director && s->synthesis_thread.joinable(),"native did not enter three lanes");
         }
         for(unsigned n=1;n<=8;++n) {
-#ifdef OFXR_DJULES_COMPARISON
+#ifdef OFXR_TEST_DJULES_ROUTE
             if(triple_switch && (n==5 || n==7))
                 require(XR_SUCCEEDED(switch_djules_pipeline(s,n==7,false)),"live GPU multiplier switch");
             if(deep_switch && (n==5 || n==7)) {
@@ -597,7 +625,7 @@ int main(int argc,char** argv) {
             require(output_times.size()==submissions.size(), "midpoint runtime receipts");
             for(unsigned i=1;i<submissions.size();++i)
                 if(submissions[i-1].second && !submissions[i].second)
-#ifdef OFXR_DJULES_COMPARISON
+#ifdef OFXR_TEST_DJULES_ROUTE
                     // This fixture's native runtime is neither SteamVR nor VD:
                     // final D26 uses its wait plus a half-period floor (8.33/2).
                     require(output_times[i]-output_times[i-1]>=std::chrono::milliseconds(4),
@@ -611,8 +639,18 @@ int main(int argc,char** argv) {
             "FSR consumer CPU-waited before entering XR with pending GPU work");
         if(fsr_queue || legacy_queue) {
             require(waits == expected_cycles && output_times.size() == expected_count, "FSR repeated or lost output");
-            for(unsigned i=1;i<output_times.size();++i)
-                require(output_times[i]-output_times[i-1] >= std::chrono::milliseconds(6), "FSR bunched output slots");
+            require(output_display_times.size()==expected_count, "missing runtime output slot receipt");
+            for(unsigned i=1;i<output_times.size();++i) {
+                require(output_display_times[i]-output_display_times[i-1]==8333333,
+                    "output skipped or reused a physical runtime slot");
+                // FSR reanchors after a long End. Reference NVIDIA deliberately
+                // keeps its grid through normal wake/End lateness; the fake
+                // runtime's synchronous pixel readbacks must not impose an
+                // unrelated minimum wall-time gap. Its exact lateness/starvation
+                // contract is checked deterministically by TwoOutputSchedule.
+                if(fsr_queue)
+                    require(output_times[i]-output_times[i-1] >= std::chrono::milliseconds(6), "FSR bunched output slots");
+            }
         }
         if(fsr_test) {const auto stats=xrfg::fsr_frame_generation_statistics();
             require(fsr_missing ? stats.attempts==0 : stats.used==7 && stats.failures==0,"FSR dispatch count/failed");}

@@ -8,7 +8,7 @@ bool layer_active() noexcept;
 // CPU-only interface: no NGX/FFX structures cross the host/backend ABI boundary.
 struct Settings {
     bool enabled{true};
-    int backend{}; // 0 FidelityFX, 1 NVIDIA legacy, 2 NVIDIA three-slot director
+    int backend{}; // 0 FidelityFX, 1 NVIDIA legacy, 2 NVIDIA new, 3 NVIDIA djules
     int preset{1}; // 0 slow, 1 medium, 2 fast
     int scale{2}; // 0 full, 1 three-quarter, 2 half
     bool backward{};
@@ -95,5 +95,6 @@ struct DjulesPipelineSnapshot {
 };
 DjulesPipelineSnapshot djules_pipeline_snapshot();
 bool set_djules_prefer_fps(bool enabled);
-void register_djules_pipeline(std::uint64_t id, bool prefer_fps);
+bool set_djules_triple_frame_gen(bool enabled);
+void register_djules_pipeline(std::uint64_t id, bool prefer_fps, bool triple = false);
 }

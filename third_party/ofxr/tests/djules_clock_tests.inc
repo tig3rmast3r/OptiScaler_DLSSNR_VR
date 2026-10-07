@@ -1,4 +1,4 @@
-#ifdef OFXR_DJULES_COMPARISON
+#ifdef OFXR_TEST_DJULES_ROUTE
 void djules_phase_acquisition_test() {
     using namespace std::chrono;
     const auto period = nanoseconds(11'111'111);
@@ -57,7 +57,7 @@ void djules_absolute_grid_test() {
 }
 
 void djules_triple_buffer_test() {
-    xrfg::DjulesOutputBuffer<int> buffer; buffer.configure(3);
+    xrfg::ThreeSlotBuffer<int> buffer; buffer.configure(3);
     check(buffer.capacity()==4 && buffer.push_real(1),"3X prime capacity");
     for(int i=0;i<3;++i) check(buffer.shift_empty(),"3X prime shift");
     check(buffer.slot(0)->value==1 && !buffer.releasable(),"3X lost retained endpoint");
@@ -88,7 +88,7 @@ void djules_readiness_test() {
 
 void djules_inline_policy_test() {
     auto s = session();
-    s->menu_enabled = true; s->nvidia_new_route = true; s->luke_afw_enabled = false;
+    s->menu_enabled = true; s->nvidia_new_route = true; s->djules_route=kTestDjules; s->luke_afw_enabled = false;
     s->graphics_binding = SessionGraphicsBinding::d3d12;
     s->frame_generation_mode = xrfg::D3D12FrameGenerationMode::ofxr;
     s->optical_flow_backend = xrfg::D3D12OpticalFlowBackend::nvidia;
@@ -106,7 +106,7 @@ void djules_inline_policy_test() {
     s->pipelined_presenter_mode = false;
     s->nvidia_new_route = false;
     check(!djules_inline_runtime(*s), "reference inherited optional inline runtime policy");
-    s->nvidia_new_route = true; s->luke_afw_enabled = true;
+    s->nvidia_new_route = true; s->djules_route=kTestDjules; s->luke_afw_enabled = true;
     check(!djules_inline_runtime(*s) && three_slot_generation_session(s), "AFW lost accepted director");
     std::cout << "DJ VD/Pimax: fixed inline shape, genuine pipeline override, reference/AFW guards\n";
 }
@@ -117,7 +117,7 @@ void djules_display_clock_test() {
     s->graphics_binding = SessionGraphicsBinding::d3d12;
     s->frame_generation_mode = xrfg::D3D12FrameGenerationMode::ofxr;
     s->optical_flow_backend = xrfg::D3D12OpticalFlowBackend::nvidia;
-    s->nvidia_new_route = true;
+    s->nvidia_new_route = true; s->djules_route=kTestDjules;
     s->luke_afw_enabled = false;
     s->dispatch->steamvr_runtime = true;
     s->presenter_display_period = 27'777'778;
@@ -132,7 +132,7 @@ void djules_display_clock_test() {
     check(!adopt_djules_display_period(*s, std::nullopt), "missing compositor period accepted");
     s->nvidia_new_route = false;
     check(!adopt_djules_display_period(*s, std::chrono::nanoseconds(8'333'333)), "legacy route adopted optional clock");
-    s->nvidia_new_route = true;
+    s->nvidia_new_route = true; s->djules_route=kTestDjules;
     s->luke_afw_enabled = true;
     check(!adopt_djules_display_period(*s, std::chrono::nanoseconds(8'333'333)), "AFW pair changed clock policy");
     s->luke_afw_enabled = false;

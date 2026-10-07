@@ -1,16 +1,17 @@
 // Compile the actual layer implementation into this test: no test-only switch
 // or alternate director implementation is added to the distributed DLL.
-#ifdef OFXR_DJULES_COMPARISON
-#include "../variants/djules/openxr_layer.cpp"
-#else
 #include "../src/layer/openxr_layer.cpp"
-#endif
 #include <iostream>
 #include <stdexcept>
 #include <fstream>
 #include "ram_timing_fixture.hpp"
 
 namespace {
+#ifdef OFXR_TEST_DJULES_ROUTE
+constexpr bool kTestDjules=true;
+#else
+constexpr bool kTestDjules=false;
+#endif
 std::mutex test_mutex;
 std::vector<std::pair<unsigned, bool>> presented;
 std::atomic<unsigned> waits{}, begins{}, ends{};
@@ -167,7 +168,7 @@ std::shared_ptr<SessionState> session() {
     state->handle = reinterpret_cast<XrSession>(0x207);
     state->graphics_binding = SessionGraphicsBinding::d3d11;
     state->optical_flow_backend = xrfg::D3D12OpticalFlowBackend::nvidia;
-    state->nvidia_new_route = true;
+    state->nvidia_new_route = true; state->djules_route=kTestDjules;
     state->presenter_active = true;
     state->three_slot_director = true;
     state->presenter_frame_state_valid = true;
@@ -240,8 +241,9 @@ void pipelined_route_handoff_test(bool steamvr = false) {
         check(XR_SUCCEEDED(layer_begin_frame_impl(state->handle, nullptr)), "initial virtual Begin");
         // Every change occurs after the *next* virtual Wait has already returned
         // on another thread. A stop-only switch passes End yet strands that Begin.
-        for (const auto target : std::array<std::pair<int,int>, 8>{{
-                {1,0}, {2,0}, {0,0}, {-1,0}, {1,0}, {0,1}, {1,0}, {0,1}}}) {
+        for (const auto target : std::array<std::pair<int,int>, 12>{{
+                {1,0}, {2,0}, {3,0}, {2,0}, {3,0}, {1,0},
+                {0,0}, {-1,0}, {1,0}, {0,1}, {1,0}, {0,1}}}) {
             XrFrameState next{XR_TYPE_FRAME_STATE};
             XrResult wait_result = XR_ERROR_RUNTIME_FAILURE;
             std::thread application_wait([&] {
@@ -261,6 +263,8 @@ void pipelined_route_handoff_test(bool steamvr = false) {
             check(continuous_presenter_active(state), "virtual tickets lost their physical owner");
             check(state->fsr_two_slot_presenter == fsr_two_slot_session(state), "FSR owner mismatch");
             check(state->queued_nvidia_presenter == queued_nvidia_session(state), "NVIDIA owner mismatch");
+            check(state->djules_route == (target.first == 3), "DJ route was not physically selected");
+            check(state->nvidia_new_route == (target.first >= 2), "advanced route selection mismatch");
             prediction = next;
         }
         XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
@@ -268,7 +272,7 @@ void pipelined_route_handoff_test(bool steamvr = false) {
         end.displayTime = prediction.predictedDisplayTime;
         check(XR_SUCCEEDED(layer_end_frame_impl(state->handle, &end)), "last virtual End");
         stop_continuous_presenter(state);
-        check(order_errors == 0 && physical_waits > 8 &&
+        check(order_errors == 0 && physical_waits > 12 &&
               physical_waits == physical_begins && physical_begins == physical_ends &&
               !physical_waited && !physical_begun, "physical Wait/Begin/End journal imbalance");
     } catch (...) {
@@ -279,7 +283,58 @@ void pipelined_route_handoff_test(bool steamvr = false) {
     }
     check(xrfg::embedded::request(original), "restore handoff fixture configuration");
     { std::scoped_lock lock(g_state_mutex); g_sessions.erase(state->handle); }
-    std::cout << "Eight live route changes preserve outstanding virtual tickets and balanced physical cycles\n";
+    std::cout << "Twelve live route changes preserve outstanding virtual tickets and balanced physical cycles\n";
+}
+
+void unified_route_policy_test() {
+    const auto ini = current_layer_directory() / L"ofxr_bridge.ini";
+    wchar_t old_deep[64]{}, old_triple[64]{};
+    GetPrivateProfileStringW(L"ofxr", L"deep_pipeline", L"absent", old_deep, 64, ini.c_str());
+    GetPrivateProfileStringW(L"ofxr", L"triple_frame_gen", L"absent", old_triple, 64, ini.c_str());
+    const auto original = xrfg::embedded::snapshot().desired;
+    auto live = std::make_shared<SessionState>(std::make_shared<Dispatch>());
+    live->graphics_binding = SessionGraphicsBinding::d3d12;
+    live->dispatch->steamvr_runtime = true;
+    live->dispatch->inline_unless_pipelined = true;
+    live->three_slot_director = true;
+    live->djules_pipeline_switchable = true;
+    const auto restore = [&] {
+        static_cast<void>(xrfg::embedded::request(original));
+        WritePrivateProfileStringW(L"ofxr", L"deep_pipeline", std::wcscmp(old_deep,L"absent") ? old_deep : nullptr, ini.c_str());
+        WritePrivateProfileStringW(L"ofxr", L"triple_frame_gen", std::wcscmp(old_triple,L"absent") ? old_triple : nullptr, ini.c_str());
+    };
+    try {
+        check(xrfg::embedded::set_djules_triple_frame_gen(true), "request 3X from embedded menu producer");
+        check(xrfg::embedded::set_djules_prefer_fps(true), "save deep policy");
+        for (const int route : {3,2,1,2,3}) {
+            auto desired = original;
+            desired.enabled = true; desired.backend = route; desired.frame_generation = 0;
+            check(xrfg::embedded::request(desired), "request actual runtime route");
+            apply_embedded_control(live);
+            live->djules_pipeline_poll = {};
+            check(XR_SUCCEEDED(poll_djules_pipeline(live)), "first policy observation");
+            live->djules_pipeline_poll = {};
+            check(XR_SUCCEEDED(poll_djules_pipeline(live)), "second policy observation");
+            check(live->djules_route == (route==3), "route did not select DJ runtime policy");
+            check(djules_triple_active(*live) == (route==3), "3X leaked outside DJ");
+            check(djules_inline_runtime(*live) == (route==3), "inline pacing leaked outside DJ");
+            check(live->three_slots.capacity() == (route==3 ? 4U : 3U), "wrong physical output shape");
+            check(live->nvidia_options.pose_compensated_input == (route>=2), "non-pacing input fix missing or on reference");
+            live->presenter_display_period = 2'000'000;
+            check(adopt_djules_display_period(*live,std::chrono::nanoseconds(8'333'333)) == (route==3), "DJ clock leaked outside route");
+        }
+        auto desired = original; desired.enabled=true; desired.backend=3; desired.frame_generation=1;
+        check(xrfg::embedded::request(desired), "request FSR with saved DJ flags");
+        apply_embedded_control(live);
+        check(!djules_triple_active(*live) && !djules_inline_runtime(*live), "FSR inherited DJ policy");
+        desired.frame_generation=0;
+        check(xrfg::embedded::request(desired), "return to DJ");
+        apply_embedded_control(live);
+        live->luke_afw_enabled=true;
+        check(!djules_triple_active(*live) && !djules_deep_active(*live), "Luke AFW inherited DJ policy");
+    } catch (...) { restore(); throw; }
+    restore();
+    std::cout << "One runtime selects all three routes; saved 3X/deep/clock/inline policy stays DJ-only\n";
 }
 
 void djules_pipeline_preference_test() {
@@ -319,10 +374,10 @@ void djules_pipeline_preference_test() {
         const auto after = xrfg::embedded::snapshot();
         check(after.revision == before.revision && after.desired == before.desired,
               "preference click reconfigured the active renderer");
-#ifdef OFXR_DJULES_COMPARISON
+#ifdef OFXR_TEST_DJULES_ROUTE
         auto live = std::make_shared<SessionState>(std::make_shared<Dispatch>());
         live->graphics_binding = SessionGraphicsBinding::d3d12;
-        live->nvidia_new_route = true;
+        live->nvidia_new_route = true; live->djules_route=kTestDjules;
         live->optical_flow_backend = xrfg::D3D12OpticalFlowBackend::nvidia;
         live->frame_generation_mode = xrfg::D3D12FrameGenerationMode::ofxr;
         live->djules_pipeline_switchable = true;
@@ -340,7 +395,7 @@ void djules_pipeline_preference_test() {
         check(xrfg::embedded::set_djules_prefer_fps(false), "request shallow outside DJ");
         poll(); poll();
         check(live->djules_deep_pipeline && live->djules_configuration_epoch == 1, "reference applied DJ policy");
-        live->nvidia_new_route = true;
+        live->nvidia_new_route = true; live->djules_route=kTestDjules;
         poll(); poll();
         check(!live->djules_deep_pipeline && live->djules_configuration_epoch == 2, "return to DJ did not apply preference");
         check(WritePrivateProfileStringW(L"ofxr", L"triple_frame_gen", L"1", ini.c_str()), "request live 3X");
@@ -1722,11 +1777,11 @@ void refused_frame_recovery_test() {
 #include "djules_clock_tests.inc"
 
 int main(int argc, char** argv) {
-#ifdef OFXR_DJULES_COMPARISON
+#ifdef OFXR_TEST_DJULES_ROUTE
     {
         auto timing=std::make_shared<SessionState>(std::make_shared<Dispatch>());
         timing->graphics_binding=SessionGraphicsBinding::d3d12;
-        timing->nvidia_new_route=true; timing->menu_enabled=true;
+        timing->nvidia_new_route=true; timing->djules_route=kTestDjules; timing->menu_enabled=true;
         timing->optical_flow_backend=xrfg::D3D12OpticalFlowBackend::nvidia;
         timing->frame_generation_mode=xrfg::D3D12FrameGenerationMode::ofxr;
         timing->minimum_runtime_display_period=10;
@@ -1739,7 +1794,7 @@ int main(int argc, char** argv) {
         check(std::abs(synthetic_interpolation_fraction(timing,a,b)-1.0F/3.0F)<0.0001F,"invalid cadence fallback");
         timing->nvidia_new_route=false;
         check(synthetic_interpolation_fraction(timing,a,b)==0.5F,"reference fraction changed");
-        timing->nvidia_new_route=true; timing->three_slot_director=true;
+        timing->nvidia_new_route=true; timing->djules_route=kTestDjules; timing->three_slot_director=true;
         check(XR_SUCCEEDED(switch_djules_pipeline(timing,false,false)),"switch 2X");
         check(!timing->djules_triple_requested && timing->three_slots.empty(),"2X shape reset");
         check(XR_SUCCEEDED(switch_djules_pipeline(timing,true,true)),"switch 3X");
@@ -1770,7 +1825,7 @@ int main(int argc, char** argv) {
         check(three_slot_generation_session(state), "Nvidia (new) must select director");
         state->nvidia_new_route = false;
         check(!three_slot_generation_session(state), "Nvidia legacy must exclude director");
-        state->nvidia_new_route = true;
+        state->nvidia_new_route = true; state->djules_route=kTestDjules;
         state->frame_generation_mode = xrfg::D3D12FrameGenerationMode::fsr3;
         check(!three_slot_generation_session(state), "FSR must remain inline");
         state->frame_generation_mode = xrfg::D3D12FrameGenerationMode::ofxr;
@@ -1784,15 +1839,16 @@ int main(int argc, char** argv) {
         check(!three_slot_generation_session(state), "Luke legacy must stay inline");
         check(!queued_nvidia_session(state),
               "Luke AFW must not enter the NVIDIA queued presenter");
-        state->nvidia_new_route = true;
+        state->nvidia_new_route = true; state->djules_route=kTestDjules;
         state->luke_afw_enabled = false;
         if (argc > 1) {
             const auto mode = std::string_view(argv[1]);
             if (mode == "route-handoff") { pipelined_route_handoff_test(); return 0; }
             if (mode == "route-handoff-steamvr") { pipelined_route_handoff_test(true); return 0; }
             if (mode == "pipeline-preference") { djules_pipeline_preference_test(); return 0; }
+            if (mode == "unified-routes") { unified_route_policy_test(); return 0; }
             if (mode == "vulkan-contract") { vulkan_bridge_contract_test(); return 0; }
-#ifdef OFXR_DJULES_COMPARISON
+#ifdef OFXR_TEST_DJULES_ROUTE
             if (mode == "binding-queue") { djules_binding_queue_test(); return 0; }
             if (mode == "display-clock") { djules_display_clock_test(); return 0; }
             if (mode == "absolute-grid") { djules_absolute_grid_test(); return 0; }
@@ -1831,7 +1887,7 @@ int main(int argc, char** argv) {
             check(xrfg::embedded::request(choice), "request Nvidia legacy");
             apply_embedded_control(selected);
             check(!three_slot_generation_session(selected), "legacy menu revision applied");
-            choice.backend = 2;
+            choice.backend = kTestDjules ? 3 : 2;
             check(xrfg::embedded::request(choice), "request Nvidia new");
             apply_embedded_control(selected);
             check(three_slot_generation_session(selected), "new menu revision applied");

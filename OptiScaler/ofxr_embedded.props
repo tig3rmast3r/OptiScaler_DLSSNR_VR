@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <PropertyGroup><OptiScalerEmbeddedRoute Condition="'$(OptiScalerEmbeddedRoute)'==''">standard</OptiScalerEmbeddedRoute></PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <Link>
       <GenerateMapFile>true</GenerateMapFile>
@@ -11,12 +10,7 @@
     <PostBuildEvent><Command></Command></PostBuildEvent>
     <PreBuildEvent><Command></Command></PreBuildEvent>
   </ItemDefinitionGroup>
-  <ItemGroup Condition="'$(Configuration)|$(Platform)|$(OptiScalerEmbeddedRoute)'=='Release|x64|djules'">
-    <ClCompile Update="menu\menu_common.cpp">
-      <PreprocessorDefinitions>OFXR_DJULES_COMPARISON=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-    </ClCompile>
-  </ItemGroup>
   <Target Name="BuildEmbeddedOfxr" BeforeTargets="PrepareForBuild" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)build_ofxr.ps1&quot; -ComparisonRoute $(OptiScalerEmbeddedRoute)" />
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)build_ofxr.ps1&quot;" />
   </Target>
 </Project>

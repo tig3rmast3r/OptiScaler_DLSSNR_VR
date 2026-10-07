@@ -4124,7 +4124,7 @@ void test_srgb_synthesis_preserves_brightness(
 }
 
 
-#ifdef OFXR_DJULES_COMPARISON
+#ifdef OFXR_TEST_DJULES_ROUTE
 void test_djules_extra_output(D3D12WarpFixture& fixture) {
     constexpr UINT width=256,height=128;
     auto a=create_source_texture(fixture,width,height,DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -4195,7 +4195,7 @@ int main(int argc, char** argv) {
         xrfg::bridge_flight_logger().initialize(trace_dir);
     }
     try {
-#ifdef OFXR_DJULES_COMPARISON
+#ifdef OFXR_TEST_DJULES_ROUTE
         if (argc>1 && std::string_view(argv[1])=="djules-extra") {
             D3D12WarpFixture fixture; test_djules_extra_output(fixture); return 0;
         }
