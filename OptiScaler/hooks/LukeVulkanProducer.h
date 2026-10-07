@@ -8,7 +8,30 @@
 
 namespace luke_vulkan {
 // Native device identity is known before Luke creates its XR session. Allocate
-// the ONE producer pair on first request, not at the later DLSS feature init.
+// the ONE XR owner pair on first request, not at the later DLSS feature init.
+// Native capture shares its device, NOT its queue: capture can enqueue a wait
+// for a Vulkan submission which the producer thread has not submitted yet.
+inline HRESULT create_capture_queue(ID3D12Device* owner,
+    ID3D12CommandQueue* xrQueue, ID3D12CommandQueue** captureQueue) {
+    if (!captureQueue) return E_POINTER;
+    *captureQueue = nullptr;
+    if (!owner || !xrQueue) return E_POINTER;
+    auto description = xrQueue->GetDesc();
+    if (description.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return E_INVALIDARG;
+    Microsoft::WRL::ComPtr<ID3D12Device> queueOwner;
+    auto result = xrQueue->GetDevice(IID_PPV_ARGS(&queueOwner));
+    Microsoft::WRL::ComPtr<IUnknown> ownerIdentity, queueIdentity;
+    if (SUCCEEDED(result)) result = owner->QueryInterface(IID_PPV_ARGS(&ownerIdentity));
+    if (SUCCEEDED(result)) result = queueOwner->QueryInterface(IID_PPV_ARGS(&queueIdentity));
+    if (FAILED(result)) return result;
+    if (ownerIdentity.Get() != queueIdentity.Get()) return E_INVALIDARG;
+    description.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    description.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    result = owner->CreateCommandQueue(&description, IID_PPV_ARGS(captureQueue));
+    if (SUCCEEDED(result)) (*captureQueue)->SetName(L"Luke Vulkan Native Capture Queue");
+    return result;
+}
+
 class Producer {
     struct Device { LUID luid{}; unsigned node{}; bool valid{}; };
     std::mutex mutex;

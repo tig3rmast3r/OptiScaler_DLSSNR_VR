@@ -150,17 +150,44 @@ inline void luke_origin_pixel(std::byte* pixel, DXGI_FORMAT format, bool white) 
     }
 }
 inline float luke_origin_luma(const std::byte* pixel, DXGI_FORMAT format) noexcept {
+    // Decode all color channels in the stored/encoded domain. Closed color
+    // processing can erase blue-only Manchester contrast while RGB retains it.
+    // Ignore alpha; keep the existing marker, decoder thresholds and CRC.
+    const auto luminance = [](float red, float green, float blue) {
+        return .2126f * red + .7152f * green + .0722f * blue;
+    };
     if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-        std::uint16_t bits{}; std::memcpy(&bits, pixel, sizeof(bits));
-        const int exponent = (bits >> 10) & 31; const unsigned mantissa = bits & 1023;
-        if (exponent == 31) return NAN;
-        const float value = exponent ? std::ldexp(1.f + mantissa / 1024.f, exponent - 15)
-            : std::ldexp(static_cast<float>(mantissa), -24);
-        return bits & 0x8000 ? -value : value;
+        std::uint16_t channels[4]{}; std::memcpy(channels, pixel, sizeof(channels));
+        const auto half = [](std::uint16_t bits) {
+            const int exponent = (bits >> 10) & 31; const unsigned mantissa = bits & 1023;
+            if (exponent == 31) return static_cast<float>(NAN);
+            const float value = exponent ? std::ldexp(1.f + mantissa / 1024.f, exponent - 15)
+                : std::ldexp(static_cast<float>(mantissa), -24);
+            return bits & 0x8000 ? -value : value;
+        };
+        return luminance(half(channels[0]), half(channels[1]), half(channels[2]));
     }
-    if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) { float value{}; std::memcpy(&value, pixel, sizeof(value)); return value; }
-    if (format == DXGI_FORMAT_R10G10B10A2_UNORM) { std::uint32_t value{}; std::memcpy(&value, pixel, sizeof(value)); return (value & 1023) / 1023.f; }
-    return std::to_integer<unsigned char>(*pixel) / 255.f;
+    if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+        float channels[4]{}; std::memcpy(channels, pixel, sizeof(channels));
+        return luminance(channels[0], channels[1], channels[2]);
+    }
+    if (format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+        std::uint32_t value{}; std::memcpy(&value, pixel, sizeof(value));
+        return luminance((value & 1023) / 1023.f,
+            ((value >> 10) & 1023) / 1023.f, ((value >> 20) & 1023) / 1023.f);
+    }
+    const auto channel = [&](unsigned index) {
+        return std::to_integer<unsigned char>(pixel[index]) / 255.f;
+    };
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return luminance(channel(0), channel(1), channel(2));
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return luminance(channel(2), channel(1), channel(0));
+    default: return NAN;
+    }
 }
 struct LukeColorOriginRect { unsigned x{}, y{}, width{}, height{}; };
 inline constexpr unsigned kLukeOriginHeight = 8;

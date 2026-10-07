@@ -8,6 +8,7 @@
 #include <NVNGX_Parameter.h>
 #include <ofxr/ofxr_bridge_client.hpp>
 #include <hooks/LukeCaptureParameters.h>
+#include <hooks/LukeVulkanProducer.h>
 
 #include <proxies/DXGI_Proxy.h>
 #include <proxies/D3D12_Proxy.h>
@@ -20,26 +21,6 @@
 #include <magic_enum.hpp>
 #include <detours/detours.h>
 #include <imgui/ImGuiNotify.hpp>
-
-// Diagnostic only: inspect the native NGX call, not Streamline's earlier
-// declaration. Never retain the borrowed pointer or change capture metadata.
-static void LogNativeMotionHistory(const NVSDK_NGX_Parameter* parameters, uint64_t frame)
-{
-    if (frame >= 2 && frame % 240 != 0) return;
-    void* borrowed = nullptr;
-    const auto status = parameters->Get(NVSDK_NGX_Parameter_DLSS_CLIP_TO_PREV_CLIP_MATRIX, &borrowed);
-    float matrix[16] {};
-    SIZE_T copied = 0;
-    bool valid = status == NVSDK_NGX_Result_Success && borrowed &&
-        ReadProcessMemory(GetCurrentProcess(), borrowed, matrix, sizeof(matrix), &copied) &&
-        copied == sizeof(matrix);
-    if (valid) for (float value : matrix) valid = valid && std::isfinite(value) && std::abs(value) < 1e12F;
-    LOG_INFO("V30071 native NGX motion history frame={} status=0x{:X} present={} valid={}",
-        frame, static_cast<unsigned>(status), borrowed != nullptr, valid);
-    if (valid) for (unsigned row = 0; row < 4; ++row)
-        LOG_INFO("V30071 native NGX ClipToPrevClip row={} values={},{},{},{}", row,
-            matrix[row*4], matrix[row*4+1], matrix[row*4+2], matrix[row*4+3]);
-}
 
 // Used Nukem's VKToDX as a base
 // https://github.com/Nukem9/dlssg-to-fsr3/blob/eca4a79b4d23339a1dcf02e30b9f3bafe7901513/source/maindll/FFFrameInterpolatorVKToDX.cpp
@@ -998,13 +979,8 @@ static bool NvVkResourceNotValid(NVSDK_NGX_Resource_VK* param)
            param->Resource.ImageViewInfo.Height == 0;
 }
 
-bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NVSDK_NGX_Parameter* InParameters)
+bool IFeature_VkwDx12::ResolveCommandQueueFamily(VkCommandBuffer InCmdList)
 {
-    LOG_FUNC();
-
-    auto frame = _frameCount % VKDX12_BUFFER_COUNT;
-    LOG_DEBUG("frame: {}", frame);
-
     auto queueFamilyOpt = Vulkan_wDx12::cmdBufferStateTracker.GetCommandBufferQueueFamily(InCmdList);
 
     if (queueFamilyOpt.has_value())
@@ -1034,10 +1010,42 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
                  ActiveQueueFamilyIndex);
         if (CapturesCompletedOutput()) return false;
     }
+    return true;
+}
+
+bool IFeature_VkwDx12::PrepareCaptureMotion(VkCommandBuffer command, NVSDK_NGX_Resource_VK* original)
+{
+    FrozenMotion.reset();
+    if (!CapturesCompletedOutput() || !IsInited() || NvVkResourceNotValid(original) ||
+        !ResolveCommandQueueFamily(command)) return false;
+
+    // Same slot/reallocation protection as the completed-color transport. The
+    // existing motion pass moves here; there is no second copy after NGX.
+    const auto frame=_frameCount % VKDX12_BUFFER_COUNT;
+    if (!WaitCaptureSlot(frame)) return false;
+    const auto& image=original->Resource.ImageViewInfo;
+    if (vkMv.VkSharedImage && (vkMv.Width!=image.Width || vkMv.Height!=image.Height || vkMv.Format!=image.Format))
+        for (unsigned slot=0; slot<VKDX12_BUFFER_COUNT; ++slot)
+            if (!WaitCaptureSlot(slot)) return false;
+    if (!VelocityCopy) VelocityCopy=std::make_unique<ResourceCopy_Vk>("VelocityCopy", VulkanDevice, VulkanPhysicalDevice);
+    if (!CopyTextureFromVkToDx12(command, original, &vkMv, VelocityCopy.get(), true, false)) return false;
+    vkMv.VkSourceImage=image.Image;
+    vkMv.VkSourceImageView=image.ImageView;
+    FrozenMotion.publish(command, _frameCount);
+    return true;
+}
+
+bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NVSDK_NGX_Parameter* InParameters)
+{
+    LOG_FUNC();
+    auto frame = _frameCount % VKDX12_BUFFER_COUNT;
+    if (CapturesCompletedOutput()) {
+        // A failed/missing early copy rejects this capture, never reads the
+        // original image late and never reuses a previous evaluation's pixels.
+        if (!FrozenMotion.matches(InCmdList, _frameCount)) return false;
+    } else if (!ResolveCommandQueueFamily(InCmdList)) return false;
 
     LOG_DEBUG("Upscaling command buffer: {:X}, frame: {}", (size_t) InCmdList, frame);
-
-    if (CapturesCompletedOutput() && !WaitCaptureSlot(frame)) return false;
 
     // Only wait if we're more than 1 frame behind (triple buffering protection)
     uint64_t lastFrameToWaitFor = (_frameCount > 1) ? (_frameCount - 1) : 0;
@@ -1070,7 +1078,7 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
     }
 
     NVSDK_NGX_Resource_VK* paramMv = nullptr;
-    if (InParameters->Get(NVSDK_NGX_Parameter_MotionVectors, (void**) &paramMv) != NVSDK_NGX_Result_Success ||
+    if (ResolveCaptureMotion(InParameters, &paramMv) != NVSDK_NGX_Result_Success ||
         NvVkResourceNotValid(paramMv))
     {
         LOG_ERROR("MotionVectors not exist!!");
@@ -1192,7 +1200,7 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
         }
     }
 
-    if (paramMv != nullptr)
+    if (!CapturesCompletedOutput() && paramMv != nullptr)
     {
         LOG_DEBUG("MotionVectors: {}x{}, format: {} ({})", paramMv->Resource.ImageViewInfo.Width,
                   paramMv->Resource.ImageViewInfo.Height, magic_enum::enum_name(paramMv->Resource.ImageViewInfo.Format),
@@ -1919,11 +1927,15 @@ HRESULT IFeature_VkwDx12::CreateDx12Device()
 
     if (CapturesCompletedOutput())
     {
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> xrQueue;
         result = ofxr_bridge::request_luke_vulkan_context(reinterpret_cast<std::uintptr_t>(VulkanDevice),
-            InteropDevice.ReleaseAndGetAddressOf(), &Dx12CommandQueue);
+            InteropDevice.ReleaseAndGetAddressOf(), xrQueue.GetAddressOf());
         if (FAILED(result)) return result;
-        LOG_INFO("V30068 native Vulkan capture reuses early LUID-matched owner={:p} queue={:p}",
-            static_cast<void*>(InteropDevice.Get()), static_cast<void*>(Dx12CommandQueue));
+        result = luke_vulkan::create_capture_queue(InteropDevice.Get(), xrQueue.Get(), &Dx12CommandQueue);
+        if (FAILED(result)) return result;
+        LOG_INFO("V30094 native Vulkan capture shares owner={:p}, private capture queue={:p}, XR queue={:p}",
+            static_cast<void*>(InteropDevice.Get()), static_cast<void*>(Dx12CommandQueue),
+            static_cast<void*>(xrQueue.Get()));
     }
     else if (State::Instance().currentD3D12Device == nullptr ||
         ((State::Instance().gameQuirks & GameQuirk::ForceCreateD3D12Device) && _localDx11on12Device == nullptr))
@@ -2246,7 +2258,6 @@ bool IFeature_VkwDx12::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter
         }
 
         if (CapturesCompletedOutput()) {
-            LogNativeMotionHistory(InParameters, _frameCount);
             NVNGX_Parameters captureParameters(API::DX12, false);
             luke_vulkan::copy_capture_metadata(*InParameters, captureParameters);
             captureParameters.Set(NVSDK_NGX_Parameter_Color, vkColor.Dx12Resource);

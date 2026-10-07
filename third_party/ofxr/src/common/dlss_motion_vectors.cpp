@@ -1040,6 +1040,7 @@ std::shared_ptr<const DlssMotionVectorSet> resolve_luke_alternating_guides(
         newer->previous_serial = newer->serial > 2 ? newer->serial - 2 : 0;
         older->previous_opposite_guide = previous2;
         newer->previous_opposite_guide = previous;
+        newer->previous_same_guide = previous2;
         auto result = std::make_shared<DlssMotionVectorSet>();
         result->eye_count = 2;
         result->eyes[0] = std::move(older);
@@ -1128,7 +1129,17 @@ std::shared_ptr<const DlssMotionVectorFrame> resolve_luke_guide_token(
         auto resolved = std::make_shared<DlssMotionVectorFrame>(*current);
         resolved->previous_serial = resolved->serial > 2 ? resolved->serial - 2 : 0;
         resolved->previous_opposite_guide = previous;
-
+        if (std::distance(stream.luke_origin_history.begin(), origin) >= 2) {
+            const auto& native_previous = *std::prev(origin, 2);
+            if (native_previous->stream == current->stream &&
+                native_previous->epoch == current->epoch &&
+                native_previous->serial + 2 == current->serial &&
+                native_previous->publication + 2 == current->publication) {
+                // Only its immutable CPU camera is used. Current and N-1
+                // snapshots already passed the GPU compatibility checks above.
+                resolved->previous_same_guide = native_previous;
+            }
+        }
         ++state.statistics.matched;
         return resolved;
     } catch (...) {

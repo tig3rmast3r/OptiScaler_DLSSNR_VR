@@ -154,10 +154,13 @@ struct DlssMotionVectorFrame {
     Microsoft::WRL::ComPtr<ID3D12Fence> producer_fence;
     Microsoft::WRL::ComPtr<ID3D12Device> producer_fence_device;
     std::uint64_t producer_fence_value{};
-    // Exact preceding opposite-eye publication, retained for identity and
-    // production-order unit calibration; never sample its raw motion field.
+    // Exact preceding opposite-eye publication; its owned motion field feeds
+    // stereo-depth consistency, independently of successful AFW color history.
     std::shared_ptr<const DlssMotionVectorFrame> previous_opposite_guide;
     std::optional<DlssNativeCameraHistory> previous_same_native_camera;
+    // Exact native N-2 same-eye camera. Resolver results retain plain producer
+    // frames, never recursive history chains; no additional GPU copy is needed.
+    std::shared_ptr<const DlssMotionVectorFrame> previous_same_guide;
     // Calibrated same-time eye separation in the producer camera units.
     float calibrated_game_eye_baseline{};
     std::shared_ptr<DlssSnapshotRetention> motion_retention;
@@ -239,7 +242,8 @@ std::shared_ptr<const DlssMotionVectorSet> resolve_luke_alternating_guides(
     ID3D12CommandQueue* consumer_queue) noexcept;
 // Resolves only the token recovered from Luke's actual source color, using the
 // immutable retained guide's full publication/stream/epoch metadata.
-// The returned frame pins its exact immediately preceding opposite-eye guide.
+// The returned frame pins its exact N-1 opposite-eye guide and, when retained,
+// its native N-2 same-eye camera independently of successful AFW evaluations.
 // Unknown, evicted, or reset-epoch keys never fall back to the newest guide.
 std::shared_ptr<const DlssMotionVectorFrame> resolve_luke_guide_token(
     std::uint32_t color_origin_token,

@@ -96,6 +96,7 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
     std::unique_ptr<ResourceCopy_Vk> ExpCopy = nullptr;
     std::unique_ptr<ResourceCopy_Vk> OutCopy = nullptr;
     std::unique_ptr<ResourceCopy_Vk> OutCopy2 = nullptr;
+    luke_vulkan::FrozenMotionReceipt FrozenMotion;
 
     // Vulkan function pointers for external memory
     PFN_vkGetMemoryWin32HandlePropertiesKHR vkGetMemoryWin32HandlePropertiesKHR = nullptr;
@@ -110,6 +111,7 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
                                  VK_TEXTURE2D_RESOURCE_C* OutResource, ResourceCopy_Vk* InCopyShader, bool InCopy,
                                  bool InDepth);
     bool ProcessVulkanTextures(VkCommandBuffer InCmdList, const NVSDK_NGX_Parameter* InParameters);
+    bool ResolveCommandQueueFamily(VkCommandBuffer command);
     bool CopyBackOutput();
 
     void ResourceBarrier(ID3D12GraphicsCommandList* InCommandList, ID3D12Resource* InResource,
@@ -136,6 +138,10 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
     // Native Vulkan capture reuses interop/sync, NOT the D3D12 SR pipeline.
     virtual IFeature* InteropFeature() { return dx12Feature.get(); }
     virtual bool CapturesCompletedOutput() const { return false; }
+    virtual NVSDK_NGX_Result ResolveCaptureMotion(const NVSDK_NGX_Parameter* parameters,
+        NVSDK_NGX_Resource_VK** resource) {
+        return parameters->Get(NVSDK_NGX_Parameter_MotionVectors, reinterpret_cast<void**>(resource));
+    }
     virtual bool InitInteropFeature(NVSDK_NGX_Parameter* parameters);
     virtual bool EvaluateInteropFeature(ID3D12GraphicsCommandList* list,
                                          NVSDK_NGX_Parameter* parameters);
@@ -143,6 +149,8 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
     ID3D12Device* InteropDeviceOwner() const { return InteropDevice.Get(); }
     void CaptureExternalOwnership(VkCommandBuffer list, bool release);
     bool WaitCaptureSlot(unsigned frame);
+    bool PrepareCaptureMotion(VkCommandBuffer command, NVSDK_NGX_Resource_VK* original);
+    void ClearCaptureMotion() { FrozenMotion.reset(); }
     void DrainCapture();
 
     // vk w/dx12 can't be wrapped by the IFeature_Vk, needs its own Init and Evaluate

@@ -31,7 +31,7 @@ namespace ofxr_bridge {
 
 void configure_dlss_guides(bool enabled) noexcept;
 void cache_streamline_camera(
-    std::uint32_t frame, std::uint32_t diagnostic_viewport,
+    std::uint32_t frame,
     const float* camera_view_to_clip,
     const float* camera_clip_to_view,
     const float* camera_position,

@@ -5357,6 +5357,149 @@ struct D3D12FrameSynthesizer::Impl {
         return S_OK;
     }
 
+    [[nodiscard]] HRESULT submit_copy(
+        const D3D12HistoryCaptureTicket& current,
+        std::span<const D3D12ReprojectionView> current_source_views,
+        std::uint32_t current_destination_index,
+        D3D12FrameSynthesisTicket* output_ticket) noexcept {
+        if (output_ticket == nullptr) {
+            return E_POINTER;
+        }
+        *output_ticket = {};
+        if (!synthesis_enabled || previous.active() || untracked_source.active() ||
+            current.serial == 0 || current.fence_value == 0 ||
+            !valid_view_layout(
+                current_source_views,
+                static_cast<UINT>(image_description.Width),
+                image_description.Height,
+                image_description.DepthOrArraySize) ||
+            current_destination_index >= current_destinations.size()) {
+            return E_INVALIDARG;
+        }
+        static_cast<void>(flush_pending_copy());
+        HRESULT result = submission_available();
+        if (FAILED(result)) {
+            return result;
+        }
+        result = destination_available(current_destinations[current_destination_index]);
+        if (FAILED(result)) {
+            return result;
+        }
+        std::uint32_t work_slot_index = 0;
+        result = acquire_work_slot(&work_slot_index);
+        if (FAILED(result)) {
+            return result;
+        }
+
+        RollingSource next{};
+        result = acquire_source(current, current_source_views, &next);
+        if (FAILED(result)) {
+            return result;
+        }
+        const auto cancel_next = [this, &next]() noexcept {
+            history->cancel_consumer(next.lease);
+            next.clear();
+        };
+        ID3D12Resource* const destination =
+            current_destinations[current_destination_index].resource.Get();
+        if (next.resource.Get() == destination) {
+            cancel_next();
+            return E_INVALIDARG;
+        }
+
+        // Transport owns only the ordinary copy list. In particular it does
+        // not reset/record the optical-flow pack, synthesis or deferred-copy
+        // lists, and its behavior cannot depend on the selected backend.
+        WorkSlot& slot = work_slots[work_slot_index];
+        slot.ram_gpu.harvest();
+        slot.ram_pair = false;
+        slot.timing_pending = false;
+        recording_uses_fsr_context = false;
+        result = slot.allocator->Reset();
+        if (SUCCEEDED(result)) {
+            result = slot.command_list->Reset(slot.allocator.Get(), nullptr);
+        }
+        if (FAILED(result)) {
+            synthesis_enabled = false;
+            cancel_next();
+            return result;
+        }
+        const std::array<D3D12_RESOURCE_BARRIER, 2> before_copy{
+            transition_barrier(next.resource.Get(),
+                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition_barrier(destination, release_state,
+                D3D12_RESOURCE_STATE_COPY_DEST),
+        };
+        slot.command_list->ResourceBarrier(
+            static_cast<UINT>(before_copy.size()), before_copy.data());
+        slot.command_list->CopyResource(destination, next.resource.Get());
+        const std::array<D3D12_RESOURCE_BARRIER, 2> after_copy{
+            transition_barrier(next.resource.Get(),
+                D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+            transition_barrier(destination, D3D12_RESOURCE_STATE_COPY_DEST,
+                release_state),
+        };
+        slot.command_list->ResourceBarrier(
+            static_cast<UINT>(after_copy.size()), after_copy.data());
+        result = slot.command_list->Close();
+        if (FAILED(result)) {
+            synthesis_enabled = false;
+            cancel_next();
+            return result;
+        }
+        if (next_fence_value == 0 ||
+            next_fence_value >= std::numeric_limits<std::uint64_t>::max() - 1U) {
+            synthesis_enabled = false;
+            cancel_next();
+            return E_FAIL;
+        }
+        result = queue->Wait(next.producer_fence.Get(), current.fence_value);
+        if (FAILED(result)) {
+            cancel_next();
+            return result;
+        }
+
+        ID3D12CommandList* lists[]{slot.command_list.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        two_frame_capture_submission(queue.Get(), 1, lists);
+        completion_unknown = true;
+        const std::uint64_t fence_value = next_fence_value++;
+        result = queue->Signal(fence.Get(), fence_value);
+        if (FAILED(result)) {
+            // GPU access was submitted: retain the lease rather than cancel
+            // it when no completion fence can prove that access retired.
+            synthesis_enabled = false;
+            untracked_source = std::move(next);
+            return result;
+        }
+        completion_unknown = false;
+        slot.fence_value = fence_value;
+        last_submitted_fence_value = fence_value;
+        last_synthetic_fence_value = fence_value;
+        current_destinations[current_destination_index].fence_value = fence_value;
+        next_work_slot = (work_slot_index + 1U) %
+            static_cast<std::uint32_t>(work_slots.size());
+        result = history->retire_consumer(next.lease, fence.Get(), fence_value);
+        if (FAILED(result)) {
+            // Submission exists; retain ownership on retirement failure too.
+            synthesis_enabled = false;
+            untracked_source = std::move(next);
+            return result;
+        }
+        next.clear();
+        fsr_stale_guide_gap = false;
+
+        output_ticket->previous_serial = 0;
+        output_ticket->current_serial = current.serial;
+        output_ticket->fence_value = fence_value;
+        output_ticket->synthetic_fence_value = fence_value;
+        output_ticket->work_slot = work_slot_index;
+        output_ticket->synthetic_destination_index =
+            std::numeric_limits<std::uint32_t>::max();
+        output_ticket->current_destination_index = current_destination_index;
+        return S_OK;
+    }
+
     [[nodiscard]] HRESULT submit_prime(
         const D3D12HistoryCaptureTicket& current,
         std::span<const D3D12ReprojectionView> current_source_views,
@@ -6031,6 +6174,29 @@ HRESULT D3D12FrameSynthesizer::reconfigure(D3D12OpticalFlowBackend backend,
         return S_OK;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
       catch (...) { return E_FAIL; }
+}
+
+HRESULT D3D12FrameSynthesizer::submit_copy(
+    const D3D12HistoryCaptureTicket& current,
+    std::span<const D3D12ReprojectionView> current_source_views,
+    std::uint32_t current_destination_index,
+    D3D12FrameSynthesisTicket* ticket) noexcept {
+    try {
+        std::scoped_lock lock(mutex_);
+        if (impl_ == nullptr) {
+            if (ticket != nullptr) {
+                *ticket = {};
+            }
+            return E_UNEXPECTED;
+        }
+        return impl_->submit_copy(current, current_source_views,
+            current_destination_index, ticket);
+    } catch (...) {
+        if (ticket != nullptr) {
+            *ticket = {};
+        }
+        return E_FAIL;
+    }
 }
 
 HRESULT D3D12FrameSynthesizer::submit_prime(

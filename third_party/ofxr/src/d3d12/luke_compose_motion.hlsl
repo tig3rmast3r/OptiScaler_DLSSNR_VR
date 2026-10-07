@@ -12,6 +12,7 @@ cbuffer Composition : register(b0)
     float2 Padding;
     column_major float4x4 ToOpposite;
     column_major float4x4 ToSame;
+    column_major float4x4 StereoInterval;
 };
 
 // Finite half sentinel excludes invalid flow; no clamped/missing correspondence.
@@ -29,11 +30,17 @@ void ComposeLukeSameEyeMotion(uint3 thread_id : SV_DispatchThreadID)
     float4 clip=float4(uv.x*2.0-1.0,1.0-uv.y*2.0,depth,1.0);
     float4 opposite=mul(ToOpposite,clip);
     float4 same=mul(ToSame,clip);
+    float4 stereo=mul(StereoInterval,clip);
+    float4 far_clip=clip; far_clip.z=0.0;
+    float4 stereo_far=mul(StereoInterval,far_clip);
     if(!all(isfinite(raw)) || !isfinite(depth) || depth<0.0 || depth>1.0 ||
-        !all(isfinite(opposite)) || !all(isfinite(same)) || opposite.w<=1e-8 || same.w<=1e-8) {
+        !all(isfinite(opposite)) || !all(isfinite(same)) ||
+        !all(isfinite(stereo)) || !all(isfinite(stereo_far)) ||
+        opposite.w<=1e-8 || same.w<=1e-8 || stereo.w<=1e-8 || stereo_far.w<=1e-8) {
         SameEyeMotion[thread_id.xy]=InvalidMotion; return;
     }
-    float2 difference=(same.xy/same.w-opposite.xy/opposite.w)*float2(0.5,-0.5);
+    float2 difference=(same.xy/same.w-opposite.xy/opposite.w-
+        (stereo.xy/stereo.w-stereo_far.xy/stereo_far.w))*float2(0.5,-0.5);
     // raw - camera(current->opposite) + camera(current->same): object motion
     // remains native. Depth at THIS pixel never samples another surface's field.
     float2 result=raw+(difference*GuideExtent+JitterDifference)/RawScale;

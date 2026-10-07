@@ -150,22 +150,10 @@ int main(int argc, char** argv) {
           ini<<"[diagnostics]\nlogging_enabled=0\ntiming_capture=1\npose_cadence_capture=1\n"; }
         logger.initialize(root);
         require(logger.ram_enabled() && !logger.enabled(),"pose profile enabled normal logging");
-        constexpr std::array<std::uint64_t,25> selected{28,71,89,90,101,102,103,104,122,123,124,125,126,127,128,129,130,131,132,944,945,946,947,948,949};
-        constexpr std::array<std::uint64_t,44> unselected{105,121,133,139,140,141,145,146,155,156,160,204,212,325,354,397,909,910,911,912,913,914,915,916,917,918,919,920,921,930,931,932,933,934,935,936,937,938,939,940,941,942,943,999};
+        constexpr std::array<std::uint64_t,26> selected{28,71,82,89,90,101,102,103,104,122,123,124,125,126,127,128,129,130,131,132,944,945,946,947,948,949};
+        constexpr std::array<std::uint64_t,54> unselected{83,84,85,200,208,320,360,400,480,520,105,121,133,139,140,141,145,146,155,156,160,204,212,325,354,397,909,910,911,912,913,914,915,916,917,918,919,920,921,930,931,932,933,934,935,936,937,938,939,940,941,942,943,999};
         for(const auto stage:selected) logger.event(O::luke_afw_stage,-731,stage,812,913);
         for(const auto stage:unselected) logger.event(O::luke_afw_stage,-732,stage,812,913);
-        std::vector<std::uint64_t> sourceStages{360,400,401};
-        for (const std::uint64_t base : {200ULL,208ULL})
-            for (unsigned i=0;i<4;++i) sourceStages.push_back(base+i);
-        for (const std::uint64_t base : {320ULL,368ULL,416ULL})
-            for (unsigned slot=0;slot<4;++slot)
-                for (unsigned i=0;i<5;++i) sourceStages.push_back(base+slot*8+i);
-        for (const std::uint64_t base : {480ULL,520ULL,560ULL})
-            for (unsigned i=0;i<24;++i) sourceStages.push_back(base+i);
-        // Same carrier position as production (result=frame/viewport identity,
-        // a=stage): exercise the real pose filter, recorder and CSV saver.
-        for (const auto stage:sourceStages)
-            logger.event(O::luke_afw_stage,-4294967000LL,stage,812,913);
         require(xrfg::save_ram_timing(GetCurrentProcessId(),root,&saved,&error),"pose profile save failed");
         const auto pose_csv=read(saved);
         for(const auto stage:selected)
@@ -174,9 +162,6 @@ int main(int argc, char** argv) {
         for(const auto stage:unselected)
             require(pose_csv.find("luke_afw_stage,-732,"+std::to_string(stage)+",812,913") ==
                 std::string::npos,"pose profile admitted a removed diagnostic stage");
-        for (const auto stage:sourceStages)
-            require(pose_csv.find("luke_afw_stage,-4294967000,"+std::to_string(stage)+",812,913") !=
-                std::string::npos,"source contract receipt lost before F11 save");
         logger.shutdown();
         require(!xrfg::pause_ram_timing(GetCurrentProcessId(),true),"pose mapping leaked after shutdown");
         fs::remove_all(root);

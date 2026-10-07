@@ -9,7 +9,7 @@
         params[i].DescriptorTable={1,&ranges[i]};
     }
     params[3].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[3].Constants.Num32BitValues=44;
+    params[3].Constants.Num32BitValues=60;
     D3D12_ROOT_SIGNATURE_DESC rd{};rd.NumParameters=4;rd.pParameters=params.data();
     ComPtr<ID3DBlob> blob;check(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&errors));
     ComPtr<ID3D12RootSignature> root;check(device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root)));
@@ -107,7 +107,7 @@
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};uav.Format=xrfg::kLukeAfwMotionFormat;uav.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;device->CreateUnorderedAccessView(output.Get(),nullptr,&uav,cpu);
         ID3D12DescriptorHeap* heaps[]{views.Get()};list->SetDescriptorHeaps(1,heaps);list->SetComputeRootSignature(root.Get());list->SetPipelineState(pipeline.Get());
         auto gpu=views->GetGPUDescriptorHandleForHeapStart();for(UINT i=0;i<3;++i){list->SetComputeRootDescriptorTable(i,gpu);gpu.ptr+=stride;}
-        list->SetComputeRoot32BitConstants(3,44,&constants,0);list->Dispatch(1,1,1);
+        list->SetComputeRoot32BitConstants(3,60,&constants,0);list->Dispatch(1,1,1);
         auto b=barrier(output.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);list->ResourceBarrier(1,&b);list->CopyResource(copied.Get(),output.Get());b=barrier(copied.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COPY_SOURCE);list->ResourceBarrier(1,&b);
         const auto desc=copied->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes{};device->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
         D3D12_RESOURCE_DESC bd{};bd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;bd.Width=bytes;bd.Height=1;bd.DepthOrArraySize=bd.MipLevels=1;bd.SampleDesc.Count=1;bd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;

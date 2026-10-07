@@ -308,7 +308,11 @@ void write_session(const std::shared_ptr<Session>& session) {
         "\tdestination_view_to_clip\tdestination_clip_to_view"
         "\tcamera_world_to_view\tcamera_view_to_world"
         "\tcamera_view_to_clip\tcamera_clip_to_view"
-        "\traw_camera_motion_included\traw_clip_to_previous_clip\traw_previous_clip_to_clip\tnative_previous_publication\tnative_same_publication\tnative_clip_to_opposite\tnative_clip_to_same\tnative_history_jitter_x\tnative_history_jitter_y\n";
+        "\traw_camera_motion_included\traw_clip_to_previous_clip\traw_previous_clip_to_clip\tnative_previous_publication\tnative_same_publication\tnative_clip_to_opposite\tnative_clip_to_same\tnative_history_jitter_x\tnative_history_jitter_y"
+        "\tmotion_temporal_valid\tmotion_previous_publication\tmotion_middle_publication"
+        "\tmotion_current_to_middle_same\tmotion_current_to_previous_same\tmotion_current_to_middle_opposite"
+        "\tdepth_native_history_valid\tdepth_native_previous_publication\tdepth_current_to_native_previous"
+        "\tcamera_forward_sign\tcamera_up_sign\n";
     const auto write_array = [&guide_manifest](const auto& values) {
         for (std::size_t i = 0; i < values.size(); ++i) {
             if (i) guide_manifest << ',';
@@ -369,7 +373,16 @@ void write_session(const std::shared_ptr<Session>& session) {
         write_array(c.raw_previous_clip_to_clip); guide_manifest << '\t';
         guide_manifest << c.native_previous_publication << '\t' << c.native_same_publication << '\t';
         write_array(c.native_clip_to_opposite); guide_manifest << '\t';
-        write_array(c.native_clip_to_same); guide_manifest << '\t' << c.native_history_jitter_x << '\t' << c.native_history_jitter_y << '\n';
+        write_array(c.native_clip_to_same); guide_manifest << '\t' << c.native_history_jitter_x << '\t' << c.native_history_jitter_y << '\t';
+        guide_manifest << c.motion_temporal_valid << '\t' << c.motion_previous_publication << '\t'
+            << c.motion_middle_publication << '\t';
+        write_array(c.motion_current_to_middle_same); guide_manifest << '\t';
+        write_array(c.motion_current_to_previous_same); guide_manifest << '\t';
+        write_array(c.motion_current_to_middle_opposite); guide_manifest << '\t';
+        guide_manifest << c.depth_native_history_valid << '\t'
+            << c.depth_native_previous_publication << '\t';
+        write_array(c.depth_current_to_native_previous); guide_manifest << '\t';
+        guide_manifest << c.camera_forward_sign << '\t' << c.camera_up_sign << '\n';
     }
     const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::seconds(15);

@@ -9,6 +9,11 @@ namespace xrfg {
 
 using LukeCameraBasis = std::array<std::array<float, 3>, 3>;
 
+enum class LukeProducerCameraAxes {
+    view,
+    right_down_forward,
+};
+
 // The rows are local right, up and back vectors in world coordinates. Map the
 // submitted OpenXR source-to-destination eye rotation into the NGX camera's
 // local frame; the two world coordinate systems need not share an origin.
@@ -56,16 +61,26 @@ using LukeCameraBasis = std::array<std::array<float, 3>, 3>;
     return true;
 }
 
-// The NGX forward vector is the physical viewing direction; projection W
-// selects whether local view Z points forwards or backwards.
-[[nodiscard]] inline bool luke_view_camera_basis(const LukeCameraBasis& physical,
-    float perspective_w, LukeCameraBasis& view) noexcept {
+// Decode the producer's complete local-axis contract. A right/down/forward
+// camera must rotate BOTH down and forward into view up/back; reflecting only
+// forward changes handedness and leaves the vertical camera motion incorrect.
+// Projection W alone does not identify the producer's supplied camera axes.
+[[nodiscard]] inline bool luke_view_camera_basis(const LukeCameraBasis& producer,
+    float perspective_w, LukeCameraBasis& view, LukeProducerCameraAxes axes) noexcept {
     if (!std::isfinite(perspective_w) || perspective_w == 0.0F) return false;
-    view = physical;
+    view = producer;
+    switch (axes) {
+    case LukeProducerCameraAxes::view:
+        break;
+    case LukeProducerCameraAxes::right_down_forward:
+        for (float& value : view[1]) value = -value;
+        for (float& value : view[2]) value = -value;
+        break;
+    default:
+        return false;
+    }
     for (auto& row : view) for (float value : row)
         if (!std::isfinite(value)) return false;
-    const float forward_z = std::copysign(1.0F, perspective_w);
-    for (float& value : view[2]) value *= forward_z;
     return true;
 }
 
@@ -74,6 +89,9 @@ using LukeCameraBasis = std::array<std::array<float, 3>, 3>;
     const LukeCameraBasis& source_view, float perspective_w,
     LukeCameraBasis& destination_view) noexcept {
     if (!std::isfinite(perspective_w) || perspective_w == 0.0F) return false;
+    // Producer axes have already been decoded. Only projection handedness
+    // remains here: XR local Z is back, while a LH view Z is forward. Conjugate
+    // the relative XR rotation into/out of that view convention.
     const float back_to_view = -std::copysign(1.0F, perspective_w);
     auto xr_basis = source_view;
     for (float& value : xr_basis[2]) value *= back_to_view;

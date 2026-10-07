@@ -73,6 +73,15 @@ struct TwoFrameGuideContract {
     float native_history_jitter_x{},native_history_jitter_y{};
     int raw_camera_motion_included{-1};
     std::array<float,16> raw_clip_to_previous_clip{}, raw_previous_clip_to_clip{};
+    bool motion_temporal_valid{};
+    std::uint64_t motion_previous_publication{}, motion_middle_publication{};
+    std::array<float,16> motion_current_to_middle_same{}, motion_current_to_previous_same{},
+        motion_current_to_middle_opposite{};
+    bool depth_native_history_valid{};
+    int camera_forward_sign{};
+    int camera_up_sign{};
+    std::uint64_t depth_native_previous_publication{};
+    std::array<float,16> depth_current_to_native_previous{};
     std::array<float, 3> camera_position{}, camera_right{}, camera_up{},
         camera_forward{};
     std::array<float, 3> source_pose{}, destination_pose{};

@@ -9,8 +9,11 @@ struct LukeNativeMotionConstants {
     std::array<std::uint32_t,2> source_base{},crop{};
     std::array<float,2> extent{},scale{},jitter_difference{},padding{};
     std::array<float,16> opposite{},same{};
+    // Producer depth-dependent stereo interval. Exact native history already
+    // includes it in opposite/same; identity makes its disparity zero there.
+    std::array<float,16> stereo{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
 };
-static_assert(sizeof(LukeNativeMotionConstants)==44*sizeof(std::uint32_t));
+static_assert(sizeof(LukeNativeMotionConstants)==60*sizeof(std::uint32_t));
 namespace native_motion_detail {
 using Matrix=std::array<std::array<double,4>,4>;
 inline Matrix matrix(const std::array<float,16>& values) noexcept {
@@ -46,6 +49,30 @@ inline bool transform(const DlssNativeCameraHistory& current,
         output[c*4+r]=static_cast<float>(m[r][c]);if(!std::isfinite(output[c*4+r]))return false;
     }
     return true;
+}
+inline Matrix guide_to_window(unsigned width,unsigned height,
+    unsigned x,unsigned y,unsigned window_width,unsigned window_height) noexcept {
+    Matrix m{}; m[2][2]=m[3][3]=1;
+    m[0][0]=double(width)/window_width;
+    m[1][1]=double(height)/window_height;
+    m[0][3]=(double(width)-2.0*x)/window_width-1.0;
+    m[1][3]=1.0-(double(height)-2.0*y)/window_height;
+    return m;
+}
+inline std::array<float,16> values(const Matrix& m) noexcept {
+    std::array<float,16> out{};
+    for(unsigned r=0;r<4;++r)for(unsigned c=0;c<4;++c)out[c*4+r]=float(m[r][c]);
+    return out;
+}
+inline std::array<float,16> window_to_guide_transform(
+    const std::array<float,16>& transform,const Matrix& to_window) noexcept {
+    Matrix to_guide{};inverse(to_window,to_guide);
+    return values(multiply(multiply(to_guide,matrix(transform)),to_window));
+}
+inline std::array<float,16> guide_to_window_transform(
+    const std::array<float,16>& transform,const Matrix& to_window) noexcept {
+    Matrix to_guide{};inverse(to_window,to_guide);
+    return values(multiply(multiply(to_window,matrix(transform)),to_guide));
 }
 }
 inline bool luke_native_motion_constants(const DlssMotionVectorFrame& guide,

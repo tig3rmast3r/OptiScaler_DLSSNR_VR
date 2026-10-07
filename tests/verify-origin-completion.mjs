@@ -39,7 +39,8 @@ for (const failure of ['Nested', 'MissingOutput', 'MissingContext', 'Dimensions'
 assert(completion.includes('marker_result, 91, color_origin->publication'), 'keep full writer outcome identity');
 const vk = read('OptiScaler/upscalers/IFeature_Vk.cpp');
 assert(vk.indexOf('paramOutput->Resource.ImageViewInfo.Image = originalOutput.Image') <
-    vk.indexOf('_lukeCapture->Evaluate(InCmdBuffer, InParameters)'), 'capture follows restored native Vulkan pipeline');
+    vk.indexOf('!_lukeCapture->EvaluateCompleted('),
+    'completed-color/AER guide capture follows restored native Vulkan pipeline');
 for (const native of ['dlss/DLSSFeature_Vk.cpp', 'dlssd/DLSSDFeature_Vk.cpp']) {
     const feature = read('OptiScaler/upscalers/' + native);
     assert(feature.includes('NVNGXProxy::VULKAN_EvaluateFeature()(') &&
@@ -179,8 +180,13 @@ console.log('Luke motion input/output format contract: PASS');
 const composition = read('third_party/ofxr/src/d3d12/luke_compose_motion.hlsl');
 const bridge = read('OptiScaler/ofxr/ofxr_bridge_client.cpp');
 const motionStore = read('third_party/ofxr/src/common/dlss_motion_vectors.cpp');
-assert(composition.includes('CurrentDepth.Load') && composition.includes('same.xy/same.w-opposite.xy/opposite.w') &&
+assert(composition.includes('CurrentDepth.Load') && composition.includes('same.xy/same.w-opposite.xy/opposite.w-') &&
+    composition.includes('stereo.xy/stereo.w-stereo_far.xy/stereo_far.w') &&
     afw.includes('luke_native_motion_constants(guide,') &&
+    afw.includes('const bool native_camera_contract = guide.camera_frame_token_valid;') &&
+    afw.includes('if(native_camera_contract && !have_native_motion)') &&
+    afw.includes('if (!temporal_camera_valid) return HRESULT_FROM_WIN32(ERROR_NOT_READY);') &&
+    afw.includes('window_to_guide_transform(') &&
     motionStore.includes('frame->previous_same_native_camera=dlss_native_camera_history(*stream.previous)') &&
     !composition.includes('PreviousMotion') && !afw.includes('prior_motion') &&
     afw.includes('params.motion_vectors_type = Normal;'),
@@ -188,40 +194,69 @@ assert(composition.includes('CurrentDepth.Load') && composition.includes('same.x
 assert(bridge.includes('embedded.raw_clip_to_previous_clip = productionCameraToken ? std::array<float,16>{} : g_active_streamline_camera.clip_to_previous_clip') &&
     bridge.includes('embedded.raw_camera_motion_included = productionCameraToken ? -1 : g_active_streamline_camera.camera_motion_included') &&
     motionStore.includes('frame->raw_clip_to_previous_clip = publication.raw_clip_to_previous_clip'),
-    'declared Streamline metadata remains immutable; native producer must not borrow unreported Streamline motion history');
-console.log('Native depth/camera motion rebase contract: PASS');
-const sourceTrace=read('OptiScaler/hooks/LukeSourceTrace.h');
-const sourceContext=read('OptiScaler/hooks/LukeSourceContext.h');
+    'declared Streamline metadata remains immutable diagnostic evidence, not a motion correction');
+console.log('Unified depth-aware native/producer camera correction; Normal in every mode: PASS');
 const sourceHooks=read('OptiScaler/hooks/Streamline_Hooks.cpp');
 const nativePipeline=read('OptiScaler/upscalers/IFeature_Vk.cpp');
 assert(afw.includes('params.motion_scale[0] = guide.scale_x *') &&
     afw.includes('params.motion_scale[1] = guide.scale_y *') &&
     !afw.includes('params.motion_scale[0] = -guide.scale_x *'),
-    'rejected sign control must be absent: source trace uses V30071 geometry');
-assert(sourceTrace.includes('p->conversionFormula') && sourceTrace.includes('t.extent.left') &&
-    sourceTrace.includes('baseArrayLayer') && sourceTrace.includes('NVSDK_NGX_Parameter_MV_Scale_X') &&
-    !sourceTrace.includes('ReadProcessMemory') && !sourceTrace.includes('CopyTexture') &&
-    !sourceTrace.includes('.Set('),
-    'source receipts inspect borrowed identity/precision/scalars only, never alter maps or GPU work');
-assert(sourceHooks.includes('const bool attachResourceHooks = o_slSetTag || o_slSetTagForFrame;') &&
-    sourceHooks.includes('trace(true); return result;') &&
-    sourceHooks.includes('luke_source::Scope traceScope(') &&
-    sourceContext.includes('~Scope() { active = previous; }') &&
-    read('OptiScaler/upscalers/dlss/DLSSFeature_Vk.cpp').includes('luke_source::native(*InParameters,0,') &&
-    read('OptiScaler/upscalers/dlss/DLSSFeature_Vk.cpp').includes('luke_source::native(*InParameters,1,') &&
-    read('OptiScaler/upscalers/dlssd/DLSSDFeature_Vk.cpp').includes('luke_source::native(*InParameters,0,') &&
-    read('OptiScaler/upscalers/dlssd/DLSSDFeature_Vk.cpp').includes('luke_source::native(*InParameters,1,') &&
-    nativePipeline.includes('luke_source::native(*InParameters,2,'),
-    'same-evaluation source trace covers tag forwarding/nested scope/native SR/native final postpass');
-console.log('Luke same-evaluation source contract trace: PASS');
+    'rejected sign control must stay absent');
+for (const text of [sourceHooks, bridge, nativePipeline, interop,
+    read('OptiScaler/upscalers/dlss/DLSSFeature_Vk.cpp'),
+    read('OptiScaler/upscalers/dlssd/DLSSDFeature_Vk.cpp')]) {
+    assert(!text.includes('luke_source::') && !text.includes('LukeSourceTrace') &&
+        !text.includes('LukeSourceContext') && !text.includes('LogNativeMotionHistory'),
+        'release ingress must not retain temporary source tracing/native history probes');
+}
+assert(sourceHooks.includes('ofxr_bridge::cache_streamline_camera(') &&
+    sourceHooks.includes('return o_slSetConstants(values,frame,viewport);') &&
+    bridge.includes('if (candidate.valid && candidate.frame == frame)'),
+    'removing diagnostics must preserve exact production camera cache and forwarding');
+console.log('Luke release ingress / temporary trace removal: PASS');
 const ramFilter=read('third_party/ofxr/src/common/ram_timing.cpp');
 const ramTest=read('third_party/ofxr/tests/ram_timing_tests.cpp');
-assert(ramFilter.includes('selected_luke_source_stage(a)') &&
-    ramFilter.includes('{320ULL, 368ULL, 416ULL}') &&
-    ramFilter.includes('{480ULL, 520ULL, 560ULL}') &&
-    ramTest.includes('source contract receipt lost before F11 save'),
-    'source receipts must survive the active pose-profile recorder and F11 saver');
-console.log('Luke source trace RAM/F11 retention contract: PASS');
+assert(!ramFilter.includes('selected_luke_source_stage') &&
+    ramTest.includes('pose profile filtered compact AFW or cadence telemetry'),
+    'compact F11 telemetry must survive after extended source stages are retired');
+console.log('Compact RAM/F11 retention contract: PASS');
+assert(nativePipeline.includes('_lukeAERMotion.reset();') &&
+    nativePipeline.includes('EvaluateCompleted(') &&
+    nativePipeline.includes('InteropQueue());') &&
+    nativePipeline.includes('_captureMotion.valid?&_captureMotion.resource:nullptr') &&
+    read('OptiScaler/upscalers/IFeature_VkwDx12.cpp').includes('ResolveCaptureMotion(InParameters, &paramMv)') &&
+    read('OptiScaler/upscalers/dlss/DLSSFeature_Vk.cpp').includes('PrepareLukeMotion(InCmdBuffer, InParameters)') &&
+    read('OptiScaler/upscalers/dlssd/DLSSDFeature_Vk.cpp').includes('PrepareLukeMotion(InCmdBuffer, InParameters)') &&
+    afw.includes('params.motion_vectors_type = Normal;') &&
+    !bridge.includes('motionFromOtherEye') &&
+    !motionStore.includes('motion_from_other_eye'),
+    'native Vulkan original AER descriptor feeds custom correction, never double-corrects with FromOtherEye');
+console.log('Native Vulkan original AER motion contract: PASS');
+for (const native of ['dlss/DLSSFeature_Vk.cpp', 'dlssd/DLSSDFeature_Vk.cpp']) {
+    const text=read('OptiScaler/upscalers/'+native);
+    assert(text.indexOf('PrepareLukeMotion(InCmdBuffer, InParameters)') <
+        text.indexOf('NVNGXProxy::VULKAN_EvaluateFeature()(InCmdBuffer,'),
+        'native SR/RR must freeze GPU motion before evaluating NGX');
+}
+const earlyCopy=interop.slice(interop.indexOf('bool IFeature_VkwDx12::PrepareCaptureMotion('),
+    interop.indexOf('bool IFeature_VkwDx12::ProcessVulkanTextures('));
+assert(earlyCopy.includes('WaitCaptureSlot(frame)') && earlyCopy.includes('WaitCaptureSlot(slot)') &&
+    earlyCopy.includes('CopyTextureFromVkToDx12(command, original, &vkMv') &&
+    earlyCopy.indexOf('CopyTextureFromVkToDx12') < earlyCopy.indexOf('FrozenMotion.publish'),
+    'existing GPU motion pass must freeze after slot/recreation guards, before publishing receipt');
+assert(interop.includes('FrozenMotion.matches(InCmdList, _frameCount)') &&
+    interop.includes('if (!CapturesCompletedOutput() && paramMv != nullptr)') &&
+    nativePipeline.includes('ClearCaptureMotion();'),
+    'completed native capture must consume exact early pixels, no late-copy fallback');
+console.log('Native Vulkan pre-NGX GPU motion freeze: PASS');
+const captures=read('third_party/ofxr/src/common/two_frame_capture.cpp');
+assert(!afw.includes('moving_input_capture') && !captures.includes('automatic_pending') &&
+    !captures.includes('automatic_requested') && !captures.includes('request_moving_inputs') &&
+    captures.includes('if (!state.session && pressed)') &&
+    captures.includes('motion_current_to_middle_same') && captures.includes('motion_current_to_previous_same') &&
+    afw.includes('contract.motion_previous_publication = impl_->previous_source_publication[source_eye]'),
+    'manual F10 must retain exact inputs/matrices without any automatic capture');
+console.log('Manual-only F10 input capture: PASS');
 const vkHooks = read('OptiScaler/hooks/Vulkan_Hooks.cpp');
 const vkCopy = read('OptiScaler/shaders/resource_copy/RC_Vk.cpp');
 assert(vkHooks.includes('captureFeatures.prepare(localCreteInfo,') &&
@@ -255,3 +290,236 @@ assert(interop.includes('NVNGX_Parameters captureParameters(API::DX12, false)') 
     !bridgeClient.includes('register_luke_vulkan_queue'),
     'capture uses a local typed D3D12 map and early device-lifetime owner');
 console.log('Vulkan local parameter map / early producer ownership contract: PASS');
+assert(interop.includes('luke_vulkan::create_capture_queue(InteropDevice.Get(), xrQueue.Get(), &Dx12CommandQueue)') &&
+    !interop.includes('InteropDevice.ReleaseAndGetAddressOf(), &Dx12CommandQueue'),
+    'Native Vulkan capture must share the early owner device, never its XR consumer queue');
+console.log('Native Vulkan capture / XR queue isolation: PASS');
+const producerCamera = read('third_party/ofxr/include/xrfg/luke_pose_camera.hpp');
+const gameCameraConfig = read('third_party/ofxr/include/xrfg/luke_world_scale_config.hpp');
+assert(gameCameraConfig.includes('_wcsicmp(section, L"DOOMTDA") == 0') &&
+    gameCameraConfig.includes('LukeProducerCameraAxes::right_down_forward') &&
+    !gameCameraConfig.includes('forward_sign') &&
+    (afw.match(/luke_game_camera_config_from_ini\(/g) || []).length === 1 &&
+    (afw.match(/impl_->camera_origin,/g) || []).length === 3 &&
+    (afw.match(/impl_->camera_axes,/g) || []).length === 3 &&
+    afw.includes('const auto source_position = origin.position_relative(guide.camera_position);') &&
+    afw.includes('impl_->camera_origin.update(') &&
+    afw.includes('impl_->frame_buffers_ready = false;') &&
+    !afw.includes('kLukeDiagnosticForwardSign') &&
+    !afw.includes('measure_camera_convention') &&
+    !afw.includes('convention_readback') &&
+    !afw.includes('LukeCalibrationCommands') &&
+    !afw.includes('camera_convention_locked') &&
+    producerCamera.includes('LukeProducerCameraAxes') &&
+    !producerCamera.includes('forward_sign'),
+    'One stable origin and typed title camera basis must serve plugin and every temporal camera without single-axis reflection');
+console.log('DOOM right/down/forward conversion / shared stable origin / no runtime probe: PASS');
+const depthConsistency = read('third_party/ofxr/src/d3d12/luke_depth_convert.hlsl');
+const afwDepthOwner = read('third_party/ofxr/src/d3d12/luke_afw.cpp');
+const depthSeed = depthConsistency.slice(depthConsistency.indexOf('float4 CalibrationSeed('),
+    depthConsistency.indexOf('int2 SamplePixel('));
+const depthCalibration = depthConsistency.slice(depthConsistency.indexOf('void CalibrateLukeDepth('),
+    depthConsistency.indexOf('float RemappedDepth('));
+const depthRemap = depthConsistency.slice(depthConsistency.indexOf('float RemappedDepth('),
+    depthConsistency.indexOf('void ConvertLukeDepth('));
+const depthConversion = depthConsistency.slice(depthConsistency.indexOf('void ConvertLukeDepth('));
+assert(depthSeed.includes('current - prior') &&
+    depthConsistency.includes('2 * Project(clip, true) - uv - Project(clip, false)') &&
+    depthSeed.includes('length(observed - CameraDifference(uv, repaired))') &&
+    depthSeed.includes('length(current - (Project(Clip(uv, repaired), true) - uv))') &&
+    depthSeed.includes('DepthReprojectionTolerance') &&
+    depthConsistency.includes('DepthReprojectionTolerance = .0015') &&
+    depthConsistency.includes('CalibrationSamples = 1280') &&
+    depthConsistency.includes('CalibrationSupport = 32') &&
+    !depthConsistency.includes('CoherentDepth') && !depthConsistency.includes('support >= 4') &&
+    !depthConsistency.includes('0.205') && !depthConsistency.includes('DOOM'),
+    'Learned remap needs independent full-2D three-camera and native camera evidence, never object velocity, Y slack or a title offset');
+assert(depthSeed.indexOf('NativeDepthConsistent(uv, depth, current)') < depthSeed.indexOf('float2 priorPixel') &&
+    depthConsistency.includes('length(current - camera) <= DepthReprojectionTolerance') &&
+    depthCalibration.includes('ResetCalibration != 0') &&
+    depthCalibration.includes('saved.w >= float(CalibrationSupport)') &&
+    depthCalibration.includes('NativeDepthConsistent(uv, repaired, current)') &&
+    depthCalibration.includes('float4(saved.x, low, high, saved.w)') &&
+    depthRemap.includes('depth >= calibration.y && depth <= calibration.z') &&
+    depthRemap.includes('corrected > 0 && corrected < 1') &&
+    depthRemap.includes('NativeDepthConsistent(uv, depth, NativeMotion(pixel))') &&
+    depthConversion.includes('RemappedDepth(') &&
+    !depthConversion.includes('CalibrationSeed(') && !depthConversion.includes('CameraDifference(') &&
+    !depthConversion.includes('CurrentMotion.Load') && !depthConversion.includes('MiddleMotion.Load'),
+    'Cache must freeze bias, extend only independently validated raw coverage, preserve native-consistent world and remove per-pixel refitting');
+assert(afwDepthOwner.includes('depth_calibration_contracts[source_eye]') &&
+    afwDepthOwner.includes('contract.epoch != guide.epoch') &&
+    afwDepthOwner.includes('contract.projection.data(), guide.camera_view_to_clip.data()') &&
+    afwDepthOwner.includes('depth_options.reset_calibration = depth_calibration_reset_pending ? 1U : 0U') &&
+    afwDepthOwner.includes('list->SetPipelineState(depth_calibration_pipeline.Get())') &&
+    afwDepthOwner.includes('calibration_ready.UAV.pResource = depth_remap_state.Get()') &&
+    afwDepthOwner.indexOf('list->SetPipelineState(depth_calibration_pipeline.Get())') <
+        afwDepthOwner.indexOf('list->SetPipelineState(depth_pipeline.Get())'),
+    'One GPU calibration pass must precede conversion with a state UAV barrier and first/epoch/projection reset');
+console.log('Stable measured GPU depth remap / full-2D evidence / retained native guard: PASS');
+assert(afwDepthOwner.includes('const auto& native_previous = guide.previous_same_guide;') &&
+    afwDepthOwner.includes('audit_middle_opposite_transform, native_previous_same_transform,') &&
+    !afwDepthOwner.includes('previous_source_publication[source_eye] + 2 == guide.publication') &&
+    afwDepthOwner.includes('queue->Wait(middle->producer_fence.Get(), middle->producer_fence_value)') &&
+    afwDepthOwner.includes('std::swap(motion_before[i].Transition.StateBefore, motion_before[i].Transition.StateAfter)'),
+    'depth estimator requires contiguous retained GPU-ordered guides and restores their states');
+console.log('Three-publication stereo depth consistency / no title offset contract: PASS');
+const originColor = read('third_party/ofxr/include/xrfg/luke_color_origin.hpp');
+assert(originColor.includes('.2126f * red + .7152f * green + .0722f * blue') &&
+    originColor.includes('luminance(channel(2), channel(1), channel(0))') &&
+    originColor.includes('luminance(channel(0), channel(1), channel(2))') &&
+    originColor.includes('luminance(half(channels[0]), half(channels[1]), half(channels[2]))') &&
+    !originColor.includes('std::to_integer<unsigned char>(*pixel) / 255.f') &&
+    originColor.includes('gradient_contrast = .001f') &&
+    originColor.includes('edge_contrast = .002, bit_contrast = .001'),
+    'Physically replace single-component origin decoding with RGB luminance; retain decoder thresholds');
+console.log('RGB origin luminance / unchanged identity admission contract: PASS');
+const originReaderSource = read('third_party/ofxr/src/d3d12/luke_color_origin.cpp');
+const originReader = originReaderSource.slice(originReaderSource.indexOf('HRESULT read_luke_color_origin('));
+const readerEvents = [...originReader.matchAll(/bridge_flight_logger\(\)\.event\(\s*(?:xrfg::)?BridgeFlightOperation::luke_afw_stage,\s*([^,]+),\s*(12[345]),\s*([\s\S]*?)\);/g)];
+assert.deepEqual(readerEvents.map(event => Number(event[2])), [123, 124, 125],
+    'Reader timing must consist of exactly three ordered RAM observations');
+assert.deepEqual(readerEvents.map(event => event[1].trim()), ['result', 'result', 'decode_status'],
+    'Timing results must reflect original Signal/wait status and final decoder HRESULT');
+const readerTuple = event => event[3].replace(/\s/g, '');
+assert(readerTuple(readerEvents[0]) === readerTuple(readerEvents[1]) &&
+    readerTuple(readerEvents[1]) === readerTuple(readerEvents[2]) &&
+    readerTuple(readerEvents[0]).includes('reader.get()') &&
+    readerTuple(readerEvents[0]).endsWith(',value'),
+    'Queue submission, GPU readiness and decoder completion must share exact reader/fence identity');
+const signalAt = originReader.indexOf('queue->Signal(reader->fence.Get(), value)');
+const retainedFenceAt = originReader.indexOf('reader->last_fence = value', signalAt);
+const gpuWaitAt = originReader.indexOf('result = wait_reader(*reader, timeout_ms)', retainedFenceAt);
+const mapAt = originReader.indexOf('reader->readback->Map(', gpuWaitAt);
+const lumaAt = originReader.indexOf('luke_origin_luma(', mapAt);
+const decodeAt = originReader.indexOf('decode_luke_origin_row(', lumaAt);
+const unmapAt = originReader.indexOf('reader->readback->Unmap(', decodeAt);
+assert(signalAt >= 0 && retainedFenceAt > signalAt && readerEvents[0].index > retainedFenceAt &&
+    gpuWaitAt > readerEvents[0].index && readerEvents[1].index > gpuWaitAt &&
+    mapAt > readerEvents[1].index && lumaAt > mapAt && decodeAt > lumaAt &&
+    unmapAt > decodeAt && readerEvents[2].index > unmapAt,
+    'Reader events must bracket only existing GPU wait and full CPU luma/decode/unmap work');
+for (const [pattern, count] of [
+    [/queue->Signal\(/g, 1], [/queue->ExecuteCommandLists\(/g, 1],
+    [/reader->list->CopyTextureRegion\(/g, 1], [/wait_reader\(\*reader, timeout_ms\)/g, 2],
+    [/reader->readback->Map\(/g, 1], [/reader->readback->Unmap\(/g, 1],
+    [/decode_luke_origin_row\(/g, 1], [/luke_origin_luma\(/g, 1],
+    [/CreateCommittedResource\(/g, 1], [/queue->Wait\(/g, 0],
+]) assert.equal((originReader.match(pattern) ?? []).length, count,
+    `Reader timing must not add submissions, resources, readbacks, waits or decode passes (${pattern})`);
+assert.equal((originReader.match(/ram_enabled\(/g) ?? []).length, 1,
+    'Reader timing must snapshot RAM observation state once');
+assert(originReader.includes('const bool ram_reader_timing = bridge_flight_logger().ram_enabled()') &&
+    (originReader.match(/if\s*\(\s*ram_reader_timing\s*\)\s*\{?\s*bridge_flight_logger\(\)\.event\(/g) ?? []).length === 3 &&
+    (originReader.match(/\bram_reader_timing\b/g) ?? []).length === 4,
+    'Each timing event, and only that event, must be RAM-only to avoid normal-log writes');
+assert(!originReader.includes('generation_cooling_down') &&
+    !originReader.includes('frame_generation_mode') && !originReader.includes('nvidia_new_route'),
+    'Timing observations must not choose a gameplay route or depend on diagnostic mode');
+console.log('Origin reader RAM-only wait/decode timing / no new GPU work or route: PASS');
+const copySynthesizer = read('third_party/ofxr/src/d3d12/d3d12_frame_synthesizer.cpp');
+const copyStart = copySynthesizer.indexOf('[[nodiscard]] HRESULT submit_copy(');
+const copyEnd = copySynthesizer.indexOf('[[nodiscard]] HRESULT submit_prime(', copyStart);
+assert(copyStart >= 0 && copyEnd > copyStart, 'Dedicated AFW color transport API must exist');
+const copyTransport = copySynthesizer.slice(copyStart, copyEnd);
+assert.equal((copyTransport.match(/->CopyResource\(/g) ?? []).length, 1,
+    'AFW transport must record exactly one full-resource copy');
+assert(copyTransport.includes('D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE') &&
+    copyTransport.includes('D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON') &&
+    copyTransport.includes('transition_barrier(destination, release_state,') &&
+    copyTransport.includes('transition_barrier(destination, D3D12_RESOURCE_STATE_COPY_DEST,'),
+    'Copy-only transport must restore producer history and publication image states');
+const copyWaitAt = copyTransport.indexOf('queue->Wait(next.producer_fence.Get(), current.fence_value)');
+const copyExecuteAt = copyTransport.indexOf('queue->ExecuteCommandLists(1, lists)');
+const copySignalAt = copyTransport.indexOf('queue->Signal(fence.Get(), fence_value)');
+const copyRetireAt = copyTransport.indexOf('history->retire_consumer(next.lease, fence.Get(), fence_value)');
+assert(copyWaitAt >= 0 && copyExecuteAt > copyWaitAt && copySignalAt > copyExecuteAt &&
+    copyRetireAt > copySignalAt && copyTransport.includes('untracked_source = std::move(next)'),
+    'Copy transport must retain its exact history lease until its signaled GPU completion, including signal failure');
+assert(copyTransport.includes('previous.active()') &&
+    copyTransport.includes('output_ticket->previous_serial = 0') &&
+    copyTransport.includes('output_ticket->current_serial = current.serial') &&
+    copyTransport.includes('output_ticket->synthetic_fence_value = fence_value') &&
+    copyTransport.includes('output_ticket->synthetic_destination_index =') &&
+    !copyTransport.includes('previous =') && !copyTransport.includes('Dispatch(') &&
+    !copyTransport.includes('dispatch_fidelityfx(') && !copyTransport.includes('SetComputeRoot') &&
+    !copyTransport.includes('record_prime(') && !copyTransport.includes('record_pair(') &&
+    !copyTransport.includes('config.backend'),
+    'Copy transport must create neither an implicit temporal anchor nor optical-flow/backend work');
+const primeRecordStart = copySynthesizer.indexOf('[[nodiscard]] HRESULT record_prime(');
+const primeRecordEnd = copySynthesizer.indexOf('[[nodiscard]] HRESULT dispatch_fidelityfx(', primeRecordStart);
+const temporalPrimeRecord = copySynthesizer.slice(primeRecordStart, primeRecordEnd);
+const temporalPrimeEnd = copySynthesizer.indexOf('[[nodiscard]] HRESULT submit_pair(', copyEnd);
+const temporalPrime = copySynthesizer.slice(copyEnd, temporalPrimeEnd);
+assert(primeRecordStart >= 0 && primeRecordEnd > primeRecordStart && temporalPrimeEnd > copyEnd &&
+    temporalPrimeRecord.includes('pack_pipeline.Get()') && temporalPrimeRecord.includes('->Dispatch(') &&
+    temporalPrimeRecord.includes('seed_index < 6U') && temporalPrimeRecord.includes('dispatch_fidelityfx(') &&
+    temporalPrime.includes('record_prime(') && temporalPrime.includes('previous = std::move(next)'),
+    'Real OFXR priming must retain its original pack, backend warm-up and rolling temporal anchor');
+const afwCopyCall = negotiationOwnerSource.indexOf('submit_result = synthesizer->submit_copy(');
+const afwCopyBranchStart = negotiationOwnerSource.lastIndexOf('if (afw_source) {', afwCopyCall);
+const afwCopyBranchEnd = negotiationOwnerSource.indexOf('} else if (request_pair) {', afwCopyCall);
+const afwCopyBranch = negotiationOwnerSource.slice(afwCopyBranchStart, afwCopyBranchEnd);
+assert(afwCopyCall >= 0 && afwCopyBranchStart >= 0 && afwCopyBranchEnd > afwCopyCall &&
+    (negotiationOwnerSource.match(/synthesizer->submit_copy\(/g) ?? []).length === 1 &&
+    afwCopyBranch.includes('*capture, current_source_views,') &&
+    !afwCopyBranch.includes('submit_prime(') && !afwCopyBranch.includes('submit_pair(') &&
+    negotiationOwnerSource.includes('capture = afw_source->capture;') &&
+    negotiationOwnerSource.includes('false, nullptr, true, nullptr, &*source.source_capture)') &&
+    negotiationOwnerSource.includes('submit_result = synthesizer->submit_prime('),
+    'All AFW input scratch-image transport must use its immutable copy-only source; genuine OFXR prime remains separate');
+console.log('AFW immutable copy-only transport / asynchronous lease fence / real OFXR prime retained: PASS');
+const startupPolicy = read('third_party/ofxr/include/xrfg/luke_afw_startup.hpp');
+const startupKey = startupPolicy.slice(startupPolicy.indexOf('struct LukeAfwStartupKey {'),
+    startupPolicy.indexOf('// A bounded startup rendezvous'));
+assert(startupKey.includes('std::uint64_t stream{}') && startupKey.includes('std::uint64_t epoch{}') &&
+    !startupKey.includes('revision') && !startupPolicy.includes('revision') &&
+    startupPolicy.includes('stable_fresh_submissions = 3') &&
+    startupPolicy.includes('maximum_attempts_per_key = 2') &&
+    startupPolicy.includes('publication == last_publication_ + 1') &&
+    startupPolicy.includes('completed_ = success') && startupPolicy.includes('void satisfy(') &&
+    !startupPolicy.includes('Sleep(') && !startupPolicy.includes('std::chrono') &&
+    !startupPolicy.includes('D3D12') && !startupPolicy.includes('DOOM'),
+    'Startup policy must use only real producer stream/epoch, contiguous fresh evidence and bounded attempts, not UI revision or per-frame pacing');
+const startupApplyStart = negotiationOwnerSource.indexOf('HRESULT apply_embedded_control(');
+const startupApplyEnd = negotiationOwnerSource.indexOf('// Correlate source-release fingerprints', startupApplyStart);
+const startupApply = negotiationOwnerSource.slice(startupApplyStart, startupApplyEnd);
+assert(startupApplyStart >= 0 && startupApplyEnd > startupApplyStart &&
+    startupApply.includes('bool force_startup_rendezvous = false') &&
+    startupApply.includes('force_startup_rendezvous && control.desired.enabled) return E_ABORT') &&
+    startupApply.includes('state->control_revision == control.revision && !force_startup_rendezvous') &&
+    startupApply.includes('const bool changed = force_startup_rendezvous ||') &&
+    startupApply.includes('const auto control = xrfg::embedded::snapshot()') &&
+    startupApply.includes('state->menu_enabled = SUCCEEDED(result) && control.desired.enabled') &&
+    startupApply.includes('return result;'),
+    'Startup must force the existing GPU-safe reconfigure with the unchanged desired tuple and cancel a concurrent OFXR enable');
+const startupScopeStart = negotiationOwnerSource.indexOf('auto startup_request = state->luke_afw_startup.pending();');
+const startupScopeEnd = negotiationOwnerSource.indexOf('if (state->luke_afw_previous_selected &&', startupScopeStart);
+const startupScope = negotiationOwnerSource.slice(startupScopeStart, startupScopeEnd);
+assert(startupScopeStart >= 0 && startupScopeEnd > startupScopeStart &&
+    startupScope.includes('if (!afw_selected || desired_control.desired.enabled)') &&
+    startupScope.includes('else if (startup_request && !luke_afw_released_eye)') &&
+    startupScope.includes('startup_request.reset()') &&
+    startupScope.includes('apply_embedded_control(state, startup_request.has_value())') &&
+    startupScope.includes('complete(*startup_request, SUCCEEDED(control_result))') &&
+    startupScope.includes('afw_selected && !state->menu_enabled') &&
+    startupScope.includes('if (!physical_success)') && startupScope.includes('else if (!held)') &&
+    startupScope.includes('observe_fresh(candidate->key, candidate->publication)') &&
+    startupScope.includes('satisfy(candidate->key)') &&
+    startupScope.includes('state.luke_afw_startup_drained == candidate->key') &&
+    startupScope.includes('state->luke_afw_startup_drained = state->luke_afw_last_delivered_startup_key') &&
+    !startupScope.includes('startup_request->revision') && !startupScope.includes('candidate->key.revision') &&
+    /startup_request && xrfg::bridge_flight_logger\(\)\.ram_enabled\(\)[\s\S]*?luke_frame_contract,[\s\S]*?S_OK, 126,/.test(startupScope) &&
+    /if \(xrfg::bridge_flight_logger\(\)\.ram_enabled\(\)\)[\s\S]*?luke_frame_contract,[\s\S]*?control_result, 127,/.test(startupScope),
+    'Only AFW-selected/OFXR-Off fresh physical success may arm; held is ignored, failures cancel, ordinary hot drain satisfies and receipts remain RAM-only');
+const startupPhysical = negotiationOwnerSource.indexOf('startup_observation.physical_success = !pair_ready &&');
+const startupReject = negotiationOwnerSource.lastIndexOf('if (XR_FAILED(result)) {', startupPhysical);
+assert(startupPhysical > startupReject && startupReject >= 0 &&
+    negotiationOwnerSource.slice(startupReject, startupPhysical).includes('return result;') &&
+    negotiationOwnerSource.slice(startupPhysical, startupPhysical + 180).includes('prepared.kind == PreparedGenerationKind::prime') &&
+    negotiationOwnerSource.includes('startup_observation.candidate = afw_produced.startup_candidate') &&
+    negotiationOwnerSource.includes('startup_observation.held = afw_produced.held_afw_pair != nullptr') &&
+    /output\.startup_candidate = LukeAfwStartupCandidate\{\s*\{source\.guide->stream, source\.guide->epoch\},\s*source\.guide->publication\}/.test(negotiationOwnerSource) &&
+    (negotiationOwnerSource.match(/luke_afw_startup\.observe_fresh\(/g) ?? []).length === 1,
+    'One immutable fresh producer candidate must qualify only after accepted physical XR completion, never an async OFXR handoff');
+console.log('Bounded startup rendezvous / real stream-epoch key / physical Off-only evidence / RAM receipts: PASS');

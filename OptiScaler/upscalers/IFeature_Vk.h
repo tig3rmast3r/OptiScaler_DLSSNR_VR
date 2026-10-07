@@ -1,11 +1,13 @@
 #pragma once
 #include <vulkan/vulkan.hpp>
 #include "IFeature.h"
+#include <hooks/LukeAERMotionSnapshot.h>
 
 #include <shaders/rcas/RCAS_Vk.h>
 #include <shaders/output_scaling/OS_Vk.h>
 #include <shaders/magnifier/Magnifier_Vk.h>
 
+class LukeVulkanCaptureBridge;
 class IFeature_Vk : public virtual IFeature
 {
   private:
@@ -23,7 +25,10 @@ class IFeature_Vk : public virtual IFeature
     };
 
   protected:
-    std::unique_ptr<IFeature_Vk> _lukeCapture;
+    std::unique_ptr<LukeVulkanCaptureBridge> _lukeCapture;
+    luke_vulkan::AERMotionSnapshot _lukeAERMotion;
+    void RetireLukeCapture();
+    void PrepareLukeMotion(VkCommandBuffer command, NVSDK_NGX_Parameter* parameters);
     VkInstance Instance = nullptr;
     VkPhysicalDevice PhysicalDevice = nullptr;
     VkDevice Device = nullptr;
@@ -43,10 +48,10 @@ class IFeature_Vk : public virtual IFeature
                       NVSDK_NGX_Parameter* InParameters);
     virtual bool Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InParameters);
 
-    IFeature_Vk(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters) : IFeature(InHandleId, InParameters) {}
+    IFeature_Vk(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters);
 
     bool IsWithDx12() override { return false; }
     API Api() const override { return API::Vulkan; }
 
-    virtual ~IFeature_Vk() {}
+    virtual ~IFeature_Vk();
 };

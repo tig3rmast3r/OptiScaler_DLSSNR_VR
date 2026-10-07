@@ -2,7 +2,6 @@
 
 #include "Streamline_Hooks.h"
 #include "Streamline_NativeInterface.h"
-#include "LukeSourceTrace.h"
 
 #include <Util.h>
 #include <Config.h>
@@ -351,15 +350,8 @@ sl::Result StreamlineHooks::hkslGetFeatureFunction(sl::Feature feature, const ch
 sl::Result StreamlineHooks::hkslSetTag(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags,
                                        uint32_t numTags, sl::CommandBuffer* cmdBuffer)
 {
-    const auto trace = [&](bool after) {
-        if (!luke_source::enabled() || !LukeRossDlssIngress::Detected() || !tags) return;
-        for (uint32_t i=0;i<numTags;++i)
-            luke_source::tag(luke_source::active.frame, static_cast<unsigned>(viewport), tags[i], after?1:0);
-    };
-    trace(false);
     const auto forward = [&]() {
-        const auto result=o_slSetTag(viewport,tags,numTags,cmdBuffer);
-        trace(true); return result;
+        return o_slSetTag(viewport,tags,numTags,cmdBuffer);
     };
     if (State::Instance().activeFgInput != FGInput::DLSSG &&
         State::Instance().activeFgInput != FGInput::NvngxFG)
@@ -449,15 +441,8 @@ sl::Result StreamlineHooks::hkslSetTagForFrame(const sl::FrameToken& frame, cons
                                                const sl::ResourceTag* resources, uint32_t numResources,
                                                sl::CommandBuffer* cmdBuffer)
 {
-    const auto trace = [&](bool after) {
-        if (!luke_source::enabled() || !LukeRossDlssIngress::Detected() || !resources) return;
-        for (uint32_t i=0;i<numResources;++i)
-            luke_source::tag(static_cast<unsigned>(frame), static_cast<unsigned>(viewport), resources[i], after?1:0);
-    };
-    trace(false);
     const auto forward = [&]() {
-        const auto result=o_slSetTagForFrame(frame,viewport,resources,numResources,cmdBuffer);
-        trace(true); return result;
+        return o_slSetTagForFrame(frame,viewport,resources,numResources,cmdBuffer);
     };
     if (State::Instance().activeFgInput != FGInput::DLSSG &&
         State::Instance().activeFgInput != FGInput::NvngxFG)
@@ -541,24 +526,6 @@ sl::Result StreamlineHooks::hkslEvaluateFeature(sl::Feature feature, const sl::F
                                                 sl::CommandBuffer* cmdBuffer)
 {
     LOG_DEBUG("frameIndex: {}", static_cast<uint32_t>(frame));
-    unsigned traceViewport=luke_source::unknown;
-    if(inputs) for(unsigned i=0;i<numInputs;++i) {
-        const sl::BaseStructure* item=inputs[i];
-        for(unsigned n=0;item && n<4;++n,item=item->next) {
-            if(item->structType==sl::ViewportHandle::s_structType)
-                traceViewport=static_cast<unsigned>(*static_cast<const sl::ViewportHandle*>(item));
-        }
-    }
-    luke_source::Scope traceScope(static_cast<unsigned>(frame),traceViewport,static_cast<unsigned>(feature));
-    if(luke_source::enabled() && LukeRossDlssIngress::Detected()) {
-        luke_source::emit(luke_source::key(static_cast<unsigned>(frame),traceViewport),360,
-            static_cast<unsigned>(feature),reinterpret_cast<std::uintptr_t>(cmdBuffer));
-        if(inputs) for(unsigned i=0;i<numInputs;++i) {
-            if(inputs[i] && inputs[i]->structType==sl::ResourceTag::s_structType)
-                luke_source::tag(static_cast<unsigned>(frame),traceViewport,
-                    *static_cast<const sl::ResourceTag*>(inputs[i]),2);
-        }
-    }
 
     if (State::Instance().activeFgInput == FGInput::DLSSG && numInputs > 0 && inputs != nullptr)
     {
@@ -1108,7 +1075,7 @@ sl::Result StreamlineHooks::hkslSetConstants(const sl::Constants& values, const 
     LOG_TRACE("called with frameIndex: {}, viewport: {}", (unsigned int) frame, (unsigned int) viewport);
 
     ofxr_bridge::cache_streamline_camera(
-        static_cast<uint32_t>(frame), static_cast<uint32_t>(viewport),
+        static_cast<uint32_t>(frame),
         reinterpret_cast<const float*>(&values.cameraViewToClip),
         reinterpret_cast<const float*>(&values.clipToCameraView),
         reinterpret_cast<const float*>(&values.cameraPos),
@@ -1121,22 +1088,9 @@ sl::Result StreamlineHooks::hkslSetConstants(const sl::Constants& values, const 
         reinterpret_cast<const float*>(&values.prevClipToClip),
         values.cameraMotionIncluded == sl::Boolean::eTrue ? 1 :
             values.cameraMotionIncluded == sl::Boolean::eFalse ? 0 : -1);
-    static std::atomic_uint64_t historyReceipts{0};
-    const auto receipt = historyReceipts.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (receipt <= 2 || receipt % 240 == 0)
-        LOG_INFO("V30070 declared motion history frame={} cameraMotionIncluded={} motion3D={} mvScale={}/{} prevTranslation={}/{}/{}",
-            static_cast<unsigned>(frame), static_cast<int>(values.cameraMotionIncluded),
-            static_cast<int>(values.motionVectors3D), values.mvecScale.x, values.mvecScale.y,
-            values.clipToPrevClip.row[3].x, values.clipToPrevClip.row[3].y, values.clipToPrevClip.row[3].z);
-
     State::Instance().slFGInputs.setConstants(values, (uint32_t) frame);
 
-    if (luke_source::enabled() && LukeRossDlssIngress::Detected())
-        luke_source::constants(values, static_cast<unsigned>(frame), static_cast<unsigned>(viewport),false);
-    const auto result=o_slSetConstants(values,frame,viewport);
-    if (luke_source::enabled() && LukeRossDlssIngress::Detected())
-        luke_source::constants(values, static_cast<unsigned>(frame), static_cast<unsigned>(viewport),true);
-    return result;
+    return o_slSetConstants(values,frame,viewport);
 }
 
 bool StreamlineHooks::hkcommon_slOnPluginLoad(sl::param::IParameters* params, const char* loaderJSON,
@@ -1971,9 +1925,12 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
                 if (o_slEvaluateFeature != nullptr)
                     DetourAttach(&(PVOID&) o_slEvaluateFeature, hkslEvaluateFeature);
 
-                // Resource receipts must also see Luke's native Vulkan tags.
-                // Vulkan/D3D11 handlers forward exactly once without FG mutation.
-                const bool attachResourceHooks = o_slSetTag || o_slSetTagForFrame;
+                // Tags are only intercepted for OptiScaler's functional FG
+                // input, not for the retired Luke source trace.
+                const bool attachResourceHooks =
+                    (State::Instance().activeFgInput == FGInput::DLSSG ||
+                     State::Instance().activeFgInput == FGInput::NvngxFG) &&
+                    (o_slSetTag || o_slSetTagForFrame);
                 if (attachResourceHooks)
                 {
                     if (o_slSetTag != nullptr)

@@ -1752,6 +1752,8 @@ void test_protected_guide_snapshots(D3D12WarpFixture& fixture) {
             selected->previous_same_native_camera->valid ==
                 xrfg::dlss_native_camera_history(*held[1]).valid,
             "color origin borrowed or synthesized the N-2 native camera");
+        require(!selected->previous_same_guide,
+            "evicted native N-2 was substituted with a newer camera");
         require(selected->raw_camera_motion_included == 0 &&
             selected->raw_clip_to_previous_clip[12] == 1.0F &&
             selected->raw_previous_clip_to_clip[12] == -1.0F &&
@@ -1782,6 +1784,17 @@ void test_protected_guide_snapshots(D3D12WarpFixture& fixture) {
                 delayed->camera_frame_token == (index + 1) * 7 &&
                 delayed->previous_opposite_guide->camera_frame_token == index * 7,
                 "age 5/6 exact origin lost its own N-1 guide/camera");
+            // No AFW evaluations occurred between these token lookups. Depth
+            // still needs native N-2, not the earlier selected color history.
+            require(delayed->previous_same_guide &&
+                delayed->previous_same_guide->publication == held[index - 2]->publication &&
+                delayed->previous_same_guide->camera_frame_token == (index - 1) * 7 &&
+                !delayed->previous_same_guide->previous_same_guide &&
+                !delayed->previous_same_guide->previous_opposite_guide,
+                "skipped AFW lookups changed native N-2 or retained a recursive chain");
+            require_readback_matches(fixture, delayed->previous_same_guide->motion_vectors.Get(),
+                make_pattern(static_cast<std::uint8_t>((index - 1) * 13)),
+                "delayed native N-2 MV", delayed->previous_same_guide->resource_state);
             require_readback_matches(fixture, delayed->motion_vectors.Get(),
                 make_pattern(static_cast<std::uint8_t>((index + 1) * 13)),
                 "delayed exact MV", delayed->resource_state);
@@ -1851,7 +1864,8 @@ void test_protected_guide_snapshots(D3D12WarpFixture& fixture) {
     const auto after_reset = publish(11);
     const auto reset_join = xrfg::resolve_luke_guide_token(after_reset->color_origin_token, fixture.queue(), fixture.device());
     require(reset_join && reset_join->epoch == reset->epoch &&
-        reset_join->previous_opposite_guide->publication == reset->publication,
+        reset_join->previous_opposite_guide->publication == reset->publication &&
+        !reset_join->previous_same_guide,
         "reset epoch did not join its exact consecutive origin");
     xrfg::configure_dlss_motion_vector_tracking(false);
     xrfg::retire_disabled_dlss_motion_vector_resources();
@@ -2465,6 +2479,142 @@ void test_depth_private_history_allows_shader_resource_views(D3D12WarpFixture& f
     require(
         operation_succeeded(history.wait_for_idle()),
         "shader-readable history wait_for_idle failed");
+}
+
+void test_copy_only_afw_transport(D3D12WarpFixture& fixture) {
+    std::array<ComPtr<ID3D12Resource>,3> sources{
+        create_source_texture(fixture), create_source_texture(fixture), create_source_texture(fixture)};
+    std::array<ComPtr<ID3D12Resource>,3> destinations{
+        create_source_texture(fixture), create_source_texture(fixture), create_source_texture(fixture)};
+    std::array<ComPtr<ID3D12Resource>,3> synthetic{
+        create_source_texture(fixture), create_source_texture(fixture), create_source_texture(fixture)};
+    std::array<ID3D12Resource*,3> source_ptrs{sources[0].Get(),sources[1].Get(),sources[2].Get()};
+    std::array<ID3D12Resource*,3> destination_ptrs{destinations[0].Get(),destinations[1].Get(),destinations[2].Get()};
+    std::array<ID3D12Resource*,3> synthetic_ptrs{synthetic[0].Get(),synthetic[1].Get(),synthetic[2].Get()};
+    const auto pattern_a=make_pattern(17), pattern_b=make_pattern(71), pattern_c=make_pattern(119);
+    const auto sentinel=make_pattern(203);
+    upload_pattern(fixture,sources[0].Get(),pattern_a);
+    upload_pattern(fixture,sources[1].Get(),pattern_b);
+    upload_pattern(fixture,sources[2].Get(),pattern_c);
+    for(UINT i=0;i<3;++i) {
+        upload_pattern(fixture,destinations[i].Get(),sentinel);
+        upload_pattern(fixture,synthetic[i].Get(),sentinel);
+    }
+    auto history=std::make_shared<xrfg::D3D12SwapchainHistory>();
+    require_hresult(history->initialize(fixture.device(),fixture.queue(),source_ptrs,
+        D3D12_RESOURCE_STATE_RENDER_TARGET),"copy-only history initialize");
+    xrfg::D3D12FrameSynthesizer synthesizer;
+    // FidelityFX is deliberately selected: AFW transport must not dispatch its
+    // generic prime packing/warmups, nor change any synthetic output pixels.
+    require_hresult(synthesizer.initialize(fixture.device(),fixture.queue(),history,
+        destination_ptrs,synthetic_ptrs,kFormat,D3D12_RESOURCE_STATE_RENDER_TARGET,
+        xrfg::D3D12OpticalFlowBackend::fidelity_fx),"copy-only synthesizer initialize");
+    const auto views=make_reprojection_views();
+    xrfg::D3D12HistoryCaptureTicket capture_a{},capture_b{},capture_c{};
+    require_hresult(history->capture(0,&capture_a),"copy-only capture A");
+    require_hresult(history->commit(capture_a),"copy-only commit A");
+    xrfg::D3D12FrameSynthesisTicket invalid{};
+    require(FAILED(synthesizer.submit_copy(capture_a,
+        std::span<const xrfg::D3D12ReprojectionView>(views.data(),1),0,&invalid)) &&
+        invalid.current_serial==0 && invalid.fence_value==0,
+        "copy-only accepted incomplete view metadata or consumed a ticket");
+    require(FAILED(synthesizer.submit_copy(capture_a,views,3,&invalid)) &&
+        invalid.current_serial==0 && invalid.fence_value==0,
+        "copy-only accepted an invalid destination index");
+
+    ComPtr<ID3D12Fence> gate;
+    require_hresult(fixture.device()->CreateFence(0,D3D12_FENCE_FLAG_NONE,
+        IID_PPV_ARGS(gate.GetAddressOf())),"copy-only gate create");
+    require_hresult(fixture.queue()->Wait(gate.Get(),1),"copy-only blocked queue");
+    struct CopyOutcome { HRESULT result{E_FAIL}; xrfg::D3D12FrameSynthesisTicket ticket{}; };
+    auto future=std::async(std::launch::async,[&] {
+        CopyOutcome outcome;
+        outcome.result=synthesizer.submit_copy(capture_a,views,2,&outcome.ticket);
+        return outcome;
+    });
+    if(future.wait_for(std::chrono::milliseconds(500))!=std::future_status::ready) {
+        require_hresult(gate->Signal(1),"copy-only timeout cleanup");
+        (void)future.get();
+        fail("copy-only submit waited on GPU completion");
+    }
+    const auto copied_a=future.get();
+    // Observe everything while the queue is blocked, then release before any
+    // assertion can unwind GPU-owned resources with an unsignaled test gate.
+    const HRESULT pending_copy=synthesizer.wait_for_previous_submission(0);
+    xrfg::D3D12HistoryConsumerLease blocked_lease{};
+    ID3D12Resource* blocked_resource=nullptr;ID3D12Fence* blocked_fence=nullptr;
+    const HRESULT pending_history=history->acquire_consumer(capture_a,&blocked_lease,
+        &blocked_resource,&blocked_fence);
+    if(SUCCEEDED(pending_history)) {
+        history->cancel_consumer(blocked_lease);
+        if(blocked_resource)blocked_resource->Release();
+        if(blocked_fence)blocked_fence->Release();
+    }
+    const HRESULT capture_b_result=history->capture(1,&capture_b);
+    const HRESULT commit_b_result=SUCCEEDED(capture_b_result)?history->commit(capture_b):capture_b_result;
+    const HRESULT capture_c_result=history->capture(2,&capture_c);
+    const HRESULT commit_c_result=SUCCEEDED(capture_c_result)?history->commit(capture_c):capture_c_result;
+    xrfg::D3D12HistoryCaptureTicket blocked_capture{};
+    const HRESULT pending_reuse=history->capture(0,&blocked_capture);
+    require_hresult(gate->Signal(1),"copy-only release queue gate");
+    require_hresult(copied_a.result,"copy-only asynchronous submit A");
+    require(copied_a.ticket.previous_serial==0 && copied_a.ticket.current_serial==capture_a.serial &&
+        copied_a.ticket.fence_value!=0 && copied_a.ticket.synthetic_fence_value==copied_a.ticket.fence_value &&
+        copied_a.ticket.current_destination_index==2 &&
+        copied_a.ticket.synthetic_destination_index==std::numeric_limits<std::uint32_t>::max(),
+        "copy-only submission did not preserve exact ticket/fence/destination identity");
+    require(FAILED(pending_copy),"copy-only completion fence passed the blocked queue");
+    require(pending_history==HRESULT_FROM_WIN32(ERROR_BUSY),
+        "copy-only retired its history lease without protecting pending GPU access");
+    require_hresult(capture_b_result,"copy-only concurrent capture B");
+    require_hresult(commit_b_result,"copy-only concurrent commit B");
+    require_hresult(capture_c_result,"copy-only concurrent capture C");
+    require_hresult(commit_c_result,"copy-only concurrent commit C");
+    require(pending_reuse==HRESULT_FROM_WIN32(ERROR_BUSY) && blocked_capture.serial==0,
+        "copy-only pending consumer allowed ring-slot overwrite");
+    require_frame_start_gate(synthesizer,"copy-only completion A");
+    require_readback_matches(fixture,destinations[2].Get(),pattern_a,
+        "copy-only exact A",D3D12_RESOURCE_STATE_RENDER_TARGET);
+    for(UINT i=0;i<3;++i)require_readback_matches(fixture,synthetic[i].Get(),sentinel,
+        "copy-only synthetic untouched",D3D12_RESOURCE_STATE_RENDER_TARGET);
+    // Completion, not a retained temporal anchor, owns this copy lease.
+    CaptureResources inspected_a=acquire_capture_for_inspection(*history,capture_a);
+    require_readback_matches(fixture,inspected_a.resource.Get(),pattern_a,"copy-only retained history A");
+    retire_completed_inspection(fixture,*history,inspected_a);
+    xrfg::D3D12FrameSynthesisTicket implicit_pair{};
+    require(FAILED(synthesizer.submit_pair(capture_b,views,views,0,1,&implicit_pair)) &&
+        implicit_pair.current_serial==0 && implicit_pair.fence_value==0,
+        "copy-only transport secretly primed a temporal synthesis anchor");
+
+    xrfg::D3D12FrameSynthesisTicket copied_b{};
+    require_hresult(synthesizer.submit_copy(capture_b,views,1,&copied_b),"copy-only submit B");
+    require(copied_b.previous_serial==0 && copied_b.current_serial==capture_b.serial &&
+        copied_b.fence_value>copied_a.ticket.fence_value,
+        "copy-only B did not advance its independent completion fence");
+    require_frame_start_gate(synthesizer,"copy-only completion B");
+    require_readback_matches(fixture,destinations[1].Get(),pattern_b,
+        "copy-only exact B",D3D12_RESOURCE_STATE_RENDER_TARGET);
+    require_readback_matches(fixture,destinations[2].Get(),pattern_a,
+        "copy-only previous destination unchanged",D3D12_RESOURCE_STATE_RENDER_TARGET);
+    for(UINT i=0;i<3;++i)require_readback_matches(fixture,synthetic[i].Get(),sentinel,
+        "copy-only second synthetic untouched",D3D12_RESOURCE_STATE_RENDER_TARGET);
+    require_source_is_render_target(fixture,sources[0].Get());
+    require_source_is_render_target(fixture,sources[1].Get());
+
+    // Returning to genuine OFXR must explicitly execute its original prime;
+    // AFW transport neither substitutes it nor leaves a false warm anchor.
+    xrfg::D3D12FrameSynthesisTicket genuine_prime{};
+    require_hresult(synthesizer.submit_prime(capture_c,views,0,&genuine_prime),
+        "copy-only to genuine temporal prime");
+    require(genuine_prime.previous_serial==0 && genuine_prime.current_serial==capture_c.serial &&
+        genuine_prime.fence_value>copied_b.fence_value,
+        "genuine prime ticket was altered by prior AFW copies");
+    require_frame_start_gate(synthesizer,"genuine prime completion after copies");
+    require_readback_matches(fixture,destinations[0].Get(),pattern_c,
+        "genuine prime current C",D3D12_RESOURCE_STATE_RENDER_TARGET);
+    require_hresult(synthesizer.retire_previous(),"genuine prime retirement after copies");
+    require_hresult(synthesizer.wait_for_idle(),"copy-only synthesizer drain");
+    require_hresult(history->invalidate(),"copy-only leases released before invalidate");
 }
 
 void test_rolling_frame_synthesizer(D3D12WarpFixture& fixture) {
@@ -4207,6 +4357,13 @@ int main(int argc, char** argv) {
             fixture.require_no_debug_errors();
             return 0;
         }
+        if (argc > 1 && std::string_view(argv[1]) == "copy-only") {
+            D3D12WarpFixture fixture;
+            test_copy_only_afw_transport(fixture);
+            fixture.require_no_debug_errors();
+            std::cout << "D3D12 WARP copy-only AFW transport/fence/lease test passed\n";
+            return 0;
+        }
         if (GetEnvironmentVariableA("XRFG_TEST_NVIDIA_QUALITY", nullptr, 0)) {
             run_nvidia_fast_controls();
             return 0;
@@ -4219,6 +4376,7 @@ int main(int argc, char** argv) {
         test_capture_is_async_and_consumer_fence_blocks_reuse(fixture);
         test_depth_capture_path(fixture);
         test_depth_private_history_allows_shader_resource_views(fixture);
+        test_copy_only_afw_transport(fixture);
         test_rolling_frame_synthesizer(fixture);
         test_double_wide_single_slice_views(fixture);
         test_stereo_motion_synthesis_beats_same_pixel_blend(fixture);

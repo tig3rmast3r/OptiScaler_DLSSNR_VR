@@ -182,6 +182,15 @@ public:
             D3D12FrameGenerationMode::ofxr,
         bool allow_luke_guide_device_alias = false) noexcept;
 
+    // Bit-exact transport of one immutable history capture. This does not
+    // seed or dispatch any temporal/optical-flow backend. The history lease is
+    // retired against this copy's completion fence, without a rolling anchor.
+    [[nodiscard]] HRESULT submit_copy(
+        const D3D12HistoryCaptureTicket& current,
+        std::span<const D3D12ReprojectionView> current_source_views,
+        std::uint32_t current_destination_index,
+        D3D12FrameSynthesisTicket* ticket) noexcept;
+
     [[nodiscard]] HRESULT submit_prime(
         const D3D12HistoryCaptureTicket& current,
         std::span<const D3D12ReprojectionView> current_source_views,

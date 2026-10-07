@@ -96,6 +96,80 @@ void codec_tests() {
     require(!xrfg::compact_luke_origin_layout(512,8,512,8,layout),"insufficient band margin accepted");
     require(!xrfg::compact_luke_origin_layout(512,32,1024,32,layout),"upscaled/crop mismatch accepted");
 }
+void luma_tests() {
+    const auto close=[](float actual,float expected,float tolerance=1.e-6F) {
+        return std::isfinite(actual) && std::abs(actual-expected)<tolerance;
+    };
+    constexpr float red=.2126F,green=.7152F,blue=.0722F;
+    for(auto format:{DXGI_FORMAT_R8G8B8A8_TYPELESS,DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,DXGI_FORMAT_B8G8R8A8_TYPELESS,
+        DXGI_FORMAT_B8G8R8A8_UNORM,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB}) {
+        const bool bgra=format==DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+            format==DXGI_FORMAT_B8G8R8A8_UNORM || format==DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        for(unsigned alpha:{0U,255U}) {
+            const std::array<unsigned char,4> pixel{static_cast<unsigned char>(bgra?233:17),119,
+                static_cast<unsigned char>(bgra?17:233),static_cast<unsigned char>(alpha)};
+            require(close(xrfg::luke_origin_luma(reinterpret_cast<const std::byte*>(pixel.data()),format),
+                (red*17+green*119+blue*233)/255),"encoded RGB/BGRA luma ordering or alpha");
+        }
+    }
+    for(unsigned alpha:{0U,1U,2U,3U}) {
+        const std::uint32_t packed=37U|(511U<<10)|(900U<<20)|(alpha<<30);
+        require(close(xrfg::luke_origin_luma(reinterpret_cast<const std::byte*>(&packed),DXGI_FORMAT_R10G10B10A2_UNORM),
+            (red*37+green*511+blue*900)/1023),"packed10 RGB luma ordering or alpha");
+    }
+    std::array<float,4> floating{-.5F,.25F,.75F,std::numeric_limits<float>::quiet_NaN()};
+    require(close(xrfg::luke_origin_luma(reinterpret_cast<const std::byte*>(floating.data()),DXGI_FORMAT_R32G32B32A32_FLOAT),
+        -.5F*red+.25F*green+.75F*blue),"float RGB signed luma or NaN alpha");
+    for(unsigned channel=0;channel<3;++channel) for(float invalid:{std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(),-std::numeric_limits<float>::infinity()}) {
+        auto broken=floating;broken[channel]=invalid;
+        require(!std::isfinite(xrfg::luke_origin_luma(reinterpret_cast<const std::byte*>(broken.data()),DXGI_FORMAT_R32G32B32A32_FLOAT)),
+            "invalid float RGB component accepted");
+    }
+    std::array<std::uint16_t,4> half{0xb800,0x3400,0x3a00,0x7e00}; // -.5,.25,.75,NaN alpha
+    require(close(xrfg::luke_origin_luma(reinterpret_cast<const std::byte*>(half.data()),DXGI_FORMAT_R16G16B16A16_FLOAT),
+        -.5F*red+.25F*green+.75F*blue),"half RGB signed luma or NaN alpha");
+    const std::array<std::uint16_t,4> subnormal{0x8001,0x0001,0x0000,0x7c00};
+    require(close(xrfg::luke_origin_luma(reinterpret_cast<const std::byte*>(subnormal.data()),DXGI_FORMAT_R16G16B16A16_FLOAT),
+        (green-red)*std::ldexp(1.F,-24),1.e-12F),"half signed subnormals or infinite alpha");
+    for(unsigned channel=0;channel<3;++channel) for(std::uint16_t invalid:{std::uint16_t(0x7e00),std::uint16_t(0x7c00),std::uint16_t(0xfc00)}) {
+        auto broken=half;broken[channel]=invalid;
+        require(std::isnan(xrfg::luke_origin_luma(reinterpret_cast<const std::byte*>(broken.data()),DXGI_FORMAT_R16G16B16A16_FLOAT)),
+            "invalid half RGB component accepted");
+    }
+    for(auto format:{DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_R10G10B10A2_UNORM,DXGI_FORMAT_R16G16B16A16_FLOAT,DXGI_FORMAT_R32G32B32A32_FLOAT}) {
+        std::array<std::byte,16> pixel{};
+        for(bool white:{false,true}) {
+            xrfg::luke_origin_pixel(pixel.data(),format,white);
+            require(close(xrfg::luke_origin_luma(pixel.data(),format),white?1.F:0.F),"black/white stamp luminance changed");
+        }
+    }
+    // Dim chromatic overlay: B quantizes to the SAME103 in both Manchester
+    // cells, while R/G retain only three R8 steps. First-byte BGRA cannot decode.
+    constexpr std::uint32_t token=0x12345678U;
+    std::vector<std::array<unsigned char,4>> chromatic(1024,{103,103,103,255});
+    for(unsigned x=0;x<xrfg::kLukeOriginWidth;++x) {
+        const unsigned char level=xrfg::luke_origin_white(token,x)?105:102;
+        chromatic[32+x]={103,level,level,static_cast<unsigned char>(x&255)};
+    }
+    std::vector<float> rgb_row(chromatic.size()),erased_blue(chromatic.size(),103.F/255);
+    for(auto format:{DXGI_FORMAT_B8G8R8A8_UNORM,DXGI_FORMAT_B8G8R8A8_TYPELESS,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB}) {
+        for(std::size_t x=0;x<chromatic.size();++x)
+            rgb_row[x]=xrfg::luke_origin_luma(reinterpret_cast<const std::byte*>(chromatic[x].data()),format);
+        const auto decoded=xrfg::decode_luke_origin_row(rgb_row);
+        require(decoded.token==token && !decoded.ambiguous,"dim RGB Manchester token lost despite R/G contrast");
+    }
+    require(!xrfg::decode_luke_origin_row(erased_blue).token,"erased blue pairs invented identity");
+    for(unsigned x=32+27*4;x<32+28*4;++x) {
+        chromatic[x][1]=static_cast<unsigned char>(207-chromatic[x][1]);
+        chromatic[x][2]=static_cast<unsigned char>(207-chromatic[x][2]);
+    }
+    for(std::size_t x=0;x<chromatic.size();++x)
+        rgb_row[x]=xrfg::luke_origin_luma(reinterpret_cast<const std::byte*>(chromatic[x].data()),DXGI_FORMAT_B8G8R8A8_UNORM);
+    require(!xrfg::decode_luke_origin_row(rgb_row).token,"RGB luminance bypassed CRC corruption");
+}
 struct Gpu {
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
@@ -207,6 +281,6 @@ void gpu_tests() {
 }
 }
 int main() {
-    try { codec_tests();gpu_tests();std::cout<<"Compact origin: "<<checks<<" checks PASS\n";return 0; }
+    try { codec_tests();luma_tests();gpu_tests();std::cout<<"Compact origin: "<<checks<<" checks PASS\n";return 0; }
     catch(const std::exception& e) {std::cerr<<"Compact origin FAIL: "<<e.what()<<"\n";return 1;}
 }

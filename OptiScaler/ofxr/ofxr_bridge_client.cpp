@@ -7,7 +7,6 @@
 #include "../hooks/D3D_NativeInterface.h"
 #include "../inputs/NVNGX_DLSS.h"
 #include "../hooks/LukeVulkanProducer.h"
-#include "../hooks/LukeSourceContext.h"
 #include "../../third_party/ofxr/include/xrfg/bridge_flight_logger.hpp"
 #include <SysUtils.h>
 
@@ -27,7 +26,6 @@ namespace {
 
 struct StreamlineCameraEntry {
     std::uint32_t frame{};
-    std::uint32_t diagnostic_viewport{luke_source::unknown};
     std::array<float, 16> view_to_clip{};
     std::array<float, 16> clip_to_view{};
     std::array<float, 3> position{};
@@ -482,7 +480,7 @@ void configure_dlss_guides(bool enabled) noexcept {
         xrfg::configure_dlss_motion_vector_tracking(enabled);
 }
 void cache_streamline_camera(
-    std::uint32_t frame, std::uint32_t diagnostic_viewport,
+    std::uint32_t frame,
     const float* camera_view_to_clip,
     const float* camera_clip_to_view,
     const float* camera_position,
@@ -502,7 +500,6 @@ void cache_streamline_camera(
         !finite_values(camera_position, 3) ||
         !plausible_basis(camera_up, camera_right, camera_forward)) return;
     camera.frame = frame;
-    camera.diagnostic_viewport = diagnostic_viewport;
     std::copy_n(camera_view_to_clip, 16, camera.view_to_clip.begin());
     std::copy_n(camera_clip_to_view, 16, camera.clip_to_view.begin());
     std::copy_n(camera_position, 3, camera.position.begin());
@@ -530,22 +527,6 @@ void begin_streamline_evaluation(std::uint32_t frame) noexcept {
         g_streamline_cameras[frame % g_streamline_cameras.size()];
     if (candidate.valid && candidate.frame == frame)
         g_active_streamline_camera = candidate;
-    auto& trace=xrfg::bridge_flight_logger();
-    if(trace.ram_enabled()) {
-        auto hash=luke_source::hash(candidate.view_to_clip.data(),16);
-        hash=luke_source::hash(candidate.clip_to_view.data(),16,hash);
-        hash=luke_source::hash(candidate.position.data(),3,hash);
-        hash=luke_source::hash(candidate.right.data(),3,hash);
-        hash=luke_source::hash(candidate.up.data(),3,hash);
-        hash=luke_source::hash(candidate.forward.data(),3,hash);
-        trace.event(xrfg::BridgeFlightOperation::luke_afw_stage,
-            static_cast<std::int64_t>(luke_source::key(frame,luke_source::active.viewport)),
-            400,luke_source::key(candidate.frame,candidate.diagnostic_viewport),hash);
-        trace.event(xrfg::BridgeFlightOperation::luke_afw_stage,
-            static_cast<std::int64_t>(luke_source::key(frame,luke_source::active.viewport)),
-            401,candidate.valid && candidate.frame==frame,
-            reinterpret_cast<std::uintptr_t>(g_active_streamline_camera.view_to_clip.data()));
-    }
 }
 
 void end_streamline_evaluation() noexcept {

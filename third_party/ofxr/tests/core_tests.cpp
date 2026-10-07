@@ -7,7 +7,9 @@
 #include "xrfg/luke_pose_camera.hpp"
 #include "xrfg/luke_world_scale.hpp"
 #include "xrfg/luke_camera_units.hpp"
+#include "xrfg/luke_camera_origin.hpp"
 #include "xrfg/luke_ingress_devices.hpp"
+#include "xrfg/luke_afw_startup.hpp"
 
 #include <array>
 #include <chrono>
@@ -41,6 +43,206 @@ void expect(bool condition, std::string_view description) {
 }  // namespace
 
 int main() {
+    {
+        using Key = xrfg::LukeAfwStartupKey;
+        xrfg::LukeAfwStartupRendezvous startup;
+        const Key key{1000001, 7};
+        expect(!startup.pending(), "held/menu-only startup cannot arm a rendezvous");
+        startup.observe_fresh(Key{}, 1);
+        startup.observe_fresh(key, 0);
+        expect(!startup.pending(), "invalid/loading metadata cannot arm startup");
+        startup.observe_fresh(key, 100);
+        expect(!startup.pending(), "one fresh menu frame cannot arm startup");
+        // Held frames do not call observe_fresh: repeated polls preserve the
+        // candidate, so alternating fresh/held still arms after three fresh.
+        for (unsigned held = 0; held < 100; ++held)
+            expect(!startup.pending(), "held submissions cannot count toward startup");
+        startup.observe_fresh(key, 101);
+        expect(!startup.pending(), "two fresh frames do not arm startup");
+        startup.observe_fresh(key, 102);
+        expect(startup.pending() == key, "three contiguous fresh frames arm one rendezvous");
+        startup.complete(Key{1000001, 8}, true);
+        expect(startup.pending() == key, "stale completion cannot consume a different key");
+        startup.complete(key, true);
+        expect(!startup.pending(), "successful startup reconfiguration closes its request");
+        startup.complete(key, false);
+        startup.observe_failure();
+        for (std::uint64_t publication = 103; publication < 200; ++publication)
+            startup.observe_fresh(key, publication);
+        expect(!startup.pending(), "same completed key never forces again after frames or failures");
+
+        const Key epoch{1000001, 8};
+        startup.observe_fresh(epoch, 200);
+        startup.observe_fresh(epoch, 201);
+        expect(!startup.pending(), "new history epoch requires its own stable fresh streak");
+        startup.observe_fresh(epoch, 205);
+        startup.observe_fresh(epoch, 206);
+        expect(!startup.pending(), "publication gaps discard the earlier candidate");
+        startup.observe_fresh(epoch, 207);
+        expect(startup.pending() == epoch, "three frames after a gap arm the new epoch");
+        startup.observe_failure();
+        expect(!startup.pending(), "missing/admission failure disarms a pending candidate");
+        startup.observe_fresh(epoch, 208);
+        startup.observe_fresh(epoch, 209);
+        expect(!startup.pending(), "failure recovery starts a new three-fresh streak");
+        startup.observe_fresh(epoch, 210);
+        startup.complete(epoch, false);
+        expect(!startup.pending(), "failed reconfiguration cannot immediately retry");
+        startup.observe_fresh(epoch, 211);
+        startup.observe_fresh(epoch, 212);
+        expect(!startup.pending(), "failed force requires three new fresh frames before retry");
+        startup.observe_fresh(epoch, 213);
+        expect(startup.pending() == epoch, "first failure permits one bounded retry");
+        startup.complete(epoch, false);
+        for (std::uint64_t publication = 214; publication < 300; ++publication)
+            startup.observe_fresh(epoch, publication);
+        expect(!startup.pending(), "two failed attempts cannot cause a per-frame retry loop");
+
+        const Key new_stream{2000001, 8};
+        startup.observe_fresh(new_stream, 400);
+        startup.observe_fresh(new_stream, 399);
+        startup.observe_fresh(new_stream, 400);
+        expect(!startup.pending(), "nonmonotonic publication resets the new stream candidate");
+        startup.observe_fresh(new_stream, 401);
+        expect(startup.pending() == new_stream, "new producer stream has independent startup state");
+        startup.complete(new_stream, true);
+
+        const Key overflow{2000001, 9};
+        startup.observe_fresh(overflow, std::numeric_limits<std::uint64_t>::max() - 1);
+        startup.observe_fresh(overflow, std::numeric_limits<std::uint64_t>::max());
+        startup.observe_fresh(overflow, 1);
+        expect(!startup.pending(), "publication wraparound cannot manufacture continuity");
+
+        xrfg::LukeAfwStartupRendezvous changed_candidate;
+        changed_candidate.observe_fresh(key, 10);
+        changed_candidate.observe_fresh(key, 11);
+        changed_candidate.observe_fresh(epoch, 12);
+        changed_candidate.observe_fresh(epoch, 13);
+        expect(!changed_candidate.pending(), "two epochs cannot share a startup candidate streak");
+        changed_candidate.observe_fresh(epoch, 14);
+        changed_candidate.observe_failure(); // AFW Off/OFXR On cancels startup.
+        changed_candidate.complete(epoch, true);
+        expect(!changed_candidate.pending(), "disable cancels an armed request before it can complete");
+        changed_candidate.observe_fresh(epoch, 15);
+        changed_candidate.observe_fresh(epoch, 16);
+        expect(!changed_candidate.pending(), "re-enable cannot reuse a disabled candidate streak");
+        changed_candidate.observe_fresh(epoch, 17);
+        expect(changed_candidate.pending() == epoch, "re-enable requires three new fresh submissions");
+
+        xrfg::LukeAfwStartupRendezvous duplicate_candidate;
+        duplicate_candidate.observe_fresh(key, 300);
+        duplicate_candidate.observe_fresh(key, 300);
+        duplicate_candidate.observe_fresh(key, 301);
+        expect(!duplicate_candidate.pending(), "duplicate publication cannot count twice");
+        duplicate_candidate.observe_fresh(key, 302);
+        expect(duplicate_candidate.pending() == key, "three unique contiguous publications qualify startup");
+        duplicate_candidate.complete(key, true);
+        // F6, threshold and mode changes do not change producer stream/epoch.
+        duplicate_candidate.observe_fresh(key, 303);
+        duplicate_candidate.observe_fresh(key, 304);
+        duplicate_candidate.observe_fresh(key, 305);
+        expect(!duplicate_candidate.pending(), "AFW UI changes cannot rearm a completed producer context");
+
+        xrfg::LukeAfwStartupRendezvous ordinary_drain;
+        ordinary_drain.satisfy(Key{});
+        ordinary_drain.observe_fresh(key, 500);
+        ordinary_drain.satisfy(key);
+        ordinary_drain.observe_failure();
+        for (std::uint64_t publication = 501; publication < 510; ++publication)
+            ordinary_drain.observe_fresh(key, publication);
+        expect(!ordinary_drain.pending(), "ordinary successful hot On-to-Off drain satisfies startup without a force");
+        ordinary_drain.observe_fresh(epoch, 510);
+        ordinary_drain.observe_fresh(epoch, 511);
+        expect(!ordinary_drain.pending(), "ordinary drain does not satisfy a future history epoch");
+        ordinary_drain.observe_fresh(epoch, 512);
+        expect(ordinary_drain.pending() == epoch, "future epoch still needs its independent startup rendezvous");
+    }
+    {
+        xrfg::LukeCameraOrigin origin;
+        const std::array<float, 3> left{795.964600F, 2448.13086F, -4583.30908F};
+        const std::array<float, 3> right{795.918091F, 2448.17456F, -4583.30811F};
+        const auto first = origin.update(1000001, 7, left);
+        expect(first && *first && origin.position_relative(left) ==
+            std::array<float, 3>{0, 0, 0},
+            "first finite producer camera establishes a local AFW origin");
+        const auto anchor = origin.origin();
+        const auto peer = origin.update(1000001, 7, right);
+        expect(peer && !*peer && origin.origin() == anchor,
+            "opposite-eye publication preserves the same common origin");
+        const auto relative_right = origin.position_relative(right);
+        for (unsigned axis = 0; axis < 3; ++axis)
+            expect(relative_right[axis] == static_cast<float>(
+                static_cast<double>(right[axis]) - static_cast<double>(left[axis])),
+                "local camera translation is subtracted in double and cast once");
+
+        auto moved = left;
+        moved[0] += 8.0F;
+        moved[1] -= 4.0F;
+        moved[2] += 2.0F;
+        const auto movement = origin.update(1000001, 7, moved);
+        expect(movement && !*movement && origin.origin() == anchor &&
+            origin.position_relative(moved) == std::array<float, 3>{8, -4, 2} &&
+            origin.position_relative(right) == relative_right,
+            "camera motion preserves both the anchor and older eye history coordinates");
+
+        // Rebase the captured DOOM-scale world, not just a zero-origin fixture.
+        // Translating cameras and points by one origin leaves both eye view
+        // coordinates identical, including an independently rotated camera.
+        const xrfg::LukeCameraBasis basis{{
+            {0.733587086F, -0.679424882F, -0.0152251674F},
+            {0.0191475488F, 0.0430579595F, -0.998889148F},
+            {0.6793257F, 0.732480705F, 0.0445960872F}}};
+        const auto view_point = [&](const std::array<float, 3>& camera,
+                                    const std::array<float, 3>& point) {
+            std::array<double, 3> result{};
+            for (unsigned row = 0; row < 3; ++row)
+                for (unsigned axis = 0; axis < 3; ++axis)
+                    result[row] += (static_cast<double>(point[axis]) -
+                        static_cast<double>(camera[axis])) * basis[row][axis];
+            return result;
+        };
+        for (const auto& camera : {left, right, moved}) {
+            auto point = left;
+            point[0] += 1.0F;
+            point[1] += 2.0F;
+            point[2] -= 5.0F;
+            const auto before = view_point(camera, point);
+            const auto after = view_point(origin.position_relative(camera),
+                origin.position_relative(point));
+            for (unsigned row = 0; row < 3; ++row)
+                expect(std::abs(before[row] - after[row]) < 1.0e-9,
+                    "common-origin rebasing preserves both eyes' world-to-view transforms");
+        }
+
+        for (const float invalid : {std::numeric_limits<float>::quiet_NaN(),
+                 std::numeric_limits<float>::infinity(),
+                 -std::numeric_limits<float>::infinity()}) {
+            auto bad = right;
+            bad[1] = invalid;
+            expect(!origin.update(1000002, 8, bad, true) && origin.origin() == anchor,
+                "nonfinite producer position cannot mutate the stream/epoch origin");
+            expect(!std::isfinite(origin.position_relative(bad)[0]),
+                "nonfinite history position is rejected instead of silently rebased");
+        }
+        const auto stream_change = origin.update(1000002, 7, right);
+        expect(stream_change && *stream_change && origin.position_relative(right) ==
+            std::array<float, 3>{0, 0, 0},
+            "new producer stream invalidates the previous shared origin");
+        const auto epoch_change = origin.update(1000002, 8, moved);
+        expect(epoch_change && *epoch_change && origin.position_relative(moved) ==
+            std::array<float, 3>{0, 0, 0},
+            "new producer epoch invalidates the previous shared origin");
+        const auto explicit_reset = origin.update(1000002, 8, left, true);
+        expect(explicit_reset && *explicit_reset && origin.position_relative(left) ==
+            std::array<float, 3>{0, 0, 0},
+            "explicit producer reset reanchors even within an unchanged stream/epoch");
+        const auto after_reset = origin.update(1000002, 8, right);
+        expect(after_reset && !*after_reset,
+            "ordinary publications after reset do not reanchor every frame");
+        xrfg::LukeCameraOrigin uninitialized;
+        expect(!std::isfinite(uninitialized.position_relative(left)[0]),
+            "uninitialized origin does not manufacture usable camera coordinates");
+    }
     // Every combination of missing devices, optional depth, adapter and strict
     // queue/list identity must preserve the old guard's acceptance exactly.
     for (unsigned bits = 0; bits < 1024; ++bits) {
@@ -289,12 +491,16 @@ int main() {
     expect(!xrfg::luke_destination_camera_basis({0, 0, 0, 0}, yaw(10.0F),
         camera_basis, peer_basis), "invalid XR orientation rejects camera");
     xrfg::LukeCameraBasis lh_view{}, rh_view{}, lh_peer{}, rh_peer{};
-    const xrfg::LukeCameraBasis physical_basis{{
+    const xrfg::LukeCameraBasis lh_producer_basis{{
         {1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
-    expect(xrfg::luke_view_camera_basis(physical_basis, 1.0F, lh_view) &&
-        xrfg::luke_view_camera_basis(physical_basis, -1.0F, rh_view) &&
+    const xrfg::LukeCameraBasis rh_producer_basis{{
+        {1, 0, 0}, {0, 1, 0}, {0, 0, -1}}};
+    expect(xrfg::luke_view_camera_basis(lh_producer_basis, 1.0F, lh_view,
+            xrfg::LukeProducerCameraAxes::view) &&
+        xrfg::luke_view_camera_basis(rh_producer_basis, -1.0F, rh_view,
+            xrfg::LukeProducerCameraAxes::view) &&
         near(lh_view[2][2], 1.0F) && near(rh_view[2][2], -1.0F),
-        "view forward follows producer projection while RH behavior is retained");
+        "LH and RH producer view rows are preserved without double reflection");
     expect(xrfg::luke_destination_view_camera_basis(yaw(0), yaw(10), lh_view,
         1.0F, lh_peer) && xrfg::luke_destination_view_camera_basis(yaw(0), yaw(10),
         rh_view, -1.0F, rh_peer), "both view conventions accept headset yaw");
@@ -304,8 +510,9 @@ int main() {
                 "LH and RH camera yaw describe the same physical rotation");
     for (float sign : {-1.0F, 1.0F}) {
         xrfg::LukeCameraBasis view{};
-        expect(xrfg::luke_view_camera_basis(physical_basis, sign, view),
-            "producer forward convention is computable");
+        expect(xrfg::luke_view_camera_basis(sign > 0 ? lh_producer_basis :
+            rh_producer_basis, sign, view, xrfg::LukeProducerCameraAxes::view),
+            "producer view convention is computable");
         // A point five metres ahead and a peer shifted right must remain
         // in front and move left in the destination view for either matrix.
         const float view_z = 5.0F * view[2][2];
@@ -314,9 +521,164 @@ int main() {
             -0.06F * ghost_projection[0] / 5.0F),
             "stereo disparity and positive clip W agree across handedness");
     }
-    expect(!xrfg::luke_view_camera_basis(physical_basis, 0, lh_view) &&
+    expect(!xrfg::luke_view_camera_basis(lh_producer_basis, 0, lh_view,
+            xrfg::LukeProducerCameraAxes::view) &&
         !xrfg::luke_destination_view_camera_basis(yaw(0), yaw(10), rh_view, 0, rh_peer),
         "degenerate perspective does not select a guessed camera convention");
+    // PID23856 publications1708 ->1707. The TSV camera_forward column is
+    // the CONSUMED V78 row (written after camera_data), not original Fwd.
+    // Undo V78's known m[11]=-1 multiplication to recover producer input.
+    // Compare projection of actual world points with independent declared
+    // Streamline clipToPrevClip, not with the old helper's assumptions.
+    const xrfg::LukeCameraBasis captured_current{{
+        {0.939639568F, 0.320974499F, -0.118545517F},
+        {0.0473205224F, 0.221225843F, 0.974073887F},
+        {0.338878185F, -0.920887947F, 0.192683861F}}};
+    const xrfg::LukeCameraBasis captured_previous{{
+        {0.947595358F, 0.28590554F, -0.142551824F},
+        {0.0787854791F, 0.223294601F, 0.971561909F},
+        {0.309605986F, -0.931878567F, 0.189067721F}}};
+    const std::array<double, 3> captured_current_position{-277.36972, -115.582558, 7.01657772};
+    const std::array<double, 3> captured_previous_position{-277.419067, -115.597961, 7.02474356};
+    const std::array<double, 16> captured_projection{
+        .854080677,0,0,0, 0,.854080677,0,0,
+        0,0,.0000073242727,-1, 0,0,.060000442,0};
+    const std::array<double, 16> captured_declared_history{
+        .99906534,.0305275153,-.000000262451408,.0358331017,
+        -.030765608,.999499798,-.0000000629363655,.00859284867,
+        .744880795,-.00862929877,.99999994,.0103368396,
+        -.025928691,-.00706644962,.00000000362706487,.999504805};
+    const auto project_fixture = [](const std::array<double, 4>& point,
+        const std::array<double, 16>& matrix) {
+        std::array<double, 4> result{};
+        for (unsigned c = 0; c < 4; ++c)
+            for (unsigned r = 0; r < 4; ++r) result[c] += point[r] * matrix[r * 4 + c];
+        return result;
+    };
+    xrfg::LukeCameraBasis captured_view{}, captured_prior_view{};
+    expect(xrfg::luke_view_camera_basis(captured_current, -1, captured_view,
+            xrfg::LukeProducerCameraAxes::view) &&
+        xrfg::luke_view_camera_basis(captured_previous, -1, captured_prior_view,
+            xrfg::LukeProducerCameraAxes::view),
+        "actual captured RH producer rows are admitted");
+    for (const std::array<double, 4> point : {
+            std::array<double, 4>{.4,.2,-5,1}, {-1,.5,-2,1}, {4,-3,-30,1}}) {
+        std::array<double, 3> world = captured_current_position;
+        for (unsigned c = 0; c < 3; ++c)
+            for (unsigned r = 0; r < 3; ++r) world[c] += point[r] * captured_view[r][c];
+        std::array<double, 4> previous_point{0,0,0,1};
+        for (unsigned r = 0; r < 3; ++r)
+            for (unsigned c = 0; c < 3; ++c)
+                previous_point[r] += (world[c] - captured_previous_position[c]) *
+                    captured_prior_view[r][c];
+        const auto predicted = project_fixture(previous_point, captured_projection);
+        const auto declared = project_fixture(project_fixture(point, captured_projection),
+            captured_declared_history);
+        for (unsigned c = 0; c < 3; ++c)
+            expect(std::abs(predicted[c] / predicted[3] - declared[c] / declared[3]) < 5.0e-5,
+                "captured moving camera agrees with declared SL history across scene depths");
+    }
+    auto invalid_basis = captured_current;
+    invalid_basis[2][0] = std::numeric_limits<float>::quiet_NaN();
+    expect(!xrfg::luke_view_camera_basis(invalid_basis, -1, captured_view,
+            xrfg::LukeProducerCameraAxes::view),
+        "nonfinite producer basis is rejected rather than guessed");
+    expect(!xrfg::luke_view_camera_basis(captured_current, -1, captured_view,
+            static_cast<xrfg::LukeProducerCameraAxes>(99)),
+        "unknown producer axis contract is rejected instead of guessed");
+    {
+        // DOOM V30089 PID8952, immutable real colours6162 ->6161. The supplied
+        // rows are right/down/forward, whereas the image projection consumes
+        // right/up/back. Both changed rows are required; an Fwd-only reflection
+        // was rejected in V30088. This is not a declared-SL-history fixture.
+        const xrfg::LukeCameraBasis doom_current{{
+            {0.833019257F, -0.549696326F, -0.0625534728F},
+            {-0.05711063F, 0.02702263F, -0.998002052F},
+            {0.550288439F, 0.83492744F, -0.00888313074F}}};
+        const xrfg::LukeCameraBasis doom_previous{{
+            {0.830590904F, -0.553524435F, -0.0610701889F},
+            {-0.0562100895F, 0.0257725492F, -0.998086333F},
+            {0.554039061F, 0.832434118F, -0.00970721152F}}};
+        const std::array<double, 3> doom_current_position{
+            -0.00482177734, 0.0168457031, 0.00244140625};
+        const std::array<double, 3> doom_previous_position{
+            0.048034668, -0.0185546875, -0.00146484375};
+        xrfg::LukeCameraBasis current_view{}, previous_view{}, unchanged_view{};
+        expect(xrfg::luke_view_camera_basis(doom_current, -1, current_view,
+                xrfg::LukeProducerCameraAxes::right_down_forward) &&
+            xrfg::luke_view_camera_basis(doom_previous, -1, previous_view,
+                xrfg::LukeProducerCameraAxes::right_down_forward),
+            "DOOM complete producer axis contract is decoded for current and history");
+        for (unsigned row = 0; row < 3; ++row)
+            for (unsigned coordinate = 0; coordinate < 3; ++coordinate)
+                expect(current_view[row][coordinate] == doom_current[row][coordinate] *
+                    (row == 0 ? 1.0F : -1.0F),
+                    "right/down/forward rotates Up and Fwd together while preserving Right");
+        expect(xrfg::luke_view_camera_basis(doom_current, -1, unchanged_view,
+                xrfg::LukeProducerCameraAxes::view) && unchanged_view == doom_current,
+            "accepted ordinary producer view contract remains byte-identical");
+        invalid_basis = doom_current;
+        invalid_basis[1][1] = std::numeric_limits<float>::infinity();
+        expect(!xrfg::luke_view_camera_basis(invalid_basis, -1, unchanged_view,
+                xrfg::LukeProducerCameraAxes::right_down_forward),
+            "nonfinite right/down/forward producer rows are rejected");
+
+        const xrfg::Quaternion current_head{0.00602520537F, -0.0506943725F,
+            0.031026708F, -0.998214066F};
+        const xrfg::Quaternion previous_head{0.00633070152F, -0.0484380238F,
+            0.0302784983F, -0.998347223F};
+        xrfg::LukeCameraBasis destination_view{};
+        expect(xrfg::luke_destination_view_camera_basis(current_head, previous_head,
+                current_view, -1, destination_view),
+            "decoded DOOM view uses the same accepted XR destination rotation");
+        for (unsigned row = 0; row < 3; ++row)
+            for (unsigned coordinate = 0; coordinate < 3; ++coordinate)
+                expect(near(destination_view[row][coordinate],
+                    previous_view[row][coordinate], 2.0e-6F),
+                    "DOOM captured headset delta reaches the actual opposite rendered camera");
+
+        // x/y are current guide-pixel centres, z is bilinearly sampled native
+        // depth, dx/dy are bidirectionally checked LK displacements measured
+        // from the two independently captured real colour images (not AFW).
+        const std::array<std::array<double, 5>, 8> real_colour_tracks{{
+            {642,689,.0013668662,-3.685669,-.38861084},
+            {589,850,.00499421,-6.449707,-.4295044},
+            {611,776,.0028919429,-4.7799683,-.3961792},
+            {370,447,.014618282,-12.943787,-1.4966125},
+            {817,753,.001979855,-4.376953,-.2220459},
+            {644,654,.0012784565,-3.6744385,-.4039917},
+            {658,844,.0044243755,-5.954529,-.32696533},
+            {1015,700,.0023304194,-5.1900024,.258667}}};
+        constexpr double focal_x = .932515085;
+        constexpr double focal_y = .854080677;
+        constexpr double depth_a = .00000600003568;
+        constexpr double depth_b = .0600003563;
+        for (const auto& track : real_colour_tracks) {
+            const double u = (track[0] + .5) / 1341;
+            const double v = (track[1] + .5) / 1464;
+            const double view_z = -depth_b / (track[2] + depth_a);
+            const std::array<double, 3> point{
+                (2*u-1)*(-view_z)/focal_x,
+                (1-2*v)*(-view_z)/focal_y, view_z};
+            auto world = doom_current_position;
+            for (unsigned coordinate = 0; coordinate < 3; ++coordinate)
+                for (unsigned row = 0; row < 3; ++row)
+                    world[coordinate] += point[row] * current_view[row][coordinate];
+            std::array<double, 3> previous_point{};
+            for (unsigned row = 0; row < 3; ++row)
+                for (unsigned coordinate = 0; coordinate < 3; ++coordinate)
+                    previous_point[row] += (world[coordinate] -
+                        doom_previous_position[coordinate]) * previous_view[row][coordinate];
+            const double previous_u = focal_x*previous_point[0] /
+                (-previous_point[2])*.5+.5;
+            const double previous_v = -focal_y*previous_point[1] /
+                (-previous_point[2])*.5+.5;
+            const double error_x = (previous_u-u)*1341 - track[3];
+            const double error_y = (previous_v-v)*1464 - track[4];
+            expect(std::hypot(error_x,error_y) < .12,
+                "decoded DOOM world motion matches immutable adjacent real colours at varied depths");
+        }
+    }
     const std::array<float, 3> camera_right{0.27F, 0.96F, 0.01F};
     const std::array<float, 3> camera_left_position{0.0F, 0.0F, 0.0F};
     const std::array<float, 3> camera_right_position{0.0162F, 0.0576F, 0.0006F};

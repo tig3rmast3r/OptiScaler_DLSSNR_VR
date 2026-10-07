@@ -19,6 +19,7 @@
 #include "xrfg/generation_backpressure.hpp"
 #include "xrfg/implicit_layer.hpp"
 #include "xrfg/luke_afw.hpp"
+#include "xrfg/luke_afw_startup.hpp"
 #include "xrfg/luke_color_origin.hpp"
 #include "xrfg/luke_world_scale.hpp"
 #include "xrfg/embedded_control.hpp"
@@ -787,6 +788,9 @@ struct SessionState {
     // Physical separation from ONE runtime pair, not cross-time AER poses.
     std::optional<float> luke_xr_eye_baseline; // mutex
     std::optional<bool> luke_afw_previous_selected; // frame_call_mutex
+    xrfg::LukeAfwStartupRendezvous luke_afw_startup; // frame_call_mutex
+    std::optional<xrfg::LukeAfwStartupKey> luke_afw_startup_drained; // frame_call_mutex
+    std::optional<xrfg::LukeAfwStartupKey> luke_afw_last_delivered_startup_key; // frame_call_mutex
     bool luke_afw_odd_serial_is_left{true};
     bool luke_afw_f6_down{}; // frame_call_mutex; high-bit edge detector
     bool luke_f11_down{}; // frame_call_mutex; lightweight timing marker
@@ -9148,6 +9152,11 @@ struct PreparedProjectionResource {
     PreparedGeneration generation;
 };
 
+struct LukeAfwStartupCandidate {
+    xrfg::LukeAfwStartupKey key;
+    std::uint64_t publication{};
+};
+
 struct PreparedProjectionFrame {
     PreparedGenerationKind kind{PreparedGenerationKind::none};
     GenerationPrepareReason reason{GenerationPrepareReason::exception};
@@ -9156,6 +9165,7 @@ struct PreparedProjectionFrame {
     bool anchor_is_current{};
     bool preserve_previous{};
     std::shared_ptr<const HeldAfwPair> held_afw_pair;
+    std::optional<LukeAfwStartupCandidate> startup_candidate;
 };
 
 void attach_djules_outputs(PreparedProjectionFrame& prepared,
@@ -9270,6 +9280,14 @@ struct AfwSourceCapture {
     float extra_fraction=2.0F/3.0F) noexcept {
     PreparedGeneration output{};
     try {
+        // AFW's frozen source is transport, never a temporal OFXR prime.
+        // Reject incompatible callers rather than letting them silently feed
+        // this color into a backend-specific synthesis path.
+        if (afw_source && (request_pair || worker_submission ||
+                !defer_d3d11_publication || post_afw_input)) {
+            output.reason = GenerationPrepareReason::missing_generation;
+            return output;
+        }
         const auto state = find_swapchain(application_swapchain);
         if (!state) {
             output.reason = GenerationPrepareReason::unknown_swapchain;
@@ -9493,7 +9511,15 @@ struct AfwSourceCapture {
                 generation->d3d11_interop == nullptr &&
                 !state->session->queued_nvidia_presenter;
             if (!generation->d3d11_interop || SUCCEEDED(submit_result)) {
-                submit_result = request_pair ? synthesizer->submit_pair(
+                if (afw_source) {
+                    // All Luke games/modes consume the exact immutable input
+                    // color here. Backend warm-up belongs only to real OFXR
+                    // priming, not this per-frame AFW scratch-image copy.
+                    submit_result = synthesizer->submit_copy(
+                        *capture, current_source_views,
+                        current_destination_index, &ticket);
+                } else if (request_pair) {
+                    submit_result = synthesizer->submit_pair(
                                           *capture,
                                           current_source_views,
                                           current_source_views,
@@ -9507,13 +9533,15 @@ struct AfwSourceCapture {
                                           request_extra ? std::optional<xrfg::D3D12ExtraSynthetic>{
                                               xrfg::D3D12ExtraSynthetic{generation->staged_outputs ? synthetic_destination_index+1 :
                                                   static_cast<std::uint32_t>(synthetic_slot+2) * generation->synthetic_images_per_slot + extra_image.acquired_index,
-                                                  extra_fraction}} : std::nullopt)
-                                    : synthesizer->submit_prime(
+                                                  extra_fraction}} : std::nullopt);
+                } else {
+                    submit_result = synthesizer->submit_prime(
                                           *capture,
                                           current_source_views,
                                           current_destination_index,
                                           &ticket,
                                           motion_vectors, presentation_transform);
+                }
                 if (request_pair && post_afw_input) {
                     xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::luke_afw_stage,
                         submit_result, 101, post_afw_input->color_identity.application_serial,
@@ -10835,6 +10863,9 @@ void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept 
         output.kind = PreparedGenerationKind::prime;
         output.reason = GenerationPrepareReason::ready;
         output.anchor_is_current = true;
+        output.startup_candidate = LukeAfwStartupCandidate{
+            {source.guide->stream, source.guide->epoch},
+            source.guide->publication};
         output.resources.reserve(entries.size());
         for (std::size_t index = 0; index < entries.size(); ++index) {
             output.resources.push_back({
@@ -11394,9 +11425,13 @@ HRESULT reconcile_depth_history_for_route(SwapchainState& chain) {
 
 // Called with frame ownership and presenter content excluded. No GUI thread
 // touches GPU objects; no new captures may enter during this transaction.
-void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
+HRESULT apply_embedded_control(const std::shared_ptr<SessionState>& state,
+                               bool force_startup_rendezvous = false) {
     const auto control = xrfg::embedded::snapshot();
-    if (state->control_revision == control.revision) return;
+    // A concurrent GUI enable cancels the Off-only startup request; ordinary
+    // control application will take that revision on the next safe entry.
+    if (force_startup_rendezvous && control.desired.enabled) return E_ABORT;
+    if (state->control_revision == control.revision && !force_startup_rendezvous) return S_OK;
     if (continuous_presenter_active(state))
         static_cast<void>(wait_for_presenter_idle(state));
     state->menu_enabled = false;
@@ -11418,7 +11453,7 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
         static_cast<xrfg::D3D12NvidiaPerformancePreset>(control.desired.preset),
         static_cast<xrfg::D3D12NvidiaInputScale>(control.desired.scale), control.desired.backward,
         nvidia_new_route, xrfg::flow_encoding_for_route(nvidia_new_route), nvidia_new_route};
-    const bool changed = state->control_reconfigure_required || backend != state->optical_flow_backend ||
+    const bool changed = force_startup_rendezvous || state->control_reconfigure_required || backend != state->optical_flow_backend ||
         options.preset != state->nvidia_options.preset ||
         options.input_scale != state->nvidia_options.input_scale ||
         options.bidirectional != state->nvidia_options.bidirectional ||
@@ -11563,6 +11598,7 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
     xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::embedded_configuration,
         result, control.revision, optical_flow_configuration_code(backend, options),
         (state->menu_enabled ? 1ULL : 0ULL) | (state->nvidia_new_route ? 2ULL : 0ULL));
+    return result;
 }
 
 // Correlate source-release fingerprints with submitted eye metadata, even
@@ -11971,12 +12007,72 @@ XrResult layer_end_frame_impl(
         return XR_SUCCESS;
     };
 
-    apply_embedded_control(state);
-    const auto pipeline_result=poll_djules_pipeline(state);
-    if(XR_FAILED(pipeline_result)) return pipeline_result;
     const auto afw_control = xrfg::embedded::afw_snapshot();
     const bool afw_selected = state->luke_afw_enabled &&
         afw_control.desired.mode != 0;
+    const bool ofxr_was_enabled = state->menu_enabled;
+    const auto desired_control = xrfg::embedded::snapshot();
+    auto startup_request = state->luke_afw_startup.pending();
+    if (!afw_selected || desired_control.desired.enabled) {
+        state->luke_afw_startup.observe_failure();
+        startup_request.reset();
+    } else if (startup_request && !luke_afw_released_eye) {
+        // The drained control lifecycle clears the held pair. Execute it
+        // only alongside an already-committed fresh release so this cycle
+        // can repopulate both eyes instead of falling back to raw AER.
+        // Qualification stays armed; a held cycle consumes no attempt.
+        startup_request.reset();
+    }
+    if (startup_request && xrfg::bridge_flight_logger().ram_enabled())
+        xrfg::bridge_flight_logger().event(
+            xrfg::BridgeFlightOperation::luke_frame_contract,
+            S_OK, 126,
+            startup_request->stream, startup_request->epoch);
+    const HRESULT control_result = apply_embedded_control(state, startup_request.has_value());
+    if (startup_request) {
+        state->luke_afw_startup.complete(*startup_request, SUCCEEDED(control_result));
+        if (xrfg::bridge_flight_logger().ram_enabled())
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::luke_frame_contract,
+                control_result, 127, startup_request->stream, startup_request->epoch);
+    }
+    if (ofxr_was_enabled && !state->menu_enabled && SUCCEEDED(control_result) &&
+        afw_selected)
+        state->luke_afw_startup_drained = state->luke_afw_last_delivered_startup_key;
+    else if (state->menu_enabled || !afw_selected)
+        state->luke_afw_startup_drained.reset();
+
+    const auto pipeline_result=poll_djules_pipeline(state);
+    if(XR_FAILED(pipeline_result)) return pipeline_result;
+
+    // Only the synchronous AFW->XR Off path supplies startup observations.
+    // The guard covers validation/bypass/failed-prepare early returns without
+    // treating an async director handoff as a physically completed frame.
+    struct StartupObservationScope {
+        SessionState& state;
+        std::unique_lock<std::mutex>& ownership;
+        bool eligible;
+        bool physical_success{};
+        bool held{};
+        std::optional<LukeAfwStartupCandidate> candidate;
+        ~StartupObservationScope() {
+            if (!eligible || !ownership.owns_lock()) return;
+            if (!physical_success) {
+                state.luke_afw_startup.observe_failure();
+            } else if (candidate) {
+                state.luke_afw_last_delivered_startup_key = candidate->key;
+                if (state.luke_afw_startup_drained == candidate->key) {
+                    state.luke_afw_startup.satisfy(candidate->key);
+                    state.luke_afw_startup_drained.reset();
+                } else {
+                    state.luke_afw_startup_drained.reset();
+                    state.luke_afw_startup.observe_fresh(candidate->key, candidate->publication);
+                }
+            } else if (!held) {
+                state.luke_afw_startup.observe_failure();
+            }
+        }
+    } startup_observation{*state, frame_call_lock, afw_selected && !state->menu_enabled};
     if (state->luke_afw_previous_selected &&
         *state->luke_afw_previous_selected != afw_selected) {
         // The two generators have distinct temporal anchors. A menu switch
@@ -12417,6 +12513,8 @@ XrResult layer_end_frame_impl(
         if (!build_afw_terminal_submission(end_info, current_snapshot, afw_produced,
                 afw_terminal_submission, afw_terminal_snapshot))
             return bypass_generation(GenerationPrepareReason::generated_end_info_failed);
+        startup_observation.candidate = afw_produced.startup_candidate;
+        startup_observation.held = afw_produced.held_afw_pair != nullptr;
         if (!inputs.empty()) {
             completed_afw = freeze_completed_afw_frame(state, &afw_terminal_submission.info,
                 afw_terminal_snapshot, std::move(inputs), frame_serial);
@@ -12951,6 +13049,11 @@ XrResult layer_end_frame_impl(
             static_cast<std::uint32_t>(result));
         return result;
     }
+    // A ready single AFW output has now actually completed runtime EndFrame,
+    // including the waited presenter single-submission case. Held outputs do
+    // not arm or interrupt the fresh-publication sequence.
+    startup_observation.physical_success = !pair_ready &&
+        prepared.kind == PreparedGenerationKind::prime;
     if (pair_ready) {
         state->generation_steady_state_established = true;
     }

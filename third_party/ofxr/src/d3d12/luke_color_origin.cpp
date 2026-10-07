@@ -351,7 +351,16 @@ HRESULT read_luke_color_origin(ID3D12CommandQueue* queue, ID3D12Resource* color,
         result = queue->Signal(reader->fence.Get(), value);
         if (FAILED(result)) { reader->poisoned = true; return report.finish(result); }
         reader->last_fence = value;
+        // RAM only: correlate each phase by (reader address, fence value).
+        // 123->124 is queued GPU readiness; 124->125 is Map/luma/CRC decode.
+        const bool ram_reader_timing = bridge_flight_logger().ram_enabled();
+        if (ram_reader_timing)
+            bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage,
+                result, 123, reinterpret_cast<std::uint64_t>(reader.get()), value);
         result = wait_reader(*reader, timeout_ms);
+        if (ram_reader_timing)
+            bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage,
+                result, 124, reinterpret_cast<std::uint64_t>(reader.get()), value);
         if (FAILED(result)) return report.finish(result);
         std::vector<float> row(layout.scan.width);
         void* mapped{}; const D3D12_RANGE range{0, static_cast<SIZE_T>(bytes)};
@@ -371,6 +380,11 @@ HRESULT read_luke_color_origin(ID3D12CommandQueue* queue, ID3D12Resource* color,
             exact_token = decoded.token;
         }
         const D3D12_RANGE no_write{0, 0}; reader->readback->Unmap(0, &no_write);
+        const HRESULT decode_status = ambiguous ? HRESULT_FROM_WIN32(ERROR_INVALID_DATA)
+            : exact_token ? S_OK : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        if (ram_reader_timing)
+            bridge_flight_logger().event(BridgeFlightOperation::luke_afw_stage,
+                decode_status, 125, reinterpret_cast<std::uint64_t>(reader.get()), value);
         if (ambiguous) return report.finish(HRESULT_FROM_WIN32(ERROR_INVALID_DATA));
         if (!exact_token) return report.finish(HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
         *token = exact_token;

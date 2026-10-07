@@ -6,7 +6,7 @@
 #include <wrl/client.h>
 #include "../../../OptiScaler/hooks/LukeVulkanProducer.h"
 #include "../../../OptiScaler/hooks/LukeCaptureParameters.h"
-#include "../../../OptiScaler/hooks/LukeSourceContext.h"
+#include "../../../OptiScaler/hooks/LukeAERMotionSnapshot.h"
 #include <map>
 #include <string>
 #include "../../../OptiScaler/hooks/VulkanInteropSubmit.h"
@@ -25,20 +25,43 @@ void check(HRESULT value) { if (FAILED(value)) throw std::runtime_error("D3D12 H
 void vkcheck(VkResult value) { if (value != VK_SUCCESS) throw std::runtime_error("Vulkan result " + std::to_string(value)); }
 
 void submit_contracts() {
-    using namespace luke_source;
-    expect(active.frame==unknown && active.viewport==unknown,"diagnostic context initially unknown");
-    expect(key(4,1)!=key(4,2) && key(4,1)!=key(5,1),"source identity includes frame AND viewport");
-    {
-        Scope outer(4,1,9);
-        expect(active.frame==4 && active.viewport==1 && active.feature==9,"outer evaluation identity");
-        { Scope inner(5,2,10); expect(active.frame==5 && active.viewport==2,"nested evaluation identity"); }
-        expect(active.frame==4 && active.viewport==1 && active.feature==9,"nested diagnostic scope restores exact parent");
-    }
-    expect(active.frame==unknown && active.viewport==unknown,"diagnostic scope never leaks to a later evaluation");
-    float matrix[16]{}; auto unchanged=hash(matrix,16);
-    expect(unchanged==hash(matrix,16),"deterministic semantic camera hash");
-    matrix[5]=1; expect(unchanged!=hash(matrix,16),"camera hash detects changed geometry");
-    expect(pair(-1.F,1.F)!=pair(1.F,-1.F),"signed scale diagnostics preserve both axes");
+    struct MotionSource {
+        NVSDK_NGX_Resource_VK* resource{};
+        NVSDK_NGX_Result Get(const char*,void** value) const {
+            *value=resource;return NVSDK_NGX_Result_Success;
+        }
+    } producer;
+    NVSDK_NGX_Resource_VK native{};
+    native.Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW;
+    native.Resource.ImageViewInfo.Image=reinterpret_cast<VkImage>(11);
+    native.Resource.ImageViewInfo.ImageView=reinterpret_cast<VkImageView>(12);
+    native.Resource.ImageViewInfo.Width=1464;native.Resource.ImageViewInfo.Height=1464;
+    producer.resource=&native;
+    luke_vulkan::AERMotionSnapshot original;
+    original.capture(producer);
+    expect(original.valid && original.resource.Resource.ImageViewInfo.Image==reinterpret_cast<VkImage>(11),
+        "native AER snapshot must bind this evaluation's ingress field");
+    native.Resource.ImageViewInfo.Image=reinterpret_cast<VkImage>(99);
+    native.Resource.ImageViewInfo.Width=2048;
+    expect(original.resource.Resource.ImageViewInfo.Image==reinterpret_cast<VkImage>(11) &&
+        original.resource.Resource.ImageViewInfo.Width==1464,
+        "downstream descriptor mutation must not retarget the captured AER field");
+    producer.resource=nullptr;original.capture(producer);
+    expect(!original.valid && !original.resource.Resource.ImageViewInfo.Image,
+        "missing current field cannot reuse a prior evaluation's descriptor");
+    native.Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_BUFFER;producer.resource=&native;
+    original.capture(producer);expect(!original.valid,"buffer cannot stand in for image motion");
+    luke_vulkan::FrozenMotionReceipt frozen;
+    const auto command=reinterpret_cast<VkCommandBuffer>(21);
+    expect(!frozen.matches(command, 7),"no frozen GPU pixels before preparation");
+    frozen.publish(command, 7);
+    expect(frozen.matches(command, 7),"frozen motion belongs to this command/evaluation");
+    expect(!frozen.matches(command, 8) && !frozen.matches(reinterpret_cast<VkCommandBuffer>(22), 7),
+        "reused command or same-frame different command cannot consume old pixels");
+    frozen.reset();
+    expect(!frozen.matches(command, 7),"failed preparation/completed capture cannot leave a stale receipt");
+    frozen.publish(VK_NULL_HANDLE, 7);
+    expect(!frozen.valid,"invalid command cannot publish a frozen receipt");
     expect(library_search::accept_streamline_candidate(L"nvngx_dlss.dll",false) &&
         library_search::accept_streamline_candidate(L"nvngx_dlssd.dll",false),
         "native SR/RR dependencies cannot depend on enabled DLSSG output");
@@ -186,9 +209,37 @@ struct Gpu {
         ComPtr<ID3D12Device> earlyOwner, captureOwner;
         ComPtr<ID3D12CommandQueue> earlyQueue;
         check(producer.get(0, &earlyOwner, &earlyQueue));
-        check(producer.get(deviceKey, &captureOwner, &d3dQueue));
-        expect(earlyOwner.Get() == captureOwner.Get() && earlyQueue.Get() == d3dQueue.Get(),
-            "XR session and later Vulkan capture must use the same exact producer pair");
+        ComPtr<ID3D12CommandQueue> xrQueue;
+        check(producer.get(deviceKey, &captureOwner, &xrQueue));
+        expect(earlyOwner.Get() == captureOwner.Get() && earlyQueue.Get() == xrQueue.Get(),
+            "early XR owner identity must remain stable");
+        check(luke_vulkan::create_capture_queue(captureOwner.Get(), xrQueue.Get(), &d3dQueue));
+        expect(d3dQueue.Get() != xrQueue.Get(), "native capture cannot block the XR owner queue");
+        ComPtr<ID3D12Device> actualCaptureOwner;
+        check(d3dQueue->GetDevice(IID_PPV_ARGS(&actualCaptureOwner)));
+        expect(actualCaptureOwner.Get() == captureOwner.Get(), "capture must retain the exact owner device");
+        // Reproduce the early Vulkan wait. The consumer must still submit and
+        // complete its own work before Vulkan releases the capture queue.
+        ComPtr<ID3D12Fence> pendingCapture, consumerProgress;
+        check(captureOwner->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pendingCapture)));
+        check(captureOwner->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&consumerProgress)));
+        struct CaptureWaitRelease {
+            ID3D12Fence* fence;
+            ~CaptureWaitRelease() { if (fence) fence->Signal(1); }
+            void release() { check(fence->Signal(1)); fence = nullptr; }
+        } releaseCapture{pendingCapture.Get()};
+        check(d3dQueue->Wait(pendingCapture.Get(), 1));
+        check(xrQueue->Signal(consumerProgress.Get(), 1));
+        struct EventHandle {
+            HANDLE value;
+            ~EventHandle() { if (value) CloseHandle(value); }
+        } progressEvent{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
+        expect(progressEvent.value != nullptr, "consumer progress event");
+        check(consumerProgress->SetEventOnCompletion(1, progressEvent.value));
+        const DWORD progress = WaitForSingleObject(progressEvent.value, 1000);
+        // The scope guard also handles every intermediate failure above.
+        releaseCapture.release();
+        expect(progress == WAIT_OBJECT_0, "future Vulkan capture wait blocked the consumer queue");
         d3d = captureOwner;
         producer.record(deviceKey + 1, d3d->GetAdapterLuid(), 1, true);
         ID3D12Device* rejectedOwner{}; ID3D12CommandQueue* rejectedQueue{};
@@ -313,6 +364,13 @@ struct Gpu {
             copy(commands[0],local,shared);
             barrier(commands[0],shared,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,family,VK_QUEUE_FAMILY_EXTERNAL);
         }
+        // Simulate a downstream in-place producer write AFTER capture, in the
+        // same command. The shared snapshot/copyback must retain pre-write
+        // pixels (compared below), with both shader and transfer copy paths.
+        barrier(commands[0],local,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkClearColorValue downstream{{.9f,.1f,.2f,0.f}};
+        vkCmdClearColorImage(commands[0],local,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&downstream,1,&range);
+        barrier(commands[0],local,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         barrier(commands[1],shared,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL,VK_QUEUE_FAMILY_EXTERNAL,family);
         barrier(commands[1],shared,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         barrier(commands[1],local,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);

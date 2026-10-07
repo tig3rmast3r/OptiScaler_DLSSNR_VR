@@ -67,18 +67,6 @@ bool selected_generic(BridgeFlightOperation op) noexcept {
     default: return false;
     }
 }
-bool selected_luke_source_stage(std::uint64_t a) noexcept {
-    // V30073 emitted these receipts, but the pose profile discarded them.
-    // Admit ONLY the live source contract, not retired renderer diagnostics.
-    if ((a >= 200 && a <= 203) || (a >= 208 && a <= 211) ||
-        a == 360 || a == 400 || a == 401) return true;
-    for (const std::uint64_t base : {320ULL, 368ULL, 416ULL})
-        if (a >= base && a <= base + 28 && (a - base) % 8 <= 4)
-            return true;
-    for (const std::uint64_t base : {480ULL, 520ULL, 560ULL})
-        if (a >= base && a <= base + 23) return true;
-    return false;
-}
 bool selected_pose(BridgeFlightOperation op, std::uint64_t a) noexcept {
     using O = BridgeFlightOperation;
     switch (op) {
@@ -117,9 +105,8 @@ bool selected_pose(BridgeFlightOperation op, std::uint64_t a) noexcept {
             a == 23 || a == 26 || a == 27 || a == 28 || a == 31 ||
             a == 32 || a == 33 || a == 34 || a == 35 ||
             a == 36 || a == 52 || a == 53 || (a >= 54 && a <= 68) ||
-            (a >= 71 && a <= 81) || (a >= 86 && a <= 104) || (a >= 122 && a <= 132) ||
-            (a >= 944 && a <= 949) ||
-            selected_luke_source_stage(a);
+            (a >= 71 && a <= 82) || (a >= 86 && a <= 104) || (a >= 122 && a <= 132) ||
+            (a >= 944 && a <= 949);
     default: return false;
     }
 }
