@@ -1,6 +1,7 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include "xrfg/vulkan_session_bridge.hpp"
 #include "xrfg/d3d11_bridge.hpp"
+#include "xrfg/d3d11_dlss_guides.hpp"
 #include "xrfg/d3d12_history.hpp"
 #include "xrfg/d3d12_native_binding.hpp"
 #include "xrfg/three_slot_buffer.hpp"
@@ -677,6 +678,7 @@ struct SessionState {
           fsr_cadence(current_layer_directory()) {}
 
     ~SessionState() {
+        xrfg::unregister_d3d11_guide_owner(reinterpret_cast<std::uintptr_t>(this));
         xrfg::embedded::detach(control_id);
         if (presenter_pace_timer != nullptr) {
             CloseHandle(presenter_pace_timer);
@@ -4565,6 +4567,10 @@ XrResult layer_create_session_impl(
             }
         }
     }
+    if (state->graphics_binding == SessionGraphicsBinding::d3d11 && state->d3d11_device && state->d3d12_device && state->d3d12_queue) {
+        xrfg::register_d3d11_guide_owner(reinterpret_cast<std::uintptr_t>(state.get()),
+            state->d3d11_device.Get(), state->d3d12_device.Get(), state->d3d12_queue.Get());
+    }
     if (state->graphics_binding == SessionGraphicsBinding::d3d11 && state->d3d11_device && state->d3d11_context) {
         try { state->frame_capture = std::make_unique<xrfg::FrameCapture>(state->d3d11_device.Get(),
             state->d3d11_context.Get(), current_layer_directory() / L"captures"); } catch (...) {}
@@ -4642,6 +4648,7 @@ XrResult layer_destroy_session_impl(XrSession session) {
 
     const XrResult result = state->dispatch->destroy_session(session);
     if (XR_SUCCEEDED(result)) {
+        xrfg::unregister_d3d11_guide_owner(reinterpret_cast<std::uintptr_t>(state.get()));
         std::scoped_lock lock(g_state_mutex);
         for (auto iterator = g_swapchains.begin(); iterator != g_swapchains.end();) {
             if (iterator->second->session == state) {
@@ -6179,7 +6186,20 @@ XrResult release_swapchain_with_identity(
         if (state->session->dlss_motion_vectors &&
             !(luke_split_eye && state->session->luke_afw_enabled)) {
             std::scoped_lock lock(state->mutex);
-            if (*candidate_index < state->enumerated_d3d12_images.size()) {
+            if (d3d11_interop && xrfg::d3d11_guides_claimed(state->session->d3d11_device.Get())) {
+                // Resolve this actual eye texture. The returned one-eye set is
+                // already selected, including right-eye logical index 1.
+                if (*candidate_index < state->enumerated_d3d11_images.size())
+                    pending_motion_vectors = xrfg::resolve_d3d11_dlss_guides(
+                        state->enumerated_d3d11_images[*candidate_index].Get(),
+                        state->session->d3d12_queue.Get());
+                static std::atomic<unsigned> diagnostic_samples{0};
+                if (diagnostic_samples.fetch_add(1,std::memory_order_relaxed)<32) {
+                    const auto frame=pending_motion_vectors ? pending_motion_vectors->eyes[0] : nullptr;
+                    xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::d3d11_bridge,
+                        frame?S_OK:S_FALSE,811,handle_value(state->handle),frame?frame->publication:0);
+                }
+            } else if (*candidate_index < state->enumerated_d3d12_images.size()) {
                 pending_motion_vectors = xrfg::resolve_dlss_motion_vectors(
                     state->enumerated_d3d12_images[*candidate_index].Get(),
                     state->session->d3d12_queue.Get());

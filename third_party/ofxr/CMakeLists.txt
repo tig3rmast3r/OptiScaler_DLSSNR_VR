@@ -315,6 +315,8 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         src/common/fsr_frame_generation.cpp
         src/d3d11/d3d11_d3d12_interop.cpp
         src/d3d11/d3d11_bridge.cpp
+        src/d3d11/d3d11_dlss_guides.cpp
+        src/d3d11/d3d11_guide_transport.cpp
         src/vulkan/vulkan_session_bridge.cpp
         src/d3d11/d3d11_color_identity.cpp
         src/d3d12/d3d12_history.cpp
@@ -584,6 +586,20 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         target_compile_definitions(xrfg_d3d11_bridge_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
         add_test(NAME xrfg_d3d11_bridge_tests COMMAND xrfg_d3d11_bridge_tests)
         set_tests_properties(xrfg_d3d11_bridge_tests PROPERTIES SKIP_RETURN_CODE 77)
+        add_executable(xrfg_d3d11_dlss_guides_tests tests/d3d11_dlss_guides_tests.cpp)
+        target_link_libraries(xrfg_d3d11_dlss_guides_tests PRIVATE xrfg_d3d12_history)
+        target_compile_definitions(xrfg_d3d11_dlss_guides_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        add_test(NAME xrfg_d3d11_dlss_guides_tests COMMAND xrfg_d3d11_dlss_guides_tests)
+        set_tests_properties(xrfg_d3d11_dlss_guides_tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        add_executable(xrfg_d3d11_guide_observer_tests tests/d3d11_dlss_guides_tests.cpp
+            ../../OptiScaler/ofxr/d3d11_guide_observer.cpp)
+        target_include_directories(xrfg_d3d11_guide_observer_tests PRIVATE
+            tests/d3d11_observer_fixture ../../OptiScaler/include ../../external/nvngx_dlss_sdk)
+        target_link_libraries(xrfg_d3d11_guide_observer_tests PRIVATE xrfg_d3d12_history d3dcompiler
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../OptiScaler/library/detours/detours.lib")
+        target_compile_definitions(xrfg_d3d11_guide_observer_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN XRFG_TEST_D11_OBSERVER)
+        add_test(NAME xrfg_d3d11_guide_observer_tests COMMAND xrfg_d3d11_guide_observer_tests)
+        set_tests_properties(xrfg_d3d11_guide_observer_tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
         add_executable(xrfg_d3d11_color_identity_tests tests/d3d11_color_identity_tests.cpp)
         add_executable(xrfg_flow_input_encoding_tests tests/flow_input_encoding_tests.cpp)
         target_include_directories(xrfg_flow_input_encoding_tests PRIVATE

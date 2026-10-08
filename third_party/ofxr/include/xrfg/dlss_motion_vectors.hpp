@@ -73,6 +73,9 @@ struct DlssMotionVectorPublication {
     // intentionally absent from the external provider ABI.
     ID3D12Device* verified_producer_device{};
     bool protect_snapshot_lifetime{};
+    // Exact native D3D11 receipts pin snapshots without Luke color tokens,
+    // AER camera calibration or the long color-origin history.
+    bool direct_output_receipt{};
     std::uint32_t camera_frame_token{};
     bool camera_frame_token_valid{};
 };

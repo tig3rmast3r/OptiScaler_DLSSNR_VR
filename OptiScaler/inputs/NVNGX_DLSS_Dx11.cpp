@@ -780,7 +780,9 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
         return NVSDK_NGX_Result_Success;
     }
 
+    deviceContext->BeginNativeGuides(InDevCtx,InParameters);
     auto upscaleResult = deviceContext->Evaluate(InDevCtx, InParameters);
+    deviceContext->CompleteNativeGuides(InDevCtx,InParameters,upscaleResult);
 
     if (State::Instance().activeFgInput == FGInput::Upscaler)
     {

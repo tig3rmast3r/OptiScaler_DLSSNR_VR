@@ -184,7 +184,8 @@ HRESULT snapshot_resource(
     ComPtr<ID3D12Resource>* snapshot,
     D3D12_RESOURCE_STATES snapshot_state = kSnapshotReadState,
     std::shared_ptr<DlssSnapshotRetention>* retention = nullptr,
-    ComPtr<ID3D12Device>* allocation_receipt = nullptr) noexcept {
+    ComPtr<ID3D12Device>* allocation_receipt = nullptr,
+    std::size_t retained_capacity = SnapshotCount) noexcept {
     if (source == nullptr || producer_command_list == nullptr ||
         producer_queue == nullptr || snapshot == nullptr) return E_POINTER;
     snapshot->Reset();
@@ -220,7 +221,7 @@ HRESULT snapshot_resource(
     const D3D12_RESOURCE_DESC description = source->GetDesc();
     // Ordinary producers keep four slots. Luke may use eight but NEVER
     // overwrite a CPU-pinned or GPU-in-flight guide. No producer wait/flush.
-    const std::size_t capacity = retention ? SnapshotCount : 4;
+    const std::size_t capacity = retention ? std::min(retained_capacity,SnapshotCount) : 4;
     std::size_t selected = capacity;
     for (std::size_t offset = 0; offset < capacity; ++offset) {
         const auto index = (next_snapshot + offset) % capacity;
@@ -351,13 +352,15 @@ std::shared_ptr<const DlssMotionVectorFrame> publish_dlss_motion_vectors(
         ComPtr<ID3D12Resource> motion_snapshot;
         ComPtr<ID3D12Device> motion_snapshot_device, depth_snapshot_device;
         std::shared_ptr<DlssSnapshotRetention> motion_retention, depth_retention;
+        const bool retain_snapshots=publication.protect_snapshot_lifetime || publication.direct_output_receipt;
+        const std::size_t retained_capacity=publication.direct_output_receipt ? 6 : kSnapshotSlotCount;
         if (FAILED(snapshot_resource(stream.snapshots, stream.next_snapshot,
                 publication.motion_vectors, publication.resource_state,
                 publication.producer_command_list, publication.producer_queue,
                 publication.verified_producer_device,
                 &motion_snapshot, kSnapshotReadState,
-                publication.protect_snapshot_lifetime ? &motion_retention : nullptr,
-                &motion_snapshot_device))) {
+                retain_snapshots ? &motion_retention : nullptr,
+                &motion_snapshot_device,retained_capacity))) {
             ++state.statistics.snapshot_failures;
             state.statistics.status = DlssMotionVectorStatus::invalid_input;
             return {};
@@ -372,8 +375,8 @@ std::shared_ptr<const DlssMotionVectorFrame> publish_dlss_motion_vectors(
                     publication.producer_command_list,
                     publication.producer_queue,
                     publication.verified_producer_device, &depth_snapshot, kSnapshotReadState,
-                    publication.protect_snapshot_lifetime ? &depth_retention : nullptr,
-                    &depth_snapshot_device))) {
+                    retain_snapshots ? &depth_retention : nullptr,
+                    &depth_snapshot_device,retained_capacity))) {
                 ++state.statistics.snapshot_failures;
                 state.statistics.status = DlssMotionVectorStatus::invalid_input;
                 return {};
@@ -706,6 +709,23 @@ void report_dlss_motion_vector_submission(
     } catch (...) {
         report_dlss_motion_vector_status(DlssMotionVectorStatus::invalid_input);
     }
+}
+
+std::shared_ptr<const DlssMotionVectorFrame> resolve_dlss_guide_publication(
+    std::uint64_t stream_id, std::uint64_t publication,
+    ID3D12CommandQueue* consumer) noexcept {
+    try {
+        if (!g_tracking_enabled.load(std::memory_order_acquire) || !publication || !consumer) return {};
+        auto& state=registry(); std::scoped_lock lock(state.mutex);
+        const auto found=state.streams.find(stream_id);
+        if (found==state.streams.end()) return {};
+        const auto& frame=found->second.latest;
+        if (!frame || frame->publication!=publication || !frame->producer_fence || !frame->producer_fence_value ||
+            !same_device(frame->producer_fence.Get(),consumer)) return {};
+        if (!same_identity(frame->producer_queue.Get(),consumer) &&
+            FAILED(consumer->Wait(frame->producer_fence.Get(),frame->producer_fence_value))) return {};
+        return frame;
+    } catch (...) { return {}; }
 }
 
 std::shared_ptr<const DlssMotionVectorSet> resolve_dlss_motion_vectors(

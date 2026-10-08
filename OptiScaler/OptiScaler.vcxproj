@@ -307,6 +307,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
   <ItemGroup>
     <ClInclude Include="ofxr\provider_api.hpp" />
     <ClInclude Include="ofxr\ofxr_bridge_client.hpp" />
+    <ClInclude Include="ofxr\d3d11_guide_bridge.hpp" />
     <ClInclude Include="dlssnr\NrBeforeSrContract.h" />
     <ClInclude Include="framegen\nvngx\Nvngx_Combo.h" />
     <ClInclude Include="fsr4\FSR4Upgrade.h" />
@@ -613,6 +614,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ofxr\ofxr_bridge_client.cpp" />
+    <ClCompile Include="ofxr\d3d11_guide_bridge.cpp" />
+    <ClCompile Include="ofxr\d3d11_guide_observer.cpp" />
     <ClCompile Include="framegen\nvngx\Nvngx_Combo.cpp" />
     <ClCompile Include="fsr4\FSR4Upgrade.cpp" />
     <ClCompile Include="gpu_time\GpuTime_Dx11.cpp" />

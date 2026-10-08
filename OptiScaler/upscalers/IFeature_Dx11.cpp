@@ -1,6 +1,18 @@
 #include <pch.h>
 #include "IFeature_Dx11.h"
 #include <State.h>
+#include <ofxr/d3d11_guide_bridge.hpp>
+#include <Util.h>
+
+void IFeature_Dx11::BeginNativeGuides(ID3D11DeviceContext* context,NVSDK_NGX_Parameter* parameters) {
+    static const bool assetto=_wcsicmp(Util::ExePath().filename().c_str(),L"acs.exe")==0;
+    if (!assetto || IsWithDx12()) return;
+    if (!NativeGuideBridge) NativeGuideBridge=std::make_shared<ofxr_bridge::D3D11GuideBridge>();
+    NativeGuideBridge->begin(context,parameters,this);
+}
+void IFeature_Dx11::CompleteNativeGuides(ID3D11DeviceContext* context,NVSDK_NGX_Parameter* parameters,bool success) {
+    if (NativeGuideBridge) NativeGuideBridge->complete(context,parameters,this,success);
+}
 
 bool IFeature_Dx11::Init(ID3D11Device* InDevice, ID3D11DeviceContext* InContext, NVSDK_NGX_Parameter* InParameters)
 {
