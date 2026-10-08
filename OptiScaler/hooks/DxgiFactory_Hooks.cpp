@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "DxgiFactory_Hooks.h"
+#include "NativeSwapchainCreation.h"
 
 #include "D3D11_Hooks.h"
 #include "D3D12_Hooks.h"
@@ -232,6 +233,12 @@ void DxgiFactoryHooks::HookToDLSSGFactory(IDXGIFactory* pFactory)
 HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc,
                                           IDXGISwapChain** ppSwapChain)
 {
+    if (NativeSwapchainCreation::Required())
+    {
+        ScopedSkipParentWrapping skip {};
+        auto result = o_CreateSwapChain(realFactory, pDevice, pDesc, ppSwapChain);
+        return NativeSwapchainCreation::Complete(result, ppSwapChain, pDevice);
+    }
     *ppSwapChain = nullptr;
 
     if (State::Instance().vulkanCreatingSC)
@@ -582,6 +589,13 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
                                                  const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
                                                  IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain)
 {
+    if (NativeSwapchainCreation::Required())
+    {
+        ScopedSkipParentWrapping skip {};
+        auto result = o_CreateSwapChainForHwnd(realFactory, pDevice, hWnd, pDesc, pFullscreenDesc,
+                                               pRestrictToOutput, ppSwapChain);
+        return NativeSwapchainCreation::Complete(result, ppSwapChain, pDevice);
+    }
     *ppSwapChain = nullptr;
 
     static bool firstCall = static_cast<bool>(State::Instance().gameQuirks & GameQuirk::NoFSRFGFirstSwapchain);
@@ -989,6 +1003,13 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForCoreWindow(IDXGIFactory2* realFactor
                                                        const DXGI_SWAP_CHAIN_DESC1* pDesc,
                                                        IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain)
 {
+    if (NativeSwapchainCreation::Required())
+    {
+        ScopedSkipParentWrapping skip {};
+        auto result = o_CreateSwapChainForCoreWindow(realFactory, pDevice, pWindow, pDesc,
+                                                     pRestrictToOutput, ppSwapChain);
+        return NativeSwapchainCreation::Complete(result, ppSwapChain, pDevice);
+    }
     if (State::Instance().vulkanCreatingSC)
     {
         LOG_WARN("Vulkan is creating swapchain!");
@@ -1102,6 +1123,12 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForCoreWindow(IDXGIFactory2* realFactor
 HRESULT DxgiFactoryHooks::DLSSGCreateSwapChain(IDXGIFactory* realFactory, IUnknown* pDevice,
                                                DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain)
 {
+    if (NativeSwapchainCreation::Required())
+    {
+        ScopedSkipParentWrapping skip {};
+        auto result = o_DLSSGCreateSwapChain(realFactory, pDevice, pDesc, ppSwapChain);
+        return NativeSwapchainCreation::Complete(result, ppSwapChain, pDevice);
+    }
     *ppSwapChain = nullptr;
 
     if (State::Instance().vulkanCreatingSC)
@@ -1379,6 +1406,13 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChainForHwnd(IDXGIFactory2* realFactory
                                                       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
                                                       IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain)
 {
+    if (NativeSwapchainCreation::Required())
+    {
+        ScopedSkipParentWrapping skip {};
+        auto result = o_DLSSGCreateSwapChainForHwnd(realFactory, pDevice, hWnd, pDesc, pFullscreenDesc,
+                                                    pRestrictToOutput, ppSwapChain);
+        return NativeSwapchainCreation::Complete(result, ppSwapChain, pDevice);
+    }
     *ppSwapChain = nullptr;
 
     static bool firstCall = static_cast<bool>(State::Instance().gameQuirks & GameQuirk::NoFSRFGFirstSwapchain);
@@ -1701,6 +1735,13 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChainForCoreWindow(IDXGIFactory2* realF
                                                             IDXGIOutput* pRestrictToOutput,
                                                             IDXGISwapChain1** ppSwapChain)
 {
+    if (NativeSwapchainCreation::Required())
+    {
+        ScopedSkipParentWrapping skip {};
+        auto result = o_DLSSGCreateSwapChainForCoreWindow(realFactory, pDevice, pWindow, pDesc,
+                                                          pRestrictToOutput, ppSwapChain);
+        return NativeSwapchainCreation::Complete(result, ppSwapChain, pDevice);
+    }
     if (State::Instance().vulkanCreatingSC)
     {
         LOG_WARN("Vulkan is creating swapchain!");

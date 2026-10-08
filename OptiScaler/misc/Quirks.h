@@ -38,6 +38,7 @@ enum class GameQuirk : uint64_t
     DisableFakenvapi,
     DoNotPreserveFGSwapChain,
     OldOverlayMenu,
+    NativeSwapchainOverlay,
     DoNotLoadAmdxc64,
     DontUseUnrealMVBarriers,
     DontUseUnrealColorBarriers,
@@ -203,7 +204,7 @@ static const QuirkEntry quirkTable[] = {
     QUIRK_ENTRY("re3.exe", GameQuirk::DisableDxgiSpoofing, GameQuirk::OldOverlayMenu),
     QUIRK_ENTRY("re4.exe", GameQuirk::DisableDxgiSpoofing, GameQuirk::OldOverlayMenu),
     QUIRK_ENTRY("re7.exe", GameQuirk::DisableDxgiSpoofing, GameQuirk::OldOverlayMenu),
-    QUIRK_ENTRY("re8.exe", GameQuirk::DisableDxgiSpoofing, GameQuirk::OldOverlayMenu),
+    QUIRK_ENTRY("re8.exe", GameQuirk::DisableDxgiSpoofing, GameQuirk::NativeSwapchainOverlay),
     QUIRK_ENTRY("devilmaycry5.exe", GameQuirk::DisableDxgiSpoofing, GameQuirk::OldOverlayMenu),
     QUIRK_ENTRY("streetfighter6.exe", GameQuirk::DisableDxgiSpoofing, GameQuirk::OldOverlayMenu),
 

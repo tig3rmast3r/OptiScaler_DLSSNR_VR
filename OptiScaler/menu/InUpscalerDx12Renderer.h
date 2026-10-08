@@ -195,7 +195,8 @@ public:
         io.BackendFlags&=~(ImGuiBackendFlags_RendererHasVtxOffset|ImGuiBackendFlags_RendererHasTextures);
         // Draw snapshots hold all GPU references beyond the UI/context's lifetime.
     }
-    bool Render(ImDrawData* data, ID3D12GraphicsCommandList* list, ID3D12Resource* output, DXGI_FORMAT format)
+    bool Render(ImDrawData* data, ID3D12GraphicsCommandList* list, ID3D12Resource* output, DXGI_FORMAT format,
+                D3D12_RESOURCE_STATES inputState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
     {
         MenuGpuLifetime::Collect();
         if (!MenuGpuLifetime::Ready() || !MenuCommandState::hooksReady || !data || !list || !output || !Owns(list) || !Owns(output)) return false;
@@ -266,9 +267,9 @@ public:
             list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
             Barrier(list,texture.image.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
-        if(direct) Barrier(list,output,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_RENDER_TARGET);
+        if(direct) Barrier(list,output,inputState,D3D12_RESOURCE_STATE_RENDER_TARGET);
         else {
-            Barrier(list,output,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Barrier(list,output,inputState,D3D12_RESOURCE_STATE_COPY_SOURCE);
             Barrier(list,draw->target.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_DEST);
             list->CopyResource(draw->target.Get(),output);
             Barrier(list,draw->target.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -310,12 +311,12 @@ public:
             }
             vertexOffset+=commands->VtxBuffer.Size; indexOffset+=commands->IdxBuffer.Size;
         }
-        if(direct) Barrier(list,output,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if(direct) Barrier(list,output,D3D12_RESOURCE_STATE_RENDER_TARGET,inputState);
         else {
             Barrier(list,draw->target.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
             Barrier(list,output,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
             list->CopyResource(output,draw->target.Get());
-            Barrier(list,output,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            Barrier(list,output,D3D12_RESOURCE_STATE_COPY_DEST,inputState);
             Barrier(list,draw->target.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET);
         }
         for(auto& texture:draw->textures) Barrier(list,texture.image.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);

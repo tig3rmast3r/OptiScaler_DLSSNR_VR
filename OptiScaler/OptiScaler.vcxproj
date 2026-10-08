@@ -331,6 +331,9 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="fsr4\FSR4ModelSelection.h" />
     <ClInclude Include="hooks\D3D12_Hooks.h" />
     <ClInclude Include="hooks\DxgiFactory_Hooks.h" />
+    <ClInclude Include="hooks\NativeSwapchainCreation.h" />
+    <ClInclude Include="menu\NativeSwapchainOverlay.h" />
+    <ClInclude Include="menu\NativeSwapchainMenu.h" />
     <ClInclude Include="hooks\DxgiFactory_WrappedCalls.h" />
     <ClInclude Include="hooks\Dxgi_Hooks.h" />
     <ClInclude Include="hooks\FG_Hooks.h" />
@@ -799,6 +802,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="menu\menu_dx12.cpp" />
     <ClCompile Include="menu\menu_overlay_base.cpp" />
     <ClCompile Include="menu\menu_overlay_dx.cpp" />
+    <ClCompile Include="menu\NativeSwapchainOverlay.cpp" />
+    <ClCompile Include="menu\NativeSwapchainMenu.cpp" />
     <ClCompile Include="menu\menu_overlay_vk.cpp" />
     <ClCompile Include="wrapped\wrapped_swapchain.cpp" />
     <ClCompile Include="include\imgui\imgui.cpp">

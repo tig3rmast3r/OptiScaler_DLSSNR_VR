@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "DxgiFactory_WrappedCalls.h"
+#include "NativeSwapchainCreation.h"
 
 #include "FG_Hooks.h"
 #include "D3D11_Hooks.h"
@@ -76,6 +77,12 @@ HRESULT DxgiFactoryWrappedCalls::CreateSwapChain(IDXGIFactory* realFactory, Wrap
                                                  IUnknown* pDevice, const DXGI_SWAP_CHAIN_DESC* pDesc,
                                                  IDXGISwapChain** ppSwapChain)
 {
+    if (NativeSwapchainCreation::Required())
+    {
+        ScopedSkipParentWrapping skip {};
+        auto result = realFactory->CreateSwapChain(pDevice, const_cast<DXGI_SWAP_CHAIN_DESC*>(pDesc), ppSwapChain);
+        return NativeSwapchainCreation::Complete(result, ppSwapChain, pDevice);
+    }
     *ppSwapChain = nullptr;
 
     DXGI_SWAP_CHAIN_DESC localDesc = {};
@@ -426,6 +433,13 @@ HRESULT DxgiFactoryWrappedCalls::CreateSwapChainForHwnd(IDXGIFactory2* realFacto
                                                         const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
                                                         IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain)
 {
+    if (NativeSwapchainCreation::Required())
+    {
+        ScopedSkipParentWrapping skip {};
+        auto result = realFactory->CreateSwapChainForHwnd(pDevice, hWnd, pDesc, pFullscreenDesc,
+                                                          pRestrictToOutput, ppSwapChain);
+        return NativeSwapchainCreation::Complete(result, ppSwapChain, pDevice);
+    }
     *ppSwapChain = nullptr;
 
     DXGI_SWAP_CHAIN_DESC1 localDesc = {};
@@ -829,6 +843,13 @@ HRESULT DxgiFactoryWrappedCalls::CreateSwapChainForCoreWindow(IDXGIFactory2* rea
                                                               IDXGIOutput* pRestrictToOutput,
                                                               IDXGISwapChain1** ppSwapChain)
 {
+    if (NativeSwapchainCreation::Required())
+    {
+        ScopedSkipParentWrapping skip {};
+        auto result = realFactory->CreateSwapChainForCoreWindow(pDevice, pWindow, pDesc,
+                                                                pRestrictToOutput, ppSwapChain);
+        return NativeSwapchainCreation::Complete(result, ppSwapChain, pDevice);
+    }
     if (State::Instance().vulkanCreatingSC)
     {
         LOG_WARN("Vulkan is creating swapchain!");
