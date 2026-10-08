@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "input_system_internal.h"
+#include "native_key_state.h"
 
 #include <detours/detours.h>
 
@@ -22,12 +23,14 @@ namespace OptiInput
 {
 SHORT RealGetAsyncKeyStateSafe(int vk)
 {
-    ScopedHookBypass bypass;
-
-    if (o_GetAsyncKeyState != nullptr)
-        return o_GetAsyncKeyState(vk);
-
-    return ::GetAsyncKeyState(vk);
+    static const bool available = []
+    {
+        const bool present = NativeAsyncKeyStateReader() != nullptr;
+        if (!present)
+            LOG_ERROR("Native physical key-state reader unavailable; menu polling cannot acquire input");
+        return present;
+    }();
+    return available ? ReadPhysicalAsyncKeyState(vk) : 0;
 }
 
 SHORT RealGetKeyStateSafe(int vk)
