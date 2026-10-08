@@ -677,7 +677,7 @@ void gpu_pipeline(bool with_layers, bool transition = false, bool diagnostic = f
             &state->d3d11_device, nullptr, &state->d3d11_context)), "D3D11 hardware");
         check(SUCCEEDED(xrfg::create_d3d12_device_for_d3d11(state->d3d11_device.Get(),
             &state->d3d12_device, &state->d3d12_queue)), "D3D12 bridge");
-        const auto diagnostic_root=std::filesystem::current_path()/("capture-integration-"+std::to_string(GetCurrentProcessId()));
+        const auto diagnostic_root=std::filesystem::current_path()/("capture-integration-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64()));
         if(diagnostic) {
             std::filesystem::create_directories(diagnostic_root);
             {std::ofstream ini(diagnostic_root/"ofxr_bridge.ini");ini<<"[diagnostics]\nlogging_enabled=1\nmax_file_mb=8\n";}
@@ -1797,6 +1797,7 @@ void refused_frame_recovery_test() {
 #include "vulkan_bridge_contract_tests.inc"
 #include "djules_binding_queue_tests.inc"
 #include "djules_clock_tests.inc"
+#include "native_dx11_guide_session_tests.inc"
 
 int main(int argc, char** argv) {
 #ifdef OFXR_TEST_DJULES_ROUTE
@@ -1865,6 +1866,7 @@ int main(int argc, char** argv) {
         state->luke_afw_enabled = false;
         if (argc > 1) {
             const auto mode = std::string_view(argv[1]);
+            if (mode == "native-dx11-guides") { native_dx11_guide_session_test(); return 0; }
             if (mode == "route-handoff") { pipelined_route_handoff_test(); return 0; }
             if (mode == "route-handoff-steamvr") { pipelined_route_handoff_test(true); return 0; }
             if (mode == "pipeline-preference") { djules_pipeline_preference_test(); return 0; }

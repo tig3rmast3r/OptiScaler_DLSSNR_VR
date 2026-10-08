@@ -632,6 +632,8 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             xrfg_core xrfg_d3d12_history xrfg_bridge_flight_logger
             xrfg_fps_overlay xrfg_implicit_layer psapi xrfg_frame_capture)
         add_test(NAME xrfg_three_slot_director_tests COMMAND xrfg_three_slot_director_tests)
+        add_test(NAME xrfg_native_dx11_guide_session COMMAND xrfg_three_slot_director_tests native-dx11-guides)
+        set_tests_properties(xrfg_native_dx11_guide_session PROPERTIES TIMEOUT 60)
         add_test(NAME xrfg_depth_history_routes COMMAND xrfg_three_slot_director_tests depth-history)
         add_test(NAME xrfg_pipelined_route_handoff COMMAND xrfg_three_slot_director_tests route-handoff)
         add_test(NAME xrfg_pipelined_route_handoff_steamvr COMMAND xrfg_three_slot_director_tests route-handoff-steamvr)

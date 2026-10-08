@@ -4567,9 +4567,11 @@ XrResult layer_create_session_impl(
             }
         }
     }
-    if (state->graphics_binding == SessionGraphicsBinding::d3d11 && state->d3d11_device && state->d3d12_device && state->d3d12_queue) {
+    auto* application_d3d11_device = state->d3d11_bridge
+        ? state->d3d11_bridge->device.Get() : state->d3d11_device.Get();
+    if (application_d3d11_device && state->d3d12_device && state->d3d12_queue) {
         xrfg::register_d3d11_guide_owner(reinterpret_cast<std::uintptr_t>(state.get()),
-            state->d3d11_device.Get(), state->d3d12_device.Get(), state->d3d12_queue.Get());
+            application_d3d11_device, state->d3d12_device.Get(), state->d3d12_queue.Get());
     }
     if (state->graphics_binding == SessionGraphicsBinding::d3d11 && state->d3d11_device && state->d3d11_context) {
         try { state->frame_capture = std::make_unique<xrfg::FrameCapture>(state->d3d11_device.Get(),
@@ -6186,10 +6188,16 @@ XrResult release_swapchain_with_identity(
         if (state->session->dlss_motion_vectors &&
             !(luke_split_eye && state->session->luke_afw_enabled)) {
             std::scoped_lock lock(state->mutex);
-            if (d3d11_interop && xrfg::d3d11_guides_claimed(state->session->d3d11_device.Get())) {
+            auto* application_d3d11_device = state->session->d3d11_bridge
+                ? state->session->d3d11_bridge->device.Get() : state->session->d3d11_device.Get();
+            if ((d3d11_interop || bridge) && xrfg::d3d11_guides_claimed(application_d3d11_device)) {
                 // Resolve this actual eye texture. The returned one-eye set is
                 // already selected, including right-eye logical index 1.
-                if (*candidate_index < state->enumerated_d3d11_images.size())
+                if (bridge && *candidate_index < bridge->d3d11_images().size())
+                    pending_motion_vectors = xrfg::resolve_d3d11_dlss_guides(
+                        bridge->d3d11_images()[*candidate_index],
+                        state->session->d3d12_queue.Get());
+                else if (!bridge && *candidate_index < state->enumerated_d3d11_images.size())
                     pending_motion_vectors = xrfg::resolve_d3d11_dlss_guides(
                         state->enumerated_d3d11_images[*candidate_index].Get(),
                         state->session->d3d12_queue.Get());
