@@ -29,6 +29,8 @@ class NrSubmissionLedger
     std::unordered_map<void*, std::vector<NrSubmissionReceipt>> recorded_;
 
 public:
+    bool HasRecordings() const { return !recorded_.empty(); }
+
     NrSubmissionReceipt Record(unsigned int handle, void* list)
     {
         NrSubmissionReceipt receipt { handle, ++next_, list };

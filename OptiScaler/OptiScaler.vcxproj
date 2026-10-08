@@ -332,6 +332,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="hooks\D3D12_Hooks.h" />
     <ClInclude Include="hooks\DxgiFactory_Hooks.h" />
     <ClInclude Include="hooks\NativeSwapchainCreation.h" />
+    <ClInclude Include="dlssnr\NrCommandListIdentity.h" />
     <ClInclude Include="menu\NativeSwapchainOverlay.h" />
     <ClInclude Include="menu\NativeSwapchainMenu.h" />
     <ClInclude Include="hooks\DxgiFactory_WrappedCalls.h" />

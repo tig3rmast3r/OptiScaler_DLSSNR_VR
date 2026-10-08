@@ -8,6 +8,7 @@
 #include "NrHistoryContract.h"
 #include "NrGuideSnapshot.h"
 #include "NrForwarderContract.h"
+#include "NrCommandListIdentity.h"
 
 
 #include "DlssNr_Codec.h"
@@ -1034,10 +1035,19 @@ std::vector<NrSubmissionReceipt> TakeCommandListSubmissionReceipts(
     std::vector<NrSubmissionReceipt> receipts;
     if (commandLists == nullptr)
         return receipts;
+    {
+        std::lock_guard<std::mutex> lock(g_nrFlightMutex);
+        if (!g_nrSubmissionLedger.HasRecordings()) return receipts;
+    }
+    std::vector<Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>> nativeLists;
+    nativeLists.reserve(commandListCount);
+    for (unsigned int i = 0; i < commandListCount; ++i)
+        nativeLists.push_back(NrNativeCommandList(commandLists[i]));
     std::lock_guard<std::mutex> lock(g_nrFlightMutex);
     for (unsigned int i = 0; i < commandListCount; ++i)
     {
-        auto detached = g_nrSubmissionLedger.Detach(commandLists[i]);
+        if (!nativeLists[i]) continue;
+        auto detached = g_nrSubmissionLedger.Detach(nativeLists[i].Get());
         receipts.insert(receipts.end(), detached.begin(), detached.end());
     }
     for (const auto& receipt : receipts)
@@ -1124,9 +1134,14 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
     }
 
     NrPerHandle& nr = g_nrByHandle[sourceHandleId];
-    // Read the game's reset before validation, retirement or NR parameter writes.
-    // Missing resources / unsubmitted work must not lose a one-frame reset pulse.
+    // Preserve one-frame reset pulses even when native identity is unavailable.
     CaptureSourceHistoryReset(nr, sourceHandleId, params);
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> submissionList;
+    if (!LukeRossDlssIngress::Detected())
+    {
+        submissionList = NrNativeCommandList(cmdList);
+        if (!submissionList) { ReportSkipOnce("native command-list identity unavailable"); return; }
+    }
     ID3D12Resource* target = GetResource(params, NVSDK_NGX_Parameter_Color, "DLSSD.Color");
     ID3D12Resource* srOutput = GetResource(params, NVSDK_NGX_Parameter_Output, "DLSSD.Output");
     ID3D12Resource* depth = GetResource(params, NVSDK_NGX_Parameter_Depth, "DLSSD.Depth");
@@ -1417,7 +1432,7 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
         // Creating and evaluating a feature in the same command list is the dice-roll that hung the
         // GPU (every crash died on a creation frame). The creation goes through the game's own submit
         // first; the first evaluate happens next frame. One frame without the model is invisible.
-        MarkNrRecorded(sourceHandleId, cmdList);
+        MarkNrRecorded(sourceHandleId, submissionList.Get());
         device->Release();
         return;
     }
@@ -1574,7 +1589,7 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
         nr.reset = false;
 
         if (proxyResult == NVSDK_NGX_Result_Success)
-            MarkNrRecorded(sourceHandleId, cmdList);
+            MarkNrRecorded(sourceHandleId, submissionList.Get());
 
         if (proxyResult != 1)
         {
@@ -1609,7 +1624,7 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
     }
 
     if (result == NVSDK_NGX_Result_Success)
-        MarkNrRecorded(sourceHandleId, cmdList);
+        MarkNrRecorded(sourceHandleId, submissionList.Get());
 
     nr.reset = false;
 
@@ -1781,6 +1796,12 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
 
     NrPerHandle& nr = g_nrByHandle[sourceHandleId];
     CaptureSourceHistoryReset(nr, sourceHandleId, params);
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> submissionList;
+    if (!LukeRossDlssIngress::Detected())
+    {
+        submissionList = NrNativeCommandList(cmdList);
+        if (!submissionList) { ReportSkipOnce("native command-list identity unavailable"); return; }
+    }
     ID3D12Resource* target = GetResource(params, NVSDK_NGX_Parameter_Output, "DLSSD.Output");
     ID3D12Resource* depth = GetResource(params, NVSDK_NGX_Parameter_Depth, "DLSSD.Depth");
     ID3D12Resource* motion = GetResource(params, NVSDK_NGX_Parameter_MotionVectors, "DLSSD.MotionVectors");
@@ -2039,7 +2060,7 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
         // Creating and evaluating a feature in the same command list is the dice-roll that hung the
         // GPU (every crash died on a creation frame). The creation goes through the game's own submit
         // first; the first evaluate happens next frame. One frame without the model is invisible.
-        MarkNrRecorded(sourceHandleId, cmdList);
+        MarkNrRecorded(sourceHandleId, submissionList.Get());
         device->Release();
         return;
     }
@@ -2200,7 +2221,7 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
         nr.reset = false;
 
         if (proxyResult == NVSDK_NGX_Result_Success)
-            MarkNrRecorded(sourceHandleId, cmdList);
+            MarkNrRecorded(sourceHandleId, submissionList.Get());
 
         if (proxyResult != 1)
         {
@@ -2235,7 +2256,7 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
     }
 
     if (result == NVSDK_NGX_Result_Success)
-        MarkNrRecorded(sourceHandleId, cmdList);
+        MarkNrRecorded(sourceHandleId, submissionList.Get());
 
     nr.reset = false;
 
