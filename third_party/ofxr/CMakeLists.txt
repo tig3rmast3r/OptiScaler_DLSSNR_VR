@@ -592,7 +592,8 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         add_test(NAME xrfg_d3d11_dlss_guides_tests COMMAND xrfg_d3d11_dlss_guides_tests)
         set_tests_properties(xrfg_d3d11_dlss_guides_tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
         add_executable(xrfg_d3d11_guide_observer_tests tests/d3d11_dlss_guides_tests.cpp
-            ../../OptiScaler/ofxr/d3d11_guide_observer.cpp)
+            ../../OptiScaler/ofxr/d3d11_guide_observer.cpp
+            ../../OptiScaler/ofxr/csp_super_resolution.cpp)
         target_include_directories(xrfg_d3d11_guide_observer_tests PRIVATE
             tests/d3d11_observer_fixture ../../OptiScaler/include ../../external/nvngx_dlss_sdk)
         target_link_libraries(xrfg_d3d11_guide_observer_tests PRIVATE xrfg_d3d12_history d3dcompiler

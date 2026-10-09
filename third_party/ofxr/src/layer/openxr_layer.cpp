@@ -5464,6 +5464,8 @@ XrResult layer_destroy_swapchain_impl(XrSwapchain swapchain) {
         return XR_ERROR_HANDLE_INVALID;
     }
 
+    xrfg::unregister_d3d11_sr_destinations(reinterpret_cast<std::uintptr_t>(swapchain));
+
     PresenterResourceLifetimeGuard presenter_guard(state->session);
     const bool active_color_reconfiguration =
         state->session->generation_steady_state_established &&
@@ -5609,6 +5611,24 @@ XrResult layer_enumerate_swapchain_images_impl(
     }
 
     try {
+        // Register only the actual application-visible XR color images. The
+        // native upscaler resolves its destination at that exact eye draw;
+        // it never borrows a global recommendation or a different swapchain.
+        if ((bridge || state->session->graphics_binding == SessionGraphicsBinding::d3d11) &&
+            (state->create_info.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) &&
+            !(state->create_info.usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
+            state->create_info.arraySize==1 && state->create_info.sampleCount==1 &&
+            image_count_output && images && image_capacity_input>=*image_count_output) {
+            std::vector<ID3D11Texture2D*> sr_images;
+            const auto* app_images=reinterpret_cast<const XrSwapchainImageD3D11KHR*>(images);
+            for (std::uint32_t i=0;i<*image_count_output;++i) {
+                if (app_images[i].type!=XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR || !app_images[i].texture) {sr_images.clear();break;}
+                sr_images.push_back(app_images[i].texture);
+            }
+            if (!sr_images.empty()) xrfg::register_d3d11_sr_destinations(
+                reinterpret_cast<std::uintptr_t>(state->session.get()),reinterpret_cast<std::uintptr_t>(swapchain),
+                sr_images.data(),sr_images.size());
+        }
         if (state->session->graphics_binding == SessionGraphicsBinding::d3d11) {
             if (*image_count_output == 0 ||
                 image_capacity_input < *image_count_output) {

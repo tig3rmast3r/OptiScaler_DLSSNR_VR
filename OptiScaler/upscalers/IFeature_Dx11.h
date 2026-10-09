@@ -45,7 +45,7 @@ class IFeature_Dx11 : public virtual IFeature
     virtual bool Init(ID3D11Device* InDevice, ID3D11DeviceContext* InContext, NVSDK_NGX_Parameter* InParameters);
     virtual bool Evaluate(ID3D11DeviceContext* DeviceContext, NVSDK_NGX_Parameter* InParameters);
     void BeginNativeGuides(ID3D11DeviceContext*, NVSDK_NGX_Parameter*);
-    void CompleteNativeGuides(ID3D11DeviceContext*, NVSDK_NGX_Parameter*, bool);
+    virtual void CompleteNativeGuides(ID3D11DeviceContext*, NVSDK_NGX_Parameter*, bool);
 
     API Api() const override { return API::DX11; }
     std::optional<double> ReadUpscalerTime(void* deviceContextVoid) override;

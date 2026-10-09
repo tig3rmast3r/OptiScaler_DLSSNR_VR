@@ -10,6 +10,11 @@
 #include <d3d12sdklayers.h>
 #ifdef XRFG_TEST_D11_OBSERVER
 #include <d3dcompiler.h>
+#include "../../../OptiScaler/ofxr/csp_super_resolution.hpp"
+#include "../../../OptiScaler/ofxr/d3d11_upscaler_bindings.hpp"
+#include <unordered_map>
+#include <variant>
+#include <type_traits>
 namespace ofxr_bridge {void observe_d3d11_guide_context(ID3D11DeviceContext*);}
 #endif
 using Microsoft::WRL::ComPtr;
@@ -26,15 +31,343 @@ ComPtr<ID3D11Texture2D> texture(ID3D11Device* device,DXGI_FORMAT format,unsigned
     desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;
     ComPtr<ID3D11Texture2D> result;require(device->CreateTexture2D(&desc,&data,result.GetAddressOf()),"source texture");return result;
 }
-float read11(ID3D11Device* device,ID3D11DeviceContext* context,ID3D11Texture2D* source) {
+float read11(ID3D11Device* device,ID3D11DeviceContext* context,ID3D11Texture2D* source,unsigned x=0,unsigned y=0) {
     D3D11_TEXTURE2D_DESC desc{};source->GetDesc(&desc);desc.Usage=D3D11_USAGE_STAGING;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;desc.BindFlags=desc.MiscFlags=0;
     ComPtr<ID3D11Texture2D> staging;require(device->CreateTexture2D(&desc,nullptr,staging.GetAddressOf()),"readback texture");
     context->CopyResource(staging.Get(),source);D3D11_MAPPED_SUBRESOURCE mapped{};require(context->Map(staging.Get(),0,D3D11_MAP_READ,0,&mapped),"D11 GPU readback");
     float value{};
-    if (desc.Format==DXGI_FORMAT_R16G16B16A16_FLOAT) {std::uint16_t half{};std::memcpy(&half,mapped.pData,sizeof(half));value=DirectX::PackedVector::XMConvertHalfToFloat(half);}
-    else std::memcpy(&value,mapped.pData,sizeof(value));
+    const auto* pixel=static_cast<const std::byte*>(mapped.pData)+y*mapped.RowPitch+x*(desc.Format==DXGI_FORMAT_R16G16B16A16_FLOAT?8:4);
+    if (desc.Format==DXGI_FORMAT_R16G16B16A16_FLOAT || desc.Format==DXGI_FORMAT_R16G16_FLOAT) {std::uint16_t half{};std::memcpy(&half,pixel,sizeof(half));value=DirectX::PackedVector::XMConvertHalfToFloat(half);}
+    else std::memcpy(&value,pixel,sizeof(value));
     context->Unmap(staging.Get(),0);return value;
 }
+#ifdef XRFG_TEST_D11_OBSERVER
+void upscaler_bindings_test(D3D_FEATURE_LEVEL requested) {
+    ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;
+    require(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,D3D11_CREATE_DEVICE_DEBUG,&requested,1,
+        D3D11_SDK_VERSION,device.GetAddressOf(),nullptr,context.GetAddressOf()),"binding lifetime WARP/debug device");
+    auto input=texture(device.Get(),DXGI_FORMAT_R32_FLOAT,1,.25f);
+    auto target=texture(device.Get(),DXGI_FORMAT_R32_FLOAT,1,.75f);
+    D3D11_TEXTURE2D_DESC desc{};input->GetDesc(&desc);desc.BindFlags=D3D11_BIND_UNORDERED_ACCESS;
+    ComPtr<ID3D11Texture2D> output;require(device->CreateTexture2D(&desc,nullptr,output.GetAddressOf()),"binding UAV texture");
+    desc.Format=DXGI_FORMAT_D32_FLOAT;desc.BindFlags=D3D11_BIND_DEPTH_STENCIL;
+    ComPtr<ID3D11Texture2D> depth;require(device->CreateTexture2D(&desc,nullptr,depth.GetAddressOf()),"binding depth texture");
+    ComPtr<ID3D11ShaderResourceView> srv;ComPtr<ID3D11UnorderedAccessView> uav;
+    ComPtr<ID3D11RenderTargetView> rtv;ComPtr<ID3D11DepthStencilView> dsv;
+    require(device->CreateShaderResourceView(input.Get(),nullptr,srv.GetAddressOf()),"binding SRV");
+    require(device->CreateUnorderedAccessView(output.Get(),nullptr,uav.GetAddressOf()),"binding UAV");
+    require(device->CreateRenderTargetView(target.Get(),nullptr,rtv.GetAddressOf()),"binding RTV");
+    require(device->CreateDepthStencilView(depth.Get(),nullptr,dsv.GetAddressOf()),"binding DSV");
+    D3D11_SAMPLER_DESC sampler_desc{};sampler_desc.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sampler_desc.AddressU=sampler_desc.AddressV=sampler_desc.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.MaxLOD=D3D11_FLOAT32_MAX;
+    ComPtr<ID3D11SamplerState> sampler;require(device->CreateSamplerState(&sampler_desc,sampler.GetAddressOf()),"binding sampler");
+    const float constants[4]{.5f,0,0,0};D3D11_BUFFER_DESC buffer_desc{};
+    buffer_desc.ByteWidth=sizeof(constants);buffer_desc.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_SUBRESOURCE_DATA buffer_data{constants,0,0};ComPtr<ID3D11Buffer> buffer;
+    require(device->CreateBuffer(&buffer_desc,&buffer_data,buffer.GetAddressOf()),"binding constant buffer");
+    const char* shader_source="Texture2D<float> source:register(t0);RWTexture2D<float> result:register(u0);"
+        "cbuffer Constants:register(b0) {float4 factor;} [numthreads(1,1,1)] "
+        "void main(uint3 id:SV_DispatchThreadID) {result[id.xy]=source.Load(int3(id.xy,0))*factor.x;}";
+    ComPtr<ID3DBlob> binary;require(D3DCompile(shader_source,std::strlen(shader_source),nullptr,nullptr,nullptr,
+        "main","cs_5_0",0,0,binary.GetAddressOf(),nullptr),"binding compute shader compile");
+    ComPtr<ID3D11ComputeShader> shader;require(device->CreateComputeShader(binary->GetBufferPointer(),binary->GetBufferSize(),
+        nullptr,shader.GetAddressOf()),"binding compute shader");
+    auto* original_srv=srv.Get();auto* original_uav=uav.Get();auto* original_sampler=sampler.Get();
+    auto* original_buffer=buffer.Get();auto* original_rtv=rtv.Get();auto* original_dsv=dsv.Get();auto* original_shader=shader.Get();
+    context->CSSetShaderResources(0,1,&original_srv);context->CSSetUnorderedAccessViews(0,1,&original_uav,nullptr);
+    context->CSSetSamplers(0,1,&original_sampler);context->CSSetConstantBuffers(0,1,&original_buffer);
+    context->CSSetShader(original_shader,nullptr,0);context->OMSetRenderTargets(1,&original_rtv,original_dsv);
+    auto replacement=texture(device.Get(),DXGI_FORMAT_R32_FLOAT,1,.9f);
+    ComPtr<ID3D11ShaderResourceView> replacement_view;
+    require(device->CreateShaderResourceView(replacement.Get(),nullptr,replacement_view.GetAddressOf()),"model replacement SRV");
+    {
+        ofxr_bridge::D3D11UpscalerBindings saved(context.Get());
+        context->ClearState(); // Model drops the context's references.
+        srv.Reset();uav.Reset();sampler.Reset();buffer.Reset();rtv.Reset();dsv.Reset();shader.Reset();
+        input.Reset();target.Reset();output.Reset();depth.Reset(); // Snapshot is the sole owner.
+        auto* view=replacement_view.Get();context->CSSetShaderResources(1,1,&view);
+        context->CSSetUnorderedAccessViews(1,1,&original_uav,nullptr);
+        context->CSSetSamplers(1,1,&original_sampler);context->CSSetConstantBuffers(1,1,&original_buffer);
+        ID3D11RenderTargetView* model_targets[]{nullptr,original_rtv};context->OMSetRenderTargets(2,model_targets,nullptr);
+    }
+    ComPtr<ID3D11ShaderResourceView> restored_srv,empty_srv;
+    ComPtr<ID3D11UnorderedAccessView> restored_uav,empty_uav;
+    ComPtr<ID3D11SamplerState> restored_sampler,empty_sampler;ComPtr<ID3D11Buffer> restored_buffer,empty_buffer;
+    ComPtr<ID3D11RenderTargetView> restored_rtv,empty_rtv;ComPtr<ID3D11DepthStencilView> restored_dsv;
+    ComPtr<ID3D11ComputeShader> restored_shader;
+    context->CSGetShaderResources(0,1,restored_srv.GetAddressOf());context->CSGetShaderResources(1,1,empty_srv.GetAddressOf());
+    context->CSGetUnorderedAccessViews(0,1,restored_uav.GetAddressOf());context->CSGetUnorderedAccessViews(1,1,empty_uav.GetAddressOf());
+    context->CSGetSamplers(0,1,restored_sampler.GetAddressOf());context->CSGetSamplers(1,1,empty_sampler.GetAddressOf());
+    context->CSGetConstantBuffers(0,1,restored_buffer.GetAddressOf());context->CSGetConstantBuffers(1,1,empty_buffer.GetAddressOf());
+    context->OMGetRenderTargets(1,restored_rtv.GetAddressOf(),restored_dsv.GetAddressOf());
+    context->CSGetShader(restored_shader.GetAddressOf(),nullptr,nullptr);
+    expect(restored_srv.Get()==original_srv,"snapshot owns restored SRV after model releases its owner");
+    expect(restored_uav.Get()==original_uav,"snapshot owns restored UAV");
+    expect(restored_sampler.Get()==original_sampler,"snapshot owns restored sampler");
+    expect(restored_buffer.Get()==original_buffer,"snapshot owns restored constant buffer");
+    expect(restored_rtv.Get()==original_rtv && restored_dsv.Get()==original_dsv,"snapshot owns restored outputs");
+    expect(restored_shader.Get()==original_shader,"snapshot owns restored compute shader");
+    std::array<ID3D11RenderTargetView*,2> restored_targets{};context->OMGetRenderTargets(2,restored_targets.data(),nullptr);
+    expect(restored_targets[0]==original_rtv && !restored_targets[1],"restoration removes model targets from formerly empty slots");
+    for (auto* view:restored_targets) if (view) view->Release();
+    expect(!empty_srv && !empty_uav && !empty_sampler && !empty_buffer,"restoration removes model bindings from empty slots");
+    context->Dispatch(8,8,1);
+    ComPtr<ID3D11Resource> result;restored_uav->GetResource(result.GetAddressOf());
+    ComPtr<ID3D11Texture2D> result_texture;require(result.As(&result_texture),"restored output identity");
+    expect(std::abs(read11(device.Get(),context.Get(),result_texture.Get())-.125f)<.001f,"restored shader and resources execute real GPU work");
+    const auto failed_model=[&]() {
+        ofxr_bridge::D3D11UpscalerBindings saved(context.Get());
+        context->ClearState();auto* view=replacement_view.Get();context->CSSetShaderResources(1,1,&view);
+        return false; // Same lifetime as EvaluateInternal failure / early pass return.
+    };
+    expect(!failed_model(),"model failure returns early");
+    restored_srv.Reset();context->CSGetShaderResources(0,1,restored_srv.GetAddressOf());
+    empty_srv.Reset();context->CSGetShaderResources(1,1,empty_srv.GetAddressOf());
+    expect(restored_srv.Get()==original_srv && !empty_srv,"early failure restores bindings including nulls");
+    const auto throwing_model=[&]() {ofxr_bridge::D3D11UpscalerBindings saved(context.Get());context->ClearState();throw 1;};
+    try {throwing_model();} catch (int) {}
+    restored_uav.Reset();context->CSGetUnorderedAccessViews(0,1,restored_uav.GetAddressOf());
+    expect(restored_uav.Get()==original_uav,"exception unwinding restores owned bindings");
+    context->ClearState();
+    ComPtr<ID3D11InfoQueue> info;require(device.As(&info),"binding fixture debug queue");unsigned errors{};
+    for (UINT64 i=0;i<info->GetNumStoredMessages();++i) {
+        SIZE_T size{};info->GetMessage(i,nullptr,&size);std::vector<std::byte> storage(size);
+        auto* message=reinterpret_cast<D3D11_MESSAGE*>(storage.data());info->GetMessage(i,message,&size);
+        if (message->Severity<=D3D11_MESSAGE_SEVERITY_ERROR) {++errors;std::cerr<<message->pDescription<<'\n';}
+    }
+    expect(!errors,"binding retention has zero D11 validation errors at exact feature level");
+}
+class TestSrParameters final : public NVSDK_NGX_Parameter {
+    std::unordered_map<std::string,std::variant<double,void*>> values;
+    template<class T> void write(const char* key,T value) {if constexpr (std::is_pointer_v<T>) values[key]=static_cast<void*>(value);else values[key]=static_cast<double>(value);}
+    template<class T> NVSDK_NGX_Result read(const char* key,T* value) const {
+        const auto entry=values.find(key);if (entry==values.end()) return NVSDK_NGX_Result_Fail;
+        if constexpr (std::is_pointer_v<T>) {if (const auto* pointer=std::get_if<void*>(&entry->second)) {*value=static_cast<T>(*pointer);return NVSDK_NGX_Result_Success;}}
+        else if (const auto* number=std::get_if<double>(&entry->second)) {*value=static_cast<T>(*number);return NVSDK_NGX_Result_Success;}
+        return NVSDK_NGX_Result_Fail;
+    }
+public:
+#define TEST_SR_PARAMETER(Type) void Set(const char* key,Type value) override {write(key,value);} NVSDK_NGX_Result Get(const char* key,Type* value) const override {return read(key,value);}
+    TEST_SR_PARAMETER(unsigned long long) TEST_SR_PARAMETER(float) TEST_SR_PARAMETER(double)
+    TEST_SR_PARAMETER(unsigned int) TEST_SR_PARAMETER(int) TEST_SR_PARAMETER(void*)
+    TEST_SR_PARAMETER(ID3D11Resource*) TEST_SR_PARAMETER(ID3D12Resource*)
+#undef TEST_SR_PARAMETER
+    void Reset() override {values.clear();}
+};
+struct SyntheticSrFrame final : xrfg::D3D11SuperResolutionFrame {
+    ID3D11Resource* expected_color{};
+    unsigned calls{},submits{};
+    std::uint64_t id{};
+    ComPtr<ID3D11ShaderResourceView> result;
+    HRESULT render(ID3D11DeviceContext*,ID3D11Resource* color,ID3D11Resource* destination,ID3D11ShaderResourceView** output) override {
+        ++calls;expect(color==expected_color,"SR consumes exact postprocessed carrier, not cached pre-postprocess color");
+        ComPtr<ID3D11Texture2D> target;require(destination->QueryInterface(IID_PPV_ARGS(target.GetAddressOf())),"SR target texture");
+        D3D11_TEXTURE2D_DESC desc{};target->GetDesc(&desc);expect(desc.Width==16 && desc.Height==16,"SR actual final target is full size");
+        return result.CopyTo(output);
+    }
+    void submitted(ID3D11DeviceContext*) noexcept override {++submits;xrfg::retire_d3d11_sr_frame(id);}
+};
+ComPtr<ID3D11Texture2D> full_texture(ID3D11Device* device,float first,float last) {
+    std::vector<std::uint16_t> pixels(16*16*4,DirectX::PackedVector::XMConvertFloatToHalf(first));
+    pixels[(15*16+15)*4]=DirectX::PackedVector::XMConvertFloatToHalf(last);
+    D3D11_SUBRESOURCE_DATA data{pixels.data(),16*8,0};D3D11_TEXTURE2D_DESC desc{};
+    desc.Width=desc.Height=16;desc.MipLevels=desc.ArraySize=1;desc.SampleDesc.Count=1;
+    desc.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;
+    ComPtr<ID3D11Texture2D> result;require(device->CreateTexture2D(&desc,&data,result.GetAddressOf()),"owned full-size synthetic result");return result;
+}
+void sr_consumer_test(ID3D11Device* device,ID3D11DeviceContext* context,ID3D11VertexShader* vs,ID3D11PixelShader* ps) {
+    std::array<ComPtr<ID3D11Texture2D>,2> carriers{texture(device,DXGI_FORMAT_R16G16B16A16_FLOAT,4,.1f),texture(device,DXGI_FORMAT_R16G16B16A16_FLOAT,4,.9f)};
+    std::array<ComPtr<ID3D11Texture2D>,2> xr_images{full_texture(device,0,0),full_texture(device,0,0)};
+    std::array<ComPtr<ID3D11Texture2D>,2> results{full_texture(device,.25f,.75f),full_texture(device,.875f,.125f)};
+    std::array<std::shared_ptr<SyntheticSrFrame>,2> frames;
+    for (unsigned eye=0;eye<2;++eye) {
+        frames[eye]=std::make_shared<SyntheticSrFrame>();frames[eye]->expected_color=carriers[eye].Get();
+        require(device->CreateShaderResourceView(results[eye].Get(),nullptr,frames[eye]->result.GetAddressOf()),"synthetic model result view");
+        frames[eye]->id=xrfg::register_d3d11_sr_frame(frames[eye]);
+        xrfg::set_d3d11_sr_origin(carriers[eye].Get(),{frames[eye]->id,8,8});
+        auto* image=xr_images[eye].Get();xrfg::register_d3d11_sr_destinations(91,910+eye,&image,1);
+    }
+    expect(xrfg::has_d3d11_sr_destinations(device),"XR device has actual enumerated destinations");
+    auto intermediate=texture(device,DXGI_FORMAT_R16G16B16A16_FLOAT,4,0);
+    ComPtr<ID3D11RenderTargetView> small_target;require(device->CreateRenderTargetView(intermediate.Get(),nullptr,small_target.GetAddressOf()),"small postprocess RTV");
+    ComPtr<ID3D11ShaderResourceView> source;require(device->CreateShaderResourceView(carriers[0].Get(),nullptr,source.GetAddressOf()),"carrier SRV");
+    context->ClearState();context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);context->VSSetShader(vs,nullptr,0);context->PSSetShader(ps,nullptr,0);
+    auto* source_ptr=source.Get();context->PSSetShaderResources(0,1,&source_ptr);auto* small_rtv=small_target.Get();context->OMSetRenderTargets(1,&small_rtv,nullptr);
+    D3D11_VIEWPORT viewport{0,0,8,8,0,1};context->RSSetViewports(1,&viewport);context->Draw(3,0);
+    expect(xrfg::get_d3d11_sr_origin(intermediate.Get()).frame==frames[0]->id,"full-size postprocess propagates carrier origin");
+    expect(frames[0]->calls==0,"small postprocess never dispatches SR");
+    frames[0]->expected_color=intermediate.Get();
+    auto unrelated=full_texture(device,0,0);ComPtr<ID3D11RenderTargetView> unrelated_target;
+    require(device->CreateRenderTargetView(unrelated.Get(),nullptr,unrelated_target.GetAddressOf()),"unregistered full-size target");
+    auto* unrelated_rtv=unrelated_target.Get();context->OMSetRenderTargets(1,&unrelated_rtv,nullptr);
+    viewport.Width=viewport.Height=16;context->RSSetViewports(1,&viewport);context->Draw(3,0);
+    expect(frames[0]->calls==0,"same extent without XR identity never consumes SR");
+    for (unsigned eye : {1u,0u}) {
+        source.Reset();require(device->CreateShaderResourceView(eye?carriers[1].Get():intermediate.Get(),nullptr,source.GetAddressOf()),"actual per-eye carrier view");
+        source_ptr=source.Get();context->PSSetShaderResources(0,1,&source_ptr);
+        ComPtr<ID3D11RenderTargetView> target;require(device->CreateRenderTargetView(xr_images[eye].Get(),nullptr,target.GetAddressOf()),"XR eye RTV");
+        auto* rtv=target.Get();context->OMSetRenderTargets(1,&rtv,nullptr);
+        viewport.Width=8;context->RSSetViewports(1,&viewport);context->Draw(3,0);
+        expect(frames[eye]->calls==0,"cropped final draw cannot consume SR");
+        viewport.Width=16;context->RSSetViewports(1,&viewport);
+        D3D11_BLEND_DESC blend_desc{};blend_desc.RenderTarget[0].BlendEnable=TRUE;
+        blend_desc.RenderTarget[0].SrcBlend=blend_desc.RenderTarget[0].SrcBlendAlpha=D3D11_BLEND_ONE;
+        blend_desc.RenderTarget[0].DestBlend=blend_desc.RenderTarget[0].DestBlendAlpha=D3D11_BLEND_ZERO;
+        blend_desc.RenderTarget[0].BlendOp=blend_desc.RenderTarget[0].BlendOpAlpha=D3D11_BLEND_OP_ADD;
+        blend_desc.RenderTarget[0].RenderTargetWriteMask=D3D11_COLOR_WRITE_ENABLE_ALL;
+        ComPtr<ID3D11BlendState> blend;require(device->CreateBlendState(&blend_desc,blend.GetAddressOf()),"blend rejection state");
+        context->OMSetBlendState(blend.Get(),nullptr,~0u);context->Draw(3,0);
+        expect(frames[eye]->calls==0,"blended final draw cannot consume SR");context->OMSetBlendState(nullptr,nullptr,~0u);
+        ComPtr<ID3D11ShaderResourceView> mixed;require(device->CreateShaderResourceView(carriers[1-eye].Get(),nullptr,mixed.GetAddressOf()),"other-eye source");
+        auto* mixed_ptr=mixed.Get();context->PSSetShaderResources(1,1,&mixed_ptr);
+        if (eye==1) {context->Draw(3,0);expect(frames[eye]->calls==0,"mixed pending eyes rejected");}
+        mixed_ptr=nullptr;context->PSSetShaderResources(1,1,&mixed_ptr);
+        context->Draw(3,0);
+        expect(frames[eye]->calls==1 && frames[eye]->submits==1,"exact XR eye consumes its frame once in reverse order");
+        ID3D11ShaderResourceView* restored{};context->PSGetShaderResources(0,1,&restored);
+        expect(restored==source.Get(),"original CSP source restored after SR presentation");if (restored) restored->Release();
+        context->OMSetRenderTargets(0,nullptr,nullptr);
+        expect(std::abs(read11(device,context,xr_images[eye].Get())-(eye?.875f:.25f))<.001f,"real XR pixels use the owned full-size result");
+        expect(std::abs(read11(device,context,xr_images[eye].Get(),15,15)-(eye?.125f:.75f))<.001f,"full-size corner survives: no small-buffer/downscale-back presentation");
+        expect(!xrfg::get_d3d11_sr_origin(eye?carriers[1].Get():intermediate.Get()).frame,"consumed origin cannot be reused");
+        xrfg::unregister_d3d11_sr_destinations(910+eye);
+        expect(!xrfg::is_d3d11_sr_destination(xr_images[eye].Get()),"destroyed swapchain removes exact SR destination");
+    }
+    auto expired=std::make_shared<SyntheticSrFrame>();const auto expired_id=xrfg::register_d3d11_sr_frame(expired);
+    xrfg::set_d3d11_sr_origin(intermediate.Get(),{expired_id,8,8});expired.reset();
+    expect(!xrfg::get_d3d11_sr_origin(intermediate.Get()).frame,"expired frame never borrows another publication");xrfg::retire_d3d11_sr_frame(expired_id);
+    expect(!xrfg::d3d11_sr_pending(),"all completed or expired SR frames retired");context->ClearState();
+}
+void owned_sr_test(ID3D11Device* device,ID3D11DeviceContext* context,ID3D11VertexShader* vs,ID3D11PixelShader* ps,bool staging=false) {
+    // Exercise the production owner, its real GPU copies, context-state scope,
+    // output UAV and retirement. Only the NVIDIA model and table allocator are
+    // substituted, so this test does not assert actual DLSS model execution.
+    auto color=texture(device,DXGI_FORMAT_R16G16B16A16_FLOAT,4,.25f);
+    auto motion=texture(device,DXGI_FORMAT_R16G16_FLOAT,2,.5f);
+    auto depth=texture(device,DXGI_FORMAT_R32_FLOAT,1,.75f);
+    auto carrier=texture(device,DXGI_FORMAT_R16G16B16A16_FLOAT,4,0);
+    auto post=texture(device,DXGI_FORMAT_R16G16B16A16_FLOAT,4,0);
+    auto xr_image=full_texture(device,0,0);
+    TestSrParameters parameters;
+    parameters.Set(NVSDK_NGX_Parameter_Width,8u);parameters.Set(NVSDK_NGX_Parameter_Height,8u);
+    parameters.Set(NVSDK_NGX_Parameter_OutWidth,8u);parameters.Set(NVSDK_NGX_Parameter_OutHeight,8u);
+    parameters.Set(NVSDK_NGX_Parameter_PerfQualityValue,1u);parameters.Set(NVSDK_NGX_Parameter_Reset,0u);
+    parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X,1.25f);
+    parameters.Set(NVSDK_NGX_Parameter_Color,static_cast<ID3D11Resource*>(color.Get()));
+    parameters.Set(NVSDK_NGX_Parameter_Output,static_cast<ID3D11Resource*>(carrier.Get()));
+    parameters.Set(NVSDK_NGX_Parameter_MotionVectors,static_cast<ID3D11Resource*>(motion.Get()));
+    parameters.Set(NVSDK_NGX_Parameter_Depth,static_cast<ID3D11Resource*>(depth.Get()));
+    unsigned allocations{},destructions{},dispatches{};
+    ofxr_bridge::CspD3D11SuperResolution::ParametersApi api{
+        [&](NVSDK_NGX_Parameter** output) {*output=new TestSrParameters;++allocations;return NVSDK_NGX_Result_Success;},
+        [&](NVSDK_NGX_Parameter* value) {delete static_cast<TestSrParameters*>(value);++destructions;}
+    };
+    ofxr_bridge::CspD3D11SuperResolution owned(context,&parameters,api,[&](ID3D11DeviceContext* ctx,NVSDK_NGX_Parameter* local,unsigned width,unsigned height) {
+        ++dispatches;expect(width==16 && height==16,"production owner supplies actual full XR output extent");
+        unsigned input_width{},output_width{};local->Get(NVSDK_NGX_Parameter_Width,&input_width);local->Get(NVSDK_NGX_Parameter_OutWidth,&output_width);
+        expect(input_width==8 && output_width==16,"owned NGX table declares genuine SR, not one-to-one AA");
+        float jitter{};local->Get(NVSDK_NGX_Parameter_Jitter_Offset_X,&jitter);expect(jitter==1.25f,"deferred scalar snapshot survives caller table mutation");
+        ID3D11Resource* local_color{},*local_output{},*local_motion{},*local_depth{};
+        local->Get(NVSDK_NGX_Parameter_Color,&local_color);local->Get(NVSDK_NGX_Parameter_Output,&local_output);
+        local->Get(NVSDK_NGX_Parameter_MotionVectors,&local_motion);local->Get(NVSDK_NGX_Parameter_Depth,&local_depth);
+        expect(local_color==post.Get(),"native model sees current postprocessed eye carrier");
+        expect(local_motion!=motion.Get() && local_depth!=depth.Get(),"native guides are owned copies");
+        ComPtr<ID3D11Texture2D> mv_texture,depth_texture,out_texture;
+        require(local_motion->QueryInterface(IID_PPV_ARGS(mv_texture.GetAddressOf())),"owned MV texture");
+        require(local_depth->QueryInterface(IID_PPV_ARGS(depth_texture.GetAddressOf())),"owned depth texture");
+        require(local_output->QueryInterface(IID_PPV_ARGS(out_texture.GetAddressOf())),"owned output texture");
+        expect(std::abs(read11(device,ctx,mv_texture.Get())-.5f)<.001f,"MV GPU copy survives later source overwrite");
+        expect(std::abs(read11(device,ctx,depth_texture.Get())-.75f)<.001f,"depth GPU copy survives later source overwrite");
+        D3D11_TEXTURE2D_DESC output_desc{};out_texture->GetDesc(&output_desc);
+        expect(output_desc.Width==16 && output_desc.Height==16 && (output_desc.BindFlags&D3D11_BIND_UNORDERED_ACCESS),"production output is a real full-size UAV");
+        ctx->ClearState();ComPtr<ID3D11RenderTargetView> view;require(device->CreateRenderTargetView(local_output,nullptr,view.GetAddressOf()),"synthetic native output RTV");
+        const float result[4]{.625f,.625f,.625f,1};ctx->ClearRenderTargetView(view.Get(),result);
+        return true;
+    });
+    expect(owned.ready() && allocations==1,"production owned SR initialization");
+    require(owned.prepare(context,&parameters)?S_OK:E_FAIL,"production snapshots native evaluate");
+    expect(dispatches==0,"native model is deferred until the final eye consumer");
+    const auto old_id=xrfg::get_d3d11_sr_origin(carrier.Get()).frame;
+    parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X,17.f);
+    ComPtr<ID3D11RenderTargetView> motion_rtv,depth_rtv;
+    require(device->CreateRenderTargetView(motion.Get(),nullptr,motion_rtv.GetAddressOf()),"mutable motion RTV");
+    require(device->CreateRenderTargetView(depth.Get(),nullptr,depth_rtv.GetAddressOf()),"mutable depth RTV");
+    const float changed[4]{.875f,.875f,.875f,.875f};context->ClearRenderTargetView(motion_rtv.Get(),changed);context->ClearRenderTargetView(depth_rtv.Get(),changed);
+    context->CopyResource(post.Get(),carrier.Get());
+    auto* image=xr_image.Get();xrfg::register_d3d11_sr_destinations(92,920,&image,1);
+    ComPtr<ID3D11Texture2D> staging_image;ComPtr<ID3D11PixelShader> staging_ps;
+    if (staging) {
+        staging_image=full_texture(device,0,0);
+        ComPtr<ID3D11Resource> resolved;
+        expect(FAILED(xrfg::resolve_d3d11_sr_destination(staging_image.Get(),resolved.GetAddressOf())),"same-size staging has no speculative XR ownership");
+        context->CopyResource(xr_image.Get(),staging_image.Get());
+        require(xrfg::resolve_d3d11_sr_destination(staging_image.Get(),resolved.GetAddressOf()),"actual complete XR copy establishes staging destination");
+        expect(resolved.Get()==xr_image.Get() && !xrfg::is_d3d11_sr_destination(staging_image.Get()),"staging resolves real XR image without impersonating it");
+        const char* conversion="Texture2D<float4> scene:register(t0);float4 main(float4 p:SV_Position):SV_Target {return scene.Load(int3(p.xy,0))*.5;}";
+        ComPtr<ID3DBlob> bytecode;require(D3DCompile(conversion,std::strlen(conversion),nullptr,nullptr,nullptr,"main","ps_5_0",0,0,bytecode.GetAddressOf(),nullptr),"CSP staging color conversion shader");
+        require(device->CreatePixelShader(bytecode->GetBufferPointer(),bytecode->GetBufferSize(),nullptr,staging_ps.GetAddressOf()),"CSP staging color conversion object");
+    }
+    auto* presentation_ps=staging?staging_ps.Get():ps;
+    ComPtr<ID3D11ShaderResourceView> source;ComPtr<ID3D11RenderTargetView> target;
+    require(device->CreateShaderResourceView(post.Get(),nullptr,source.GetAddressOf()),"production postprocessed view");
+    require(device->CreateRenderTargetView(staging?staging_image.Get():xr_image.Get(),nullptr,target.GetAddressOf()),"production presentation destination");
+    auto* rtv=target.Get();auto* srv=source.Get();context->OMSetRenderTargets(1,&rtv,nullptr);context->PSSetShaderResources(0,1,&srv);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);context->VSSetShader(vs,nullptr,0);context->PSSetShader(presentation_ps,nullptr,0);
+    D3D11_VIEWPORT viewport{0,0,16,16,0,1};context->RSSetViewports(1,&viewport);context->Draw(3,0);
+    expect(dispatches==1 && !xrfg::resolve_d3d11_sr_frame(old_id),"production native dispatch consumed once and retired");
+    ID3D11ShaderResourceView* restored{};context->PSGetShaderResources(0,1,&restored);
+    expect(restored==source.Get(),"production context scope preserves CSP source binding");if (restored) restored->Release();
+    ComPtr<ID3D11PixelShader> restored_ps;context->PSGetShader(restored_ps.GetAddressOf(),nullptr,nullptr);expect(restored_ps.Get()==presentation_ps,"SDK state changes do not disturb the pending CSP shader");
+    unsigned unchanged_width{};parameters.Get(NVSDK_NGX_Parameter_OutWidth,&unchanged_width);
+    ID3D11Resource* unchanged_output{};parameters.Get(NVSDK_NGX_Parameter_Output,&unchanged_output);
+    expect(unchanged_width==8 && unchanged_output==carrier.Get(),"CSP table never sees the larger owned output");
+    context->OMSetRenderTargets(0,nullptr,nullptr);
+    if (staging) context->CopyResource(xr_image.Get(),staging_image.Get());
+    expect(std::abs(read11(device,context,xr_image.Get(),15,15)-(staging?.3125f:.625f))<.001f,"actual full XR corner preserves owned SR and CSP color conversion through the final copy");
+    expect(owned.retire() && destructions==1,"native parameters/resources retire after real GPU completion");
+    expect(!owned.prepare(context,&parameters),"retired owner cannot accept another pending eye");
+    xrfg::unregister_d3d11_guide_owner(92);expect(!xrfg::is_d3d11_sr_destination(xr_image.Get()),"session retires exact SR destination");
+    if (staging) {ComPtr<ID3D11Resource> resolved;expect(FAILED(xrfg::resolve_d3d11_sr_destination(staging_image.Get(),resolved.GetAddressOf())),"session teardown removes staging ownership");}
+    context->ClearState();
+}
+void staging_destination_test(ID3D11Device* device,ID3D11DeviceContext* context) {
+    // Learn only actual complete eye copies. A rotating swapchain is one
+    // destination domain; copying the same staging color to two domains is not.
+    auto frame=std::make_shared<SyntheticSrFrame>();frame->id=xrfg::register_d3d11_sr_frame(frame);
+    auto staging=full_texture(device,0,0),first=full_texture(device,0,0),second=full_texture(device,0,0),other=full_texture(device,0,0);
+    ID3D11Texture2D* images[]{first.Get(),second.Get()};xrfg::register_d3d11_sr_destinations(94,940,images,2);
+    ComPtr<ID3D11Resource> resolved;D3D11_BOX partial{0,0,0,8,16,1};
+    context->CopySubresourceRegion(first.Get(),0,0,0,0,staging.Get(),0,&partial);
+    expect(FAILED(xrfg::resolve_d3d11_sr_destination(staging.Get(),resolved.GetAddressOf())),"partial XR copy cannot establish staging ownership");
+    context->CopyResource(first.Get(),staging.Get());
+    require(xrfg::resolve_d3d11_sr_destination(staging.Get(),resolved.GetAddressOf()),"first real XR staging copy");
+    expect(resolved.Get()==first.Get(),"first exact image supplies staging extent");resolved.Reset();
+    context->CopyResource(second.Get(),staging.Get());
+    require(xrfg::resolve_d3d11_sr_destination(staging.Get(),resolved.GetAddressOf()),"rotating XR staging copy");
+    expect(resolved.Get()==second.Get(),"swapchain image rotation preserves authoritative destination");resolved.Reset();
+    auto* other_image=other.Get();xrfg::register_d3d11_sr_destinations(94,941,&other_image,1);context->CopyResource(other.Get(),staging.Get());
+    expect(FAILED(xrfg::resolve_d3d11_sr_destination(staging.Get(),resolved.GetAddressOf())),"staging shared between XR domains is rejected, never last-copy wins");
+    auto small_color=texture(device,DXGI_FORMAT_R16G16B16A16_FLOAT,4,0);xrfg::observe_d3d11_sr_destination_copy(first.Get(),small_color.Get());
+    expect(FAILED(xrfg::resolve_d3d11_sr_destination(small_color.Get(),resolved.GetAddressOf())),"different-size copy cannot prove a staging destination");
+    xrfg::unregister_d3d11_sr_destinations(940);xrfg::unregister_d3d11_sr_destinations(941);
+    expect(FAILED(xrfg::resolve_d3d11_sr_destination(staging.Get(),resolved.GetAddressOf())),"swapchain teardown removes learned staging references");
+    xrfg::register_d3d11_sr_destinations(95,950,images,2);context->CopyResource(first.Get(),staging.Get());
+    require(xrfg::resolve_d3d11_sr_destination(staging.Get(),resolved.GetAddressOf()),"new swapchain can relearn formerly ambiguous staging");resolved.Reset();
+    xrfg::register_d3d11_sr_destinations(95,950,images,2);
+    expect(FAILED(xrfg::resolve_d3d11_sr_destination(staging.Get(),resolved.GetAddressOf())),"image reenumbering invalidates prior staging links");
+    D3D11_TEXTURE2D_DESC desc{};desc.Width=desc.Height=16;desc.ArraySize=desc.MipLevels=1;desc.SampleDesc.Count=1;
+    desc.Format=DXGI_FORMAT_R8G8B8A8_TYPELESS;desc.BindFlags=D3D11_BIND_RENDER_TARGET;
+    ComPtr<ID3D11Texture2D> typeless,srgb;require(device->CreateTexture2D(&desc,nullptr,typeless.GetAddressOf()),"CSP typeless color staging");
+    desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;require(device->CreateTexture2D(&desc,nullptr,srgb.GetAddressOf()),"XR typed sRGB eye");
+    auto* srgb_image=srgb.Get();xrfg::register_d3d11_sr_destinations(95,951,&srgb_image,1);context->CopyResource(srgb.Get(),typeless.Get());
+    require(xrfg::resolve_d3d11_sr_destination(typeless.Get(),resolved.GetAddressOf()),"legal typeless-to-sRGB complete copy proves staging ownership");
+    expect(resolved.Get()==srgb.Get(),"typed XR image remains authoritative");resolved.Reset();
+    xrfg::unregister_d3d11_guide_owner(95);
+    expect(FAILED(xrfg::resolve_d3d11_sr_destination(typeless.Get(),resolved.GetAddressOf())),"session teardown removes typed staging links");
+    xrfg::retire_d3d11_sr_frame(frame->id);context->ClearState();
+}
+#endif
 }
 int main() {
     ComPtr<ID3D12Debug> debug12;
@@ -57,6 +390,8 @@ int main() {
         expect(acquired.Get()==d12.Get() && acquired_queue.Get()==queue.Get() && generation,"actual queue/device returned");
         expect(xrfg::claim_d3d11_guides(d11.Get(),generation),"claim owner");expect(xrfg::d3d11_guides_claimed(d11.Get()),"strict resource resolution active");
 #ifdef XRFG_TEST_D11_OBSERVER
+        upscaler_bindings_test(D3D_FEATURE_LEVEL_11_0);
+        upscaler_bindings_test(D3D_FEATURE_LEVEL_11_1);
         ofxr_bridge::observe_d3d11_guide_context(context.Get());
 #endif
         xrfg::register_d3d11_guide_owner(2,d11.Get(),d12.Get(),queue.Get());
@@ -149,6 +484,10 @@ int main() {
         std::array<std::uint16_t,8*8*4> replacement{};context->UpdateSubresource(final0.Get(),0,nullptr,replacement.data(),8*4*sizeof(std::uint16_t),0);
         expect(!xrfg::resolve_d3d11_dlss_guides(final0.Get(),queue.Get()),"CPU write invalidates receipt");
         context->CopyResource(final0.Get(),eye0.Get());
+        sr_consumer_test(d11.Get(),context.Get(),vs.Get(),ps.Get());
+        owned_sr_test(d11.Get(),context.Get(),vs.Get(),ps.Get());
+        owned_sr_test(d11.Get(),context.Get(),vs.Get(),ps.Get(),true);
+        staging_destination_test(d11.Get(),context.Get());
 #endif
         const auto valid=xrfg::get_d3d11_guide_receipt(final0.Get());
         xrfg::set_d3d11_guide_receipt(final0.Get(),{generation,100,valid.publication-1,8,8});

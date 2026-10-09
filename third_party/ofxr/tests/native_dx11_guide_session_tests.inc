@@ -1,6 +1,7 @@
 // Exercise production session creation/release with actual native devices.
 #include "xrfg/d3d11_guide_transport.hpp"
 LUID native_guide_adapter{};
+ID3D11Texture2D* native_sr_image{};
 void native_dx11_guide_session_test() {
     using Microsoft::WRL::ComPtr;
     ComPtr<ID3D11Device> source;ComPtr<ID3D11DeviceContext> context;
@@ -22,6 +23,11 @@ void native_dx11_guide_session_test() {
         };
         dispatch->destroy_session=[](XrSession)->XrResult {return XR_SUCCESS;};
         dispatch->release_swapchain_image=[](XrSwapchain,const XrSwapchainImageReleaseInfo*)->XrResult {return XR_SUCCESS;};
+        dispatch->enumerate_swapchain_images=[](XrSwapchain,std::uint32_t capacity,std::uint32_t* count,XrSwapchainImageBaseHeader* images)->XrResult {
+            *count=1;
+            if (capacity && images) reinterpret_cast<XrSwapchainImageD3D11KHR*>(images)[0].texture=native_sr_image;
+            return XR_SUCCESS;
+        };
         const auto instance=reinterpret_cast<XrInstance>(0x33029);
         {std::scoped_lock lock(g_state_mutex);g_instances[instance]=dispatch;}
         XrGraphicsBindingD3D11KHR binding{XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};binding.device=source.Get();
@@ -32,6 +38,22 @@ void native_dx11_guide_session_test() {
         check(SUCCEEDED(xrfg::acquire_d3d11_guide_owner(source.Get(),&device,&queue,&owner)),"session registers original application device");
         check(device.Get()==state->d3d12_device.Get() && queue.Get()==state->d3d12_queue.Get(),"actual session queue/device identity");
         check(xrfg::claim_d3d11_guides(source.Get(),owner),"guide owner claim");
+        ComPtr<ID3D11Texture2D> native_image;
+        if (!converted) {
+            D3D11_TEXTURE2D_DESC desc{};desc.Width=desc.Height=16;desc.ArraySize=desc.MipLevels=1;desc.SampleDesc.Count=1;
+            desc.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;desc.BindFlags=D3D11_BIND_RENDER_TARGET;
+            check(SUCCEEDED(source->CreateTexture2D(&desc,nullptr,&native_image)),"native runtime XR eye");native_sr_image=native_image.Get();
+            XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};ci.width=ci.height=16;
+            ci.arraySize=ci.faceCount=ci.mipCount=ci.sampleCount=1;ci.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+            auto chain=std::make_shared<SwapchainState>(state,ci);chain->handle=reinterpret_cast<XrSwapchain>(0x330310);
+            {std::scoped_lock lock(g_state_mutex);g_swapchains[chain->handle]=chain;}
+            std::uint32_t count{};XrSwapchainImageD3D11KHR image{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR};
+            check(XR_SUCCEEDED(layer_enumerate_swapchain_images_impl(chain->handle,0,&count,nullptr)),"native count-only enumeration");
+            check(!xrfg::is_d3d11_sr_destination(native_image.Get()),"count query does not register guessed images");
+            check(XR_SUCCEEDED(layer_enumerate_swapchain_images_impl(chain->handle,1,&count,reinterpret_cast<XrSwapchainImageBaseHeader*>(&image))),"actual native image enumeration");
+            check(xrfg::is_d3d11_sr_destination(native_image.Get()),"actual native enumerated eye registered for SR");
+            {std::scoped_lock lock(g_state_mutex);g_swapchains.erase(chain->handle);}
+        }
         if (converted) {
             state->menu_enabled=true;state->dlss_motion_vectors=true;
             xrfg::configure_dlss_motion_vector_tracking(true);
@@ -49,8 +71,12 @@ void native_dx11_guide_session_test() {
                 ID3D12Resource* runtime_images[]{runtime_image.Get()};xrfg::D3D11BridgeSwapchainDescription requested{};
                 requested.requested_format=static_cast<DXGI_FORMAT>(ci.format);requested.requested_sample_count=1;std::uint32_t failure_stage{};
                 check(SUCCEEDED(chain->bridge->initialize(source.Get(),context.Get(),device.Get(),queue.Get(),runtime_images,requested,&failure_stage)),"actual application bridge");
-                auto* actual_eye=chain->bridge->d3d11_images()[0];chain->d3d12_history=std::make_shared<xrfg::D3D12SwapchainHistory>();
-                check(SUCCEEDED(chain->d3d12_history->initialize(device.Get(),queue.Get(),chain->bridge->shared_images(),D3D12_RESOURCE_STATE_COMMON)),"actual history");
+                auto* actual_eye=chain->bridge->d3d11_images()[0];
+                {std::scoped_lock lock(g_state_mutex);g_swapchains[chain->handle]=chain;}
+                std::uint32_t count{};XrSwapchainImageD3D11KHR image{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR};
+                check(XR_SUCCEEDED(layer_enumerate_swapchain_images_impl(chain->handle,1,&count,reinterpret_cast<XrSwapchainImageBaseHeader*>(&image))),"actual converted image enumeration");
+                check(image.texture==actual_eye && xrfg::is_d3d11_sr_destination(actual_eye),"only actual application-visible converted eye registered for SR");
+                check(chain->d3d12_history && chain->d3d12_history->initialized(),"actual enumerated history");
                 xrfg::D3D11GuideTransport transport;
                 check(SUCCEEDED(transport.initialize(context.Get(),device.Get(),queue.Get())) && SUCCEEDED(transport.begin()),"guide transport");
                 const auto make_input=[&](DXGI_FORMAT format) {
@@ -87,6 +113,7 @@ void native_dx11_guide_session_test() {
             }
         }
         check(XR_SUCCEEDED(layer_destroy_session_impl(handle)),"session destruction");
+        check(!xrfg::has_d3d11_sr_destinations(source.Get()),"session destruction retires all SR destinations");
         check(FAILED(xrfg::acquire_d3d11_guide_owner(source.Get(),device.ReleaseAndGetAddressOf(),queue.ReleaseAndGetAddressOf(),&owner)),"destroyed owner retired");
         {std::scoped_lock lock(g_state_mutex);g_instances.erase(instance);}
     }

@@ -6,3 +6,4 @@
 #include <mutex>
 #include <atomic>
 #define LOG_WARN(...) static_cast<void>(0)
+#define LOG_INFO(...) static_cast<void>(0)
