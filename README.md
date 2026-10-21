@@ -22,13 +22,33 @@
 > parameter restoration and bounded non-UAV color copy needed by this build.
 
 > [!WARNING]
-> This is an unofficial experimental preview (internal head **V23244**). It may
-> fail, corrupt the image or crash. It currently targets ordinary DLSS Super
-> Resolution with separate D3D12 color/depth/motion inputs. DLSS Ray
-> Reconstruction is not supported by this route. NVIDIA's proprietary
+> This is an unofficial experimental preview (source head **V33034**). It may
+> fail, corrupt the image or crash. Compatibility depends on the game's native
+> inputs, stereo resource ownership and graphics API. NVIDIA's proprietary
 > `nvngx_dlssnr.dll` is not included and must be supplied separately.
 
-### V23244 VR release source
+### V33034 source alignment
+
+This source ends at the owner-selected V33034 endpoint. It includes the unified
+reference, djules and new NVIDIA OFXR runtimes, stereo-guarded FSR, Luke's
+depth-aware AFW correction, and the accepted Assetto CSP physical menu and
+full-size per-eye DLSS output. V33035 and later startup/delivery changes and
+the later Elliott integrations are outside this revision.
+
+The local history reconstructs the useful surviving integrations above the
+published V23244 base. Adapted OFXR work credits
+[djules75/OFXR-Bridge](https://github.com/djules75/OFXR-Bridge), through the
+selected [0.2.13.1 changes](https://github.com/djules75/OFXR-Bridge/releases/tag/0.2.13.1).
+Original source SHAs, authorship and import mappings are in
+[V33034 provenance](docs/V33034_PROVENANCE.md) and the
+[detailed commit map](docs/V33034_IMPORT_MAP.csv). The pre-SR credit above and
+all upstream licences remain applicable.
+
+This is a local source preparation. The original owner-tested V33034 DLL is
+preserved separately; a fresh build has different build metadata. Automated
+verification does not establish a new game or headset result.
+
+### Published V23244 baseline
 
 The **OFXR VR Framegen** menu selects Off, FidelityFX, Nvidia, Nvidia (new),
 or FSR 3.1. Nvidia (new) enables the experimental director; FSR consumes the
@@ -36,13 +56,13 @@ game's DLSS depth/motion guides with independent eye histories. Witcher3VR
 publishes owned scene-only color for post-FSR gameplay HUD composition.
 General-game support remains experimental, not a universal installer.
 
-This revision retains V23238 rendering and NR lifetime safeguards; V23239-V23243
+The published V23244 baseline retains V23238 rendering and NR lifetime safeguards; V23239-V23243
 readiness experiments are excluded. NR/DRED recording, image captures and the
 post-HUD file follow logging switches. Required GPU retirement remains active.
 
 Use the tested [Witcher 3 VR v0.9.8 package](https://github.com/tig3rmast3r/witcher3-vr/releases/tag/v0.9.8).
-The NVIDIA NR DLL is not redistributed. The separate general-game development
-lane and Wilsjo2 multipass fork are not merged into this release.
+The NVIDIA NR DLL is not redistributed. This historical package is separate
+from the V33034 source alignment and the Wilsjo2 multipass fork.
 
 <div align="center">
   <a href="https://github.com/sponsors/cdozdil?frequency=one-time"><img src="images/gh-sponsor-red.png" /></a>
