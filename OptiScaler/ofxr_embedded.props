@@ -1,16 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <OfxrBuildRoot Condition="'$(OfxrBuildRoot)'==''">$(SolutionDir)build-ofxr</OfxrBuildRoot>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <LinkIncremental>false</LinkIncremental>
+    <!-- MSVC Release remains /O2 /Z7. Avoid reproducible LNK1103 in host LTCG debug merging. -->
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile><DebugInformationFormat>OldStyle</DebugInformationFormat><WholeProgramOptimization>false</WholeProgramOptimization></ClCompile>
     <Link>
+      <GenerateDebugInformation>DebugFull</GenerateDebugInformation>
       <GenerateMapFile>true</GenerateMapFile>
       <MapFileName>$(OutDir)OptiScaler.map</MapFileName>
-      <AdditionalLibraryDirectories>$(SolutionDir)build-ofxr\Release;$(SolutionDir)external\FidelityFX-SDK\sdk\bin\ffx_sdk;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(OfxrBuildRoot)\Release;$(SolutionDir)external\FidelityFX-SDK\sdk\bin\ffx_sdk;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>XR_APILAYER_XRFrameBridge_diagnostic.lib;xrfg_d3d12_history.lib;xrfg_fps_overlay.lib;xrfg_steamvr_delivery.lib;xrfg_implicit_layer.lib;xrfg_bridge_flight_logger.lib;xrfg_frame_capture.lib;xrfg_core.lib;ofxr_ffx_backend_dx12_x64.lib;ofxr_ffx_opticalflow_x64.lib;advapi32.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent><Command></Command></PostBuildEvent>
     <PreBuildEvent><Command></Command></PreBuildEvent>
   </ItemDefinitionGroup>
-  <Target Name="BuildEmbeddedOfxr" BeforeTargets="PrepareForBuild" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+  <Target Name="BuildEmbeddedOfxr" BeforeTargets="PrepareForBuild" Condition="'$(Configuration)|$(Platform)'=='Release|x64' and '$(SkipEmbeddedOfxrBuild)'!='true'">
     <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)build_ofxr.ps1&quot;" />
   </Target>
 </Project>

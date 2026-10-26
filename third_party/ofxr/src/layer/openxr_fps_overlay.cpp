@@ -29,6 +29,35 @@ template<class T> bool load(PFN_xrGetInstanceProcAddr get, XrInstance instance,
 }
 }
 
+// Independent from the upload lock: producer FIFO admission must not block
+// the consumer's completion observation for the preceding packet.
+struct OverlayTimingState {
+    std::mutex mutex;
+    InterfaceTimingWindow timings;
+    std::int64_t next_telemetry{};
+    SteamVrDelivery* delivery{};
+    std::atomic<std::int64_t> display_period_ns{};
+    void submitted(InterfaceFrameStamp stamp, XrResult result, std::int64_t clock,
+        bool nonempty, bool synthetic, bool new_content) {
+        if (!interface_measurement_requested()) return;
+        std::scoped_lock lock(mutex);
+        if (result == XR_SUCCESS && nonempty && synthetic && new_content && stamp.cycle)
+            stamp.cycle->synthetic_accepted(clock, display_period_ns.load(std::memory_order_relaxed));
+        timings.submitted(stamp, clock, result == XR_SUCCESS, nonempty, synthetic, new_content, 0, clock);
+        if (clock >= next_telemetry) {
+            next_telemetry = clock + 250'000'000;
+            InterfaceTelemetry out{}; out.updated_ms = GetTickCount64();
+            timings.snapshot(clock, out);
+            if (delivery) if (const auto gpu = delivery->gpu_render_timing(now_ns()); gpu &&
+                std::isfinite(gpu->pre_submit_ms) && gpu->pre_submit_ms > 0) {
+                out.gpu_render_ms = gpu->pre_submit_ms;
+                out.gpu_valid = true; out.gpu_source = InterfaceSource::steamvr_pre_submit_gpu;
+            }
+            publish_interface_telemetry(out);
+        }
+    }
+};
+
 struct OpenXrFpsOverlay::Impl {
     XrInstance instance{};
     XrSession session{};
@@ -48,9 +77,21 @@ struct OpenXrFpsOverlay::Impl {
     std::filesystem::path ini;
     std::mutex mutex;
     FpsCounter counter;
-    SteamVrDelivery* delivery{}; // Session-owned; overlay retires first.
+    struct PendingNative {std::vector<std::shared_ptr<D3D12NativeFrameResult>> results;std::int64_t at;unsigned output;std::shared_ptr<InterfaceDeliveryReceipt> delivery;};
+    std::vector<PendingNative> pending_native;
+    void poll_native() {
+        for(auto it=pending_native.begin();it!=pending_native.end();) {
+            bool pending=false;
+            for(const auto& result:it->results)pending|=result && result->resolve()==D3D12NativeFrameResult::pending;
+            if(pending) {++it;continue;}
+            const auto content=classify_native_frame_content(it->results,it->output,true,true);
+            if(content.synthetic) {counter.submitted(it->at,true,true);if(it->delivery)it->delivery->synthetic_confirmed.store(true,std::memory_order_release);}
+            it=pending_native.erase(it);
+        }
+    }
+    std::shared_ptr<OverlayTimingState> timing{std::make_shared<OverlayTimingState>()};
+    DeferredEnd deferred_end;
     bool afw_active{};
-    std::atomic<std::int64_t> display_period_ns{};
     FpsOverlayPosition position{FpsOverlayPosition::upper_right};
     std::int64_t next_refresh{};
     bool attempted{}, initialized{}, image_valid{}, acquired{}, waited{}, disabled{};
@@ -79,6 +120,51 @@ struct OpenXrFpsOverlay::Impl {
         std::uint64_t fence_value{};
     };
     std::vector<Image> images;
+    bool unfenced_submission{};
+
+    bool retire() noexcept {
+        if (!last_fence && !unfenced_submission) return true;
+        if ((device12 && FAILED(device12->GetDeviceRemovedReason())) ||
+            (device11 && FAILED(device11->GetDeviceRemovedReason()))) return true;
+        const auto value = next_fence++;
+        const auto signaled = fence12 ? queue12->Signal(fence12.Get(), value) :
+            context11 ? context11->Signal(fence11.Get(), value) : E_FAIL;
+        if (FAILED(signaled)) return false;
+        if (context11) context11->Flush();
+        const auto completed = fence12 ? fence12->GetCompletedValue() : fence11->GetCompletedValue();
+        if (completed == UINT64_MAX) return true;
+        if (completed < value) {
+            const auto registered = fence12 ? fence12->SetEventOnCompletion(value, event) :
+                fence11->SetEventOnCompletion(value, event);
+            if (FAILED(registered) || WaitForSingleObject(event, 5000) != WAIT_OBJECT_0) return false;
+        }
+        last_fence = 0; unfenced_submission = false;
+        return true;
+    }
+
+    void release_unused_surface() {
+        if (position != FpsOverlayPosition::off && !disabled) return;
+        image_valid = false;
+        if (!swapchain) { attempted = initialized = false; return; }
+        if (unfenced_submission) return;
+        const auto completed = fence12 ? fence12->GetCompletedValue() : fence11 ? fence11->GetCompletedValue() : 0;
+        if (completed == UINT64_MAX) return;
+        for (const auto& image : images) if (image.fence_value > completed) return;
+        if (acquired) {
+            if (!waited) {
+                XrSwapchainImageWaitInfo info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; info.timeout = 0;
+                if (wait(swapchain, &info) != XR_SUCCESS) return;
+                waited = true;
+            }
+            XrSwapchainImageReleaseInfo info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            if (XR_FAILED(release(swapchain, &info))) return;
+            acquired = waited = false;
+        }
+        if (XR_SUCCEEDED(destroy_swapchain(swapchain))) {
+            images.clear(); swapchain = XR_NULL_HANDLE; quad.subImage.swapchain = XR_NULL_HANDLE;
+            attempted = initialized = false;
+        }
+    }
 
     ~Impl() {
         // Only teardown waits for this overlay's last upload. No global queue
@@ -131,7 +217,7 @@ struct OpenXrFpsOverlay::Impl {
         XrReferenceSpaceCreateInfo space_info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
         space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
         space_info.poseInReferenceSpace.orientation.w = 1;
-        if (XR_FAILED(create_space(session, &space_info, &space))) return false;
+        if (!space && XR_FAILED(create_space(session, &space_info, &space))) return false;
         XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
             XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
@@ -142,7 +228,7 @@ struct OpenXrFpsOverlay::Impl {
         if (XR_FAILED(create_swapchain(session, &info, &swapchain))) return false;
         if (XR_FAILED(enumerate_images(swapchain, 0, &count, nullptr)) || !count || count > 64) return false;
         images.resize(count);
-        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event) event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!event) return false;
         if (device11) {
             std::vector<XrSwapchainImageD3D11KHR> buffers(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
@@ -226,6 +312,7 @@ struct OpenXrFpsOverlay::Impl {
             // Runs on the same application end-frame thread as bridge capture,
             // never from the asynchronous presenter. No context state changes.
             if (multithread11) multithread11->Enter();
+            unfenced_submission = true;
             context11->UpdateSubresource(image.texture11.Get(), 0, nullptr, pixels.data(), width * 4, 0);
             result = context11->Signal(fence11.Get(), value);
             context11->Flush();
@@ -260,10 +347,12 @@ struct OpenXrFpsOverlay::Impl {
             image.list->ResourceBarrier(1, &barrier);
             if (FAILED(image.list->Close())) { disabled = true; return false; }
             ID3D12CommandList* lists[]{image.list.Get()};
+            unfenced_submission = true;
             queue12->ExecuteCommandLists(1, lists);
             result = queue12->Signal(fence12.Get(), value);
         }
         if (FAILED(result)) { disabled = true; return false; }
+        unfenced_submission = false;
         last_fence = image.fence_value = value;
         XrSwapchainImageReleaseInfo info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         if (XR_FAILED(release(swapchain, &info))) { disabled = true; return false; }
@@ -274,6 +363,7 @@ struct OpenXrFpsOverlay::Impl {
 
     void application_frame(const XrFrameEndInfo* info) {
         const auto now = now_ns();
+        poll_native();
         if (!info || info->type != XR_TYPE_FRAME_END_INFO) return;
         if (now < next_refresh) return;
         next_refresh = now + 250'000'000;
@@ -283,6 +373,7 @@ struct OpenXrFpsOverlay::Impl {
         std::string value;
         for (wchar_t c : setting) { if (!c) break; value += c < 128 ? static_cast<char>(c) : '?'; }
         position = parse_overlay_position(value);
+        release_unused_surface();
         if (position == FpsOverlayPosition::off || disabled || !info->layerCount || !info->layers) return;
         float left = -1, right = 1, down = -1, up = 1;
         std::uint32_t eye_width = 0;
@@ -320,13 +411,15 @@ struct OpenXrFpsOverlay::Impl {
         quad.size = {placement.width, placement.height};
         auto snapshot = counter.snapshot(now);
         snapshot.afw_active = afw_active;
-        if (delivery) {
-            if (const auto measured = delivery->delivered_fps(now)) {
+        { std::scoped_lock timing_lock(timing->mutex);
+          if (timing->delivery) {
+            if (const auto measured = timing->delivery->delivered_fps(now)) {
                 snapshot.delivered_fps = *measured;
                 snapshot.delivered_valid = true;
             }
+          }
         }
-        if (const auto period = display_period_ns.load(std::memory_order_relaxed); period > 0) {
+        if (const auto period = timing->display_period_ns.load(std::memory_order_relaxed); period > 0) {
             const auto hz = 1.0e9f / static_cast<float>(period);
             snapshot.submitted_fps = displayed_rate(snapshot.submitted_fps, hz);
             if (snapshot.delivered_valid) snapshot.delivered_fps = displayed_rate(snapshot.delivered_fps, hz);
@@ -344,7 +437,10 @@ OpenXrFpsOverlay::OpenXrFpsOverlay(XrInstance instance, XrSession session, XrSys
     impl_->device12 = device12; impl_->queue12 = queue12; impl_->device11 = device11;
     impl_->ini = ini;
 }
-OpenXrFpsOverlay::~OpenXrFpsOverlay() = default;
+OpenXrFpsOverlay::~OpenXrFpsOverlay() {
+    if (impl_) { std::scoped_lock lock(impl_->timing->mutex); impl_->timing->delivery = nullptr; }
+    if (impl_ && !impl_->retire()) static_cast<void>(impl_.release());
+}
 
 void OpenXrFpsOverlay::application_frame(const XrFrameEndInfo* info) noexcept {
     try { std::scoped_lock lock(impl_->mutex); impl_->application_frame(info); }
@@ -355,16 +451,22 @@ void OpenXrFpsOverlay::set_afw_active(bool active) noexcept {
     impl_->afw_active = active;
 }
 void OpenXrFpsOverlay::set_delivery_source(SteamVrDelivery* delivery) noexcept {
+    std::scoped_lock lock(impl_->timing->mutex);
+    impl_->timing->delivery = delivery;
+}
+void OpenXrFpsOverlay::set_private_delivery_end(DeferredEnd end) {
     std::scoped_lock lock(impl_->mutex);
-    impl_->delivery = delivery;
+    impl_->deferred_end = std::move(end);
 }
 void OpenXrFpsOverlay::set_display_period(std::int64_t period_ns) noexcept {
-    impl_->display_period_ns.store(period_ns > 0 ? period_ns : 0, std::memory_order_relaxed);
+    impl_->timing->display_period_ns.store(period_ns > 0 ? period_ns : 0, std::memory_order_relaxed);
 }
 
 void OpenXrFpsOverlay::reset_metrics() noexcept {
     std::scoped_lock lock(impl_->mutex);
     impl_->counter.reset();
+    { std::scoped_lock timing_lock(impl_->timing->mutex);
+      impl_->timing->timings = {}; impl_->timing->next_telemetry = 0; }
     impl_->image_valid = false;
     impl_->next_refresh = 0;
     impl_->placement_valid = false;
@@ -379,6 +481,11 @@ void OpenXrFpsOverlay::suspend() noexcept {
 
 FpsSnapshot OpenXrFpsOverlay::metrics() const noexcept {
     std::scoped_lock lock(impl_->mutex);
+    impl_->poll_native();
+    if(interface_measurement_requested()) {
+        std::scoped_lock timing_lock(impl_->timing->mutex);
+        InterfaceTelemetry out{};out.updated_ms=GetTickCount64();impl_->timing->timings.snapshot(interface_clock_ns(),out);publish_interface_telemetry(out);
+    }
     return impl_->counter.snapshot(now_ns());
 }
 
@@ -389,7 +496,8 @@ std::optional<OverlayPlacement> OpenXrFpsOverlay::marker_placement() const noexc
     return impl_->placement;
 }
 
-XrResult OpenXrFpsOverlay::end_frame(const XrFrameEndInfo* info, bool synthetic, bool new_content) {
+XrResult OpenXrFpsOverlay::end_frame(const XrFrameEndInfo* info, bool synthetic, bool new_content,
+    InterfaceFrameStamp stamp, std::span<const std::shared_ptr<D3D12NativeFrameResult>> native_results, unsigned native_output) {
     std::scoped_lock lock(impl_->mutex);
     std::array<const XrCompositionLayerBaseHeader*, 128> layers{};
     XrFrameEndInfo composed{};
@@ -404,8 +512,27 @@ XrResult OpenXrFpsOverlay::end_frame(const XrFrameEndInfo* info, bool synthetic,
         ++composed.layerCount;
         submitted = &composed;
     }
-    const auto result = impl_->downstream_end(impl_->session, submitted);
-    if (result == XR_SUCCESS && nonempty) impl_->counter.submitted(now_ns(), synthetic, new_content);
+    std::shared_ptr<InterfaceDeliveryReceipt> receipt;
+    const bool measure=interface_measurement_requested() && new_content && stamp.entered_ns;
+    if(measure && nonempty && stamp.cycle && impl_->deferred_end) {
+        stamp.cycle->require_native_delivery();
+        try { receipt=std::make_shared<InterfaceDeliveryReceipt>(synthetic);
+            stamp.cycle->attach_native_delivery(receipt); } catch(...) {}
+    }
+    const auto result = impl_->deferred_end
+        ? impl_->deferred_end(submitted,receipt)
+        : impl_->downstream_end(impl_->session,submitted);
+    if(result==XR_SUCCESS && nonempty) {
+        impl_->poll_native();
+        const auto content=classify_native_frame_content(native_results,native_output,synthetic,new_content);
+        impl_->counter.submitted(now_ns(),content.synthetic,content.new_content);
+        if(receipt && content.synthetic)receipt->synthetic_confirmed.store(true,std::memory_order_release);
+        if(synthetic && new_content && !content.synthetic && impl_->pending_native.size()<64) {
+            bool pending=false;for(const auto& result:native_results)pending|=result && result->resolve()==D3D12NativeFrameResult::pending;
+            if(pending)impl_->pending_native.push_back({{native_results.begin(),native_results.end()},now_ns(),native_output,receipt});
+        }
+    }
+    if(measure)impl_->timing->submitted(stamp,result,interface_clock_ns(),nonempty,synthetic,new_content);
     return result;
 }
 

@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <nvapi.h>
 #include <proxies/D3D12_Proxy.h>
 #include <device_info/device_info.hpp>
@@ -79,6 +80,7 @@ inline constexpr bool IsEqualLUID(LUID luid1, LUID luid2)
 
 class IdentifyGpu
 {
+    inline static std::atomic<VendorId::Value> primaryVendor { VendorId::Invalid };
     inline static bool hasD3d12Capabilities = false;
     inline static std::mutex mutex {};
     inline static std::vector<GpuInformation> cache {};
@@ -87,6 +89,13 @@ class IdentifyGpu
     static void queryNvapi(GpuInformation& gpuInfo);
 
   public:
+    // Loader/NVAPI hooks must never enter lazy DXGI/NVAPI discovery or wait for
+    // its mutex: discovery may itself be waiting for this thread's loader lock.
+    static VendorId::Value getObservedPrimaryVendor() noexcept
+    {
+        return primaryVendor.load(std::memory_order_acquire);
+    }
+
     static void getHardwareAdapter(IDXGIFactory* InFactory, IDXGIAdapter** InAdapter,
                                    D3D_FEATURE_LEVEL requiredFeatureLevel);
 

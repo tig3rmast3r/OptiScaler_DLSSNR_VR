@@ -32,6 +32,16 @@ struct D3D12HistoryCaptureTicket {
     std::uint32_t source_index{};
 };
 
+struct D3D12HistoryCaptureWait {
+    // In: the longest the capture may block, in microseconds. 0 fails a busy
+    // slot at once, as before.
+    std::uint32_t limit_us{};
+    // Out: the slot was busy when the capture arrived.
+    bool slot_busy{};
+    // Out: how long the capture blocked, in microseconds.
+    std::uint64_t waited_us{};
+};
+
 struct D3D12HistoryConsumerLease {
     std::uint64_t capture_serial{};
     std::uint64_t lease_serial{};
@@ -58,13 +68,14 @@ public:
         D3D12HistoryInitializationStage* failure_stage = nullptr) noexcept;
 
     // Queues the source-to-history copy and returns after signaling its fence;
-    // it never waits for GPU completion on the release path. If the next ring
-    // slot or its allocator is still in use, ERROR_BUSY is returned and the
-    // caller must fail open rather than overwrite it.
+    // The default never waits. An explicit wait budget applies only to a
+    // submitted reader/writer of the next slot, never an active CPU lease.
+    // It does not wait for this new copy. ERROR_BUSY fails open at the limit.
     [[nodiscard]] HRESULT capture(
         std::uint32_t source_index,
         D3D12HistoryCaptureTicket* ticket,
-        const TwoFrameImageInfo* diagnostic_info = nullptr) noexcept;
+        const TwoFrameImageInfo* diagnostic_info = nullptr,
+        D3D12HistoryCaptureWait* wait = nullptr) noexcept;
 
     [[nodiscard]] HRESULT commit(const D3D12HistoryCaptureTicket& ticket) noexcept;
 

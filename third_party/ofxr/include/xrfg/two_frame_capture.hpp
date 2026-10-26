@@ -10,12 +10,16 @@
 
 namespace xrfg {
 
-// A single F10 press captures two completed AFW xrEndFrame
+// A single F8 press captures two completed AFW xrEndFrame
 // intervals, or seals a partial capture after eight application intervals.
 std::uint32_t two_frame_capture_begin_end_frame() noexcept;
 void two_frame_capture_finish_end_frame(std::uint32_t frame) noexcept;
 void two_frame_capture_mark_afw_evaluation() noexcept;
 [[nodiscard]] bool two_frame_capture_active() noexcept;
+// Full-resolution F8 session only; the rolling F9 ring has its own witnesses.
+[[nodiscard]] bool two_frame_capture_images_active() noexcept;
+// Full F8 only, one native pair per stream and at most two streams.
+[[nodiscard]] bool two_frame_capture_claim_dlssg_pair(std::uint64_t stream) noexcept;
 void two_frame_capture_timeline(
     const char* stream,
     std::int64_t code,
@@ -42,6 +46,10 @@ struct TwoFrameImageInfo {
 };
 
 struct TwoFrameGuideContract {
+    std::uint32_t native_camera_token{}, color_origin_token{};
+    std::uint64_t native_production_sequence{};
+    bool interleaved_history{};
+    std::uint32_t raw_motion_native_span{1};
     const char* stage{};
     std::uint64_t stream{};
     std::uint64_t publication{};
@@ -98,6 +106,23 @@ struct TwoFrameGuideContract {
 void two_frame_capture_guide_contract(
     const TwoFrameGuideContract& info) noexcept;
 
+// Exact values at the native NGX call, rather than reconstructed ingress data.
+// Only the full F8 pair claimant records these; no always-on observation.
+struct TwoFrameNativeDlssgEvaluation {
+    std::uint32_t frame{}, index{}, count{}, flags{}, result{};
+    std::uint64_t stream{}, publication{}, serial{}, previous_serial{};
+    bool reset{}, direct{};
+    std::uint64_t color{}, motion{}, depth{}, generated{}, disable{};
+    std::uint32_t width{}, height{}, color_format{}, input_color_format{};
+    std::array<std::uint32_t,4> backbuffer_rect{}, motion_rect{}, depth_rect{};
+    std::array<float,2> motion_scale{}, jitter{};
+    float depth_scale{}, near_far_partition{}, object_separation{}, invalid_motion{};
+    float near_plane{}, far_plane{}, fov{}, aspect{};
+    std::array<float,3> position{}, right{}, up{}, forward{};
+    std::array<float,16> view_to_clip{}, clip_to_view{}, clip_to_lens{}, clip_to_previous{}, previous_to_clip{};
+};
+void two_frame_capture_native_dlssg_evaluation(const TwoFrameNativeDlssgEvaluation& info) noexcept;
+
 void two_frame_capture_note(
     const TwoFrameImageInfo& info, HRESULT status) noexcept;
 
@@ -107,6 +132,13 @@ void two_frame_capture_record_ng_x(
     ID3D12Device* device,
     ID3D12GraphicsCommandList* list,
     ID3D12Resource* source,
+    D3D12_RESOURCE_STATES source_state) noexcept;
+
+// Diagnostic copy on an already ordered queue. Retains its allocator/list
+// through the readback fence and leaves the source in its original state.
+[[nodiscard]] HRESULT two_frame_capture_record_queue(
+    const TwoFrameImageInfo& info, ID3D12Device* device,
+    ID3D12CommandQueue* queue, ID3D12Resource* source,
     D3D12_RESOURCE_STATES source_state) noexcept;
 
 // Called after the native ExecuteCommandLists hook, never before it.

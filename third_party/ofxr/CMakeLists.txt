@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 project(XRFrameGenerationBridge VERSION 0.223.0 LANGUAGES CXX)
 
 if(MSVC)
+    add_compile_options("$<$<CONFIG:Release>:/Z7>")
     # This static layer is linked into OptiScaler and injected into hosts that
     # can preload an older game-local MSVCP140.dll. Initialize mutex/CV storage
     # through that loaded runtime instead of relying on the newer toolset's
@@ -17,6 +18,7 @@ set(XRFG_LAYER_SOURCE src/layer/openxr_layer.cpp)
 set(XRFG_SYNTHESIS_SOURCE src/d3d12/d3d12_frame_synthesizer.cpp)
 set(XRFG_SYNTHESIS_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl")
 set(XRFG_TEST_NVIDIA_ROUTE "new" CACHE STRING "Runtime route exercised by renderer fixtures")
+set(XRFG_HOST_DEPENDENCY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." CACHE PATH "OptiScaler dependency root")
 set_property(CACHE XRFG_TEST_NVIDIA_ROUTE PROPERTY STRINGS new djules)
 if(NOT XRFG_TEST_NVIDIA_ROUTE MATCHES "^(new|djules)$")
     message(FATAL_ERROR "Unknown test runtime route")
@@ -52,6 +54,7 @@ set(XRFG_FIDELITYFX_API_INCLUDE_DIR
     "Path to the modular FidelityFX API headers used by FSR frame generation")
 
 add_library(xrfg_core STATIC
+    src/core/interface_metrics.cpp
     src/core/fps_overlay_model.cpp
     src/core/image.cpp
     src/core/optical_flow.cpp
@@ -133,6 +136,11 @@ if(XRFG_BUILD_TESTS)
     add_executable(xrfg_fps_overlay_tests tests/fps_overlay_tests.cpp)
     target_link_libraries(xrfg_fps_overlay_tests PRIVATE xrfg_core)
     add_test(NAME xrfg_fps_overlay_tests COMMAND xrfg_fps_overlay_tests)
+    add_executable(xrfg_interface_metrics_tests tests/interface_metrics_tests.cpp)
+    target_link_libraries(xrfg_interface_metrics_tests PRIVATE xrfg_core)
+    target_compile_features(xrfg_interface_metrics_tests PRIVATE cxx_std_20)
+    target_compile_definitions(xrfg_interface_metrics_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME xrfg_interface_metrics_tests COMMAND xrfg_interface_metrics_tests)
 
     add_executable(xrfg_optical_flow_tests tests/optical_flow_tests.cpp)
     target_link_libraries(xrfg_optical_flow_tests PRIVATE xrfg_core)
@@ -340,6 +348,74 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         "${XRFG_LUKE_DEPTH_CONVERT_HEADER}"
         "${XRFG_LUKE_DEPTH_CALIBRATE_HEADER}"
         "${XRFG_LUKE_COMPOSE_MOTION_HEADER}")
+    set(XRFG_DLSS_SDK_ROOT "${XRFG_HOST_DEPENDENCY_ROOT}/../.local/ofxr-autonomous-deps/DLSS" CACHE PATH "Shared pinned NVIDIA DLSS SDK")
+    foreach(stage decide compose)
+        set(header "${XRFG_GENERATED_SHADER_DIR}/guide_composer_${stage}_shader.hpp")
+        if(stage STREQUAL "decide")
+            set(entry Decide)
+        else()
+            set(entry Compose)
+        endif()
+        add_custom_command(OUTPUT "${header}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${XRFG_GENERATED_SHADER_DIR}"
+            COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E ${entry}
+                /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect /Fh "${header}"
+                /Vn g_xrfg_guide_composer_${stage}_shader "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/guide_composer.hlsl"
+            DEPENDS src/d3d12/guide_composer.hlsl VERBATIM)
+        target_sources(xrfg_d3d12_history PRIVATE "${header}")
+    endforeach()
+    foreach(stage pack seed vertex pixel)
+        set(header "${XRFG_GENERATED_SHADER_DIR}/native_dlssg_${stage}_shader.hpp")
+        if(stage STREQUAL "pack")
+            set(profile cs_5_1)
+            set(entry PackNativeDlssG)
+        elseif(stage STREQUAL "seed")
+            set(profile cs_5_1)
+            set(entry SeedNativeDlssG)
+        elseif(stage STREQUAL "vertex")
+            set(profile vs_5_1)
+            set(entry NativeDlssGVS)
+        else()
+            set(profile ps_5_1)
+            set(entry NativeDlssGPS)
+        endif()
+        add_custom_command(OUTPUT "${header}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${XRFG_GENERATED_SHADER_DIR}"
+            COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ${profile} /E ${entry}
+                /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect /Fh "${header}"
+                /Vn g_xrfg_native_dlssg_${stage}_shader "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/native_dlssg.hlsl"
+            DEPENDS src/d3d12/native_dlssg.hlsl VERBATIM)
+        target_sources(xrfg_d3d12_history PRIVATE "${header}")
+    endforeach()
+    target_include_directories(xrfg_d3d12_history PUBLIC "${XRFG_DLSS_SDK_ROOT}/include")
+    target_link_libraries(xrfg_d3d12_history PUBLIC
+        optimized "${XRFG_DLSS_SDK_ROOT}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib"
+        debug "${XRFG_DLSS_SDK_ROOT}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib")
+    target_compile_definitions(xrfg_d3d12_history PUBLIC XRFG_NATIVE_DLSSG)
+    target_sources(xrfg_d3d12_history PRIVATE src/d3d12/d3d12_native_dlssg.cpp)
+    target_sources(xrfg_d3d12_history PRIVATE src/d3d12/d3d12_guide_composer.cpp src/d3d12/d3d12_native_result.cpp)
+    foreach(kind pack synthesize)
+        if(kind STREQUAL "pack")
+            set(profile cs_5_1)
+            set(entry PackFlowInput)
+            set(symbol g_xrfg_hybrid_pack_flow_input_shader)
+            set(name hybrid_pack_flow_input_shader)
+            set(extra /D XRFG_HYBRID_QUARTER_INPUT=1)
+        else()
+            set(profile ps_5_1)
+            set(entry SynthesizeHybridMidpointPS)
+            set(symbol g_xrfg_hybrid_synthesize_midpoint_pixel_shader)
+            set(name hybrid_synthesize_midpoint_pixel_shader)
+            set(extra)
+        endif()
+        set(header "${XRFG_GENERATED_SHADER_DIR}/${name}.hpp")
+        add_custom_command(OUTPUT "${header}"
+            COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ${profile} /E ${entry} ${extra}
+                /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect /Fh "${header}" /Vn ${symbol} "${XRFG_SYNTHESIS_SHADER}"
+            DEPENDS "${XRFG_SYNTHESIS_SHADER}" VERBATIM)
+        target_sources(xrfg_d3d12_history PRIVATE "${header}")
+    endforeach()
+
     target_include_directories(xrfg_d3d12_history
         PUBLIC include
         PRIVATE
@@ -347,7 +423,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             "${XRFG_FIDELITYFX_INCLUDE_DIR}"
             "${XRFG_FIDELITYFX_API_INCLUDE_DIR}"
             "${XRFG_NVIDIA_OPTICAL_FLOW_INCLUDE_DIR}")
-    set(XRFG_VULKAN_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../external/vulkan/include")
+    set(XRFG_VULKAN_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../external/vulkan/include" CACHE PATH "Pinned Vulkan headers")
     if(NOT EXISTS "${XRFG_VULKAN_INCLUDE_DIR}/vulkan/vk_layer.h")
         message(FATAL_ERROR "Initialize the pinned OptiScaler Vulkan-Headers submodule")
     endif()
@@ -377,6 +453,11 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             /W4 /permissive- /EHsc)
     endif()
 
+    add_library(xrfg_dlssg_forwarder SHARED src/d3d12/dlssg_forwarder.cpp)
+    target_compile_features(xrfg_dlssg_forwarder PRIVATE cxx_std_20)
+    target_compile_definitions(xrfg_dlssg_forwarder PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(xrfg_dlssg_forwarder PRIVATE "${XRFG_DLSS_SDK_ROOT}/include")
+    set_target_properties(xrfg_dlssg_forwarder PROPERTIES OUTPUT_NAME "nvngx.dll_dlssg")
     add_library(xrfg_bridge_flight_logger STATIC
         src/layer/bridge_flight_logger.cpp
         src/layer/luke_counter_probe.cpp
@@ -416,7 +497,30 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             /W4 /permissive- /EHsc)
     endif()
 
-    add_library(xrfg_steamvr_delivery STATIC src/layer/steamvr_delivery.cpp)
+    add_library(xrfg_steamvr_delivery STATIC src/layer/steamvr_delivery.cpp src/layer/private_openxr_runtime.cpp)
+    target_include_directories(xrfg_steamvr_delivery PUBLIC "${XRFG_OPENXR_SDK_ROOT}/include")
+    target_compile_definitions(xrfg_steamvr_delivery PUBLIC XR_USE_PLATFORM_WIN32 XR_USE_GRAPHICS_API_D3D11 XR_USE_GRAPHICS_API_D3D12 NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(xrfg_steamvr_delivery PUBLIC d3d11 d3d12 dxgi)
+    if(XRFG_BUILD_TESTS)
+        add_executable(xrfg_private_output_distributor_tests tests/private_output_distributor_tests.cpp)
+        target_include_directories(xrfg_private_output_distributor_tests PRIVATE include)
+        target_compile_features(xrfg_private_output_distributor_tests PRIVATE cxx_std_20)
+        foreach(mode hybrid native ofa25)
+            add_test(NAME xrfg_assetto_${mode}_gpu COMMAND xrfg_d3d12_history_tests assetto-${mode})
+            set_tests_properties(xrfg_assetto_${mode}_gpu PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+        endforeach()
+        add_test(NAME xrfg_assetto_native_late_gpu COMMAND "${CMAKE_COMMAND}"
+            "-DTEST_EXE=$<TARGET_FILE:xrfg_d3d12_history_tests>" "-DFORWARDER=$<TARGET_FILE:xrfg_dlssg_forwarder>"
+            "-DPROVIDER_MODEL=${XRFG_DLSS_SDK_ROOT}/lib/Windows_x86_64/rel/nvngx_dlssg.dll"
+            "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/assetto-native-late" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_assetto_native_late.cmake")
+        set_tests_properties(xrfg_assetto_native_late_gpu PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+        add_test(NAME xrfg_private_output_distributor_tests COMMAND xrfg_private_output_distributor_tests)
+        add_executable(xrfg_private_openxr_runtime_tests tests/private_openxr_runtime_tests.cpp)
+        target_link_libraries(xrfg_private_openxr_runtime_tests PRIVATE xrfg_steamvr_delivery)
+        target_compile_features(xrfg_private_openxr_runtime_tests PRIVATE cxx_std_20)
+        add_test(NAME xrfg_private_openxr_runtime_gpu COMMAND xrfg_private_openxr_runtime_tests)
+        set_tests_properties(xrfg_private_openxr_runtime_gpu PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+    endif()
     target_include_directories(xrfg_steamvr_delivery PUBLIC include PRIVATE external/OpenVR/include)
     target_compile_features(xrfg_steamvr_delivery PUBLIC cxx_std_20)
     target_compile_definitions(xrfg_steamvr_delivery PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -427,7 +531,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     target_compile_features(xrfg_fps_overlay PUBLIC cxx_std_20)
     target_compile_definitions(xrfg_fps_overlay PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN
         XR_USE_GRAPHICS_API_D3D11 XR_USE_GRAPHICS_API_D3D12 XR_USE_PLATFORM_WIN32)
-    target_link_libraries(xrfg_fps_overlay PUBLIC xrfg_core xrfg_steamvr_delivery d3d11 d3d12 dxgi)
+    target_link_libraries(xrfg_fps_overlay PUBLIC xrfg_core xrfg_d3d12_history xrfg_steamvr_delivery d3d11 d3d12 dxgi)
     if(MSVC)
         target_compile_options(xrfg_fps_overlay PRIVATE /W4 /permissive- /EHsc)
     endif()
@@ -595,7 +699,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             ../../OptiScaler/ofxr/d3d11_guide_observer.cpp
             ../../OptiScaler/ofxr/csp_super_resolution.cpp)
         target_include_directories(xrfg_d3d11_guide_observer_tests PRIVATE
-            tests/d3d11_observer_fixture ../../OptiScaler/include ../../external/nvngx_dlss_sdk)
+            tests/d3d11_observer_fixture ../../OptiScaler/include "${XRFG_HOST_DEPENDENCY_ROOT}/external/nvngx_dlss_sdk")
         target_link_libraries(xrfg_d3d11_guide_observer_tests PRIVATE xrfg_d3d12_history d3dcompiler
             "${CMAKE_CURRENT_SOURCE_DIR}/../../OptiScaler/library/detours/detours.lib")
         target_compile_definitions(xrfg_d3d11_guide_observer_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN XRFG_TEST_D11_OBSERVER)
@@ -623,6 +727,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         target_compile_definitions(xrfg_d3d11_color_identity_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
         add_test(NAME xrfg_d3d11_color_identity COMMAND xrfg_d3d11_color_identity_tests)
         set_tests_properties(xrfg_d3d11_color_identity PROPERTIES TIMEOUT 30)
+        add_test(NAME xrfg_assetto_common_contracts COMMAND xrfg_three_slot_director_tests assetto-common)
         target_include_directories(xrfg_three_slot_director_tests PRIVATE
             include "${XRFG_OPENXR_SDK_ROOT}/include")
         target_compile_features(xrfg_three_slot_director_tests PRIVATE cxx_std_20)
@@ -686,6 +791,16 @@ if(WIN32 AND XRFG_BUILD_LAYER)
 
         add_executable(xrfg_three_slot_d3d12_tests tests/three_slot_d3d12_tests.cpp
             src/common/embedded_control.cpp)
+        add_executable(xrfg_private_runtime_layer_tests tests/private_runtime_layer_tests.cpp src/common/embedded_control.cpp)
+        target_include_directories(xrfg_private_runtime_layer_tests PRIVATE include "${XRFG_OPENXR_SDK_ROOT}/include")
+        target_compile_features(xrfg_private_runtime_layer_tests PRIVATE cxx_std_20)
+        target_compile_definitions(xrfg_private_runtime_layer_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN XR_USE_GRAPHICS_API_D3D11 XR_USE_GRAPHICS_API_D3D12 XR_USE_PLATFORM_WIN32 OFXR_PROVIDER_API_EXPORTS)
+        target_link_libraries(xrfg_private_runtime_layer_tests PRIVATE xrfg_core xrfg_d3d12_history xrfg_bridge_flight_logger xrfg_fps_overlay xrfg_implicit_layer psapi xrfg_frame_capture)
+        foreach(route IN ITEMS ref new djules fidelity fsr djules3 d11-ref d11-new d11-djules d11-fidelity new-01 new-10 new-11 switch separate-ref separate-new separate-fidelity separate-fsr session bridge-session)
+            add_test(NAME xrfg_private_runtime_${route}_gpu COMMAND xrfg_private_runtime_layer_tests ${route})
+            set_tests_properties(xrfg_private_runtime_${route}_gpu PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
+        endforeach()
+
         target_include_directories(xrfg_three_slot_d3d12_tests PRIVATE include "${XRFG_OPENXR_SDK_ROOT}/include")
         target_compile_features(xrfg_three_slot_d3d12_tests PRIVATE cxx_std_20)
         target_compile_definitions(xrfg_three_slot_d3d12_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
@@ -735,6 +850,39 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             set_tests_properties(xrfg_fsr_inline_gpu PROPERTIES TIMEOUT 60)
         endif()
         set_tests_properties(xrfg_fsr_inline_missing_guides PROPERTIES TIMEOUT 60)
+        # Same actual renderer/GPU oracle, with each supported storage tuple.
+        add_executable(xrfg_assetto_djules_tests tests/three_slot_d3d12_tests.cpp src/common/embedded_control.cpp)
+        foreach(property INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_LIBRARIES)
+            get_target_property(value xrfg_three_slot_d3d12_tests ${property})
+            if(value)
+                set_property(TARGET xrfg_assetto_djules_tests PROPERTY ${property} "${value}")
+            endif()
+        endforeach()
+        target_compile_features(xrfg_assetto_djules_tests PRIVATE cxx_std_20)
+        target_compile_definitions(xrfg_assetto_djules_tests PRIVATE OFXR_TEST_DJULES_ROUTE=1)
+        foreach(mode triple-core triple-switch deep-readiness)
+            add_test(NAME xrfg_assetto_djules_${mode} COMMAND xrfg_assetto_djules_tests ${mode})
+            set_tests_properties(xrfg_assetto_djules_${mode} PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)
+        endforeach()
+        foreach(runtime 0 1)
+            foreach(separate 0 1)
+                foreach(reduced 0 1)
+                    foreach(engine reference new djules)
+                        set(target xrfg_three_slot_d3d12_tests)
+                        set(mode split)
+                        if(engine STREQUAL reference)
+                            set(mode legacy-queue)
+                        elseif(engine STREQUAL djules)
+                            set(target xrfg_assetto_djules_tests)
+                        endif()
+                        set(test xrfg_assetto_storage_${engine}_${runtime}_${separate}_${reduced})
+                        add_test(NAME ${test} COMMAND ${target} ${mode})
+                        set_tests_properties(${test} PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE
+                            ENVIRONMENT "XRFG_TEST_RUNTIME=${runtime};XRFG_TEST_SEPARATE=${separate};XRFG_TEST_REDUCED=${reduced}")
+                    endforeach()
+                endforeach()
+            endforeach()
+        endforeach()
         add_test(NAME xrfg_capture_gap_d3d12_split COMMAND xrfg_three_slot_d3d12_tests gap-split)
         add_test(NAME xrfg_capture_gap_d3d12_array COMMAND xrfg_three_slot_d3d12_tests gap-array)
         set_tests_properties(xrfg_capture_gap_d3d11 xrfg_capture_gap_d3d12_split xrfg_capture_gap_d3d12_array PROPERTIES TIMEOUT 30)
@@ -908,7 +1056,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
 
         add_executable(xrfg_luke_depth_gpu_tests tests/luke_depth_gpu_tests.cpp)
         add_executable(xrfg_luke_vulkan_interop_tests tests/luke_vulkan_interop_tests.cpp src/d3d12/luke_color_origin.cpp)
-        target_include_directories(xrfg_luke_vulkan_interop_tests PRIVATE include "${CMAKE_CURRENT_SOURCE_DIR}/../../external/vulkan/include" "${CMAKE_CURRENT_SOURCE_DIR}/../../external/nvngx_dlss_sdk")
+        target_include_directories(xrfg_luke_vulkan_interop_tests PRIVATE include "${XRFG_VULKAN_INCLUDE_DIR}" "${XRFG_HOST_DEPENDENCY_ROOT}/external/nvngx_dlss_sdk")
         target_compile_definitions(xrfg_luke_vulkan_interop_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
         target_compile_features(xrfg_luke_vulkan_interop_tests PRIVATE cxx_std_20)
         target_link_libraries(xrfg_luke_vulkan_interop_tests PRIVATE d3d12 dxgi xrfg_bridge_flight_logger

@@ -1,6 +1,8 @@
 #include "pch.h"
 
 #include "ofxr_bridge_client.hpp"
+#include "../proxies/NVNGX_Proxy.h"
+#include "../../third_party/ofxr/include/xrfg/native_ngx_owner.hpp"
 
 #include "../State.h"
 #include "../hooks/Streamline_Hooks.h"
@@ -473,6 +475,7 @@ bool set_overlay_setting(int position) noexcept {
                          : xrfg::embedded::set_overlay_setting(position);
 }
 void configure_dlss_guides(bool enabled) noexcept {
+    xrfg::register_native_ngx_owner(NVNGXProxy::NVNGXModule());
     const auto api = current_dispatch();
     if (complete(api))
         api.configure_vectors(enabled ? 1 : 0);

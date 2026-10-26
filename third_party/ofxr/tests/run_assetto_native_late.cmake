@@ -1,0 +1,8 @@
+file(MAKE_DIRECTORY "${WORK}")
+file(REMOVE "${WORK}/nvngx_dlssg.dll")
+file(COPY "${TEST_EXE}" "${FORWARDER}" DESTINATION "${WORK}")
+get_filename_component(exe_name "${TEST_EXE}" NAME)
+execute_process(COMMAND "${WORK}/${exe_name}" assetto-native-late "${PROVIDER_MODEL}" RESULT_VARIABLE result)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "Actual late NGX discovery/private FG failed: ${result}")
+endif()

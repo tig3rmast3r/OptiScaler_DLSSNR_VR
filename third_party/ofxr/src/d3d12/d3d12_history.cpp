@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -113,6 +114,8 @@ struct D3D12SwapchainHistory::Impl {
     std::vector<ComPtr<ID3D12Resource>> source_images;
     ComPtr<ID3D12Fence> producer_fence;
     HANDLE fence_event{};
+    HANDLE busy_event{};
+    HANDLE busy_timer{};
     std::array<HistorySlot, D3D12SwapchainHistory::kSlotCount> slots;
     D3D12_RESOURCE_STATES release_state{};
     std::uint64_t next_serial{1};
@@ -129,6 +132,8 @@ struct D3D12SwapchainHistory::Impl {
         if (fence_event != nullptr) {
             CloseHandle(fence_event);
         }
+        if (busy_event) CloseHandle(busy_event);
+        if (busy_timer) CloseHandle(busy_timer);
     }
 
     [[nodiscard]] static bool matching_ticket(
@@ -345,6 +350,80 @@ struct D3D12SwapchainHistory::Impl {
         return fence_status(fence, value) == S_OK ? S_OK : E_FAIL;
     }
 
+    // Waits until `fence` reaches `value` or the timer armed by
+    // wait_for_busy_slot fires. ERROR_BUSY when the time ran out first.
+    [[nodiscard]] HRESULT wait_for_fence_bounded(
+        ID3D12Fence* fence,
+        std::uint64_t value) noexcept {
+        for (;;) {
+            const HRESULT status = fence_status(fence, value);
+            if (status != S_FALSE) {
+                return status;
+            }
+            const HRESULT event_result = fence->SetEventOnCompletion(value, busy_event);
+            if (FAILED(event_result)) {
+                return event_result;
+            }
+            const HANDLE handles[] = {busy_event, busy_timer};
+            const DWORD wait_result =
+                WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+            if (wait_result == WAIT_OBJECT_0 + 1) {
+                return fence_status(fence, value) == S_FALSE
+                    ? HRESULT_FROM_WIN32(ERROR_BUSY)
+                    : fence_status(fence, value);
+            }
+            if (wait_result != WAIT_OBJECT_0) {
+                const DWORD error = GetLastError();
+                return HRESULT_FROM_WIN32(error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error);
+            }
+            // The event may be a stale registration from an earlier wait that
+            // timed out: the loop checks the fence again before trusting it.
+        }
+    }
+
+    // The bounded wait for a slot whose last reader or writer is still on the
+    // GPU: the consumer's completion first, then the slot's own capture.
+    // Never for a lease, which is CPU state no fence will clear.
+    [[nodiscard]] HRESULT wait_for_busy_slot(
+        HistorySlot& slot,
+        std::uint32_t limit_us) noexcept {
+        if (slot.active_lease_serial != 0 || limit_us == 0) {
+            return HRESULT_FROM_WIN32(ERROR_BUSY);
+        }
+        if (busy_event == nullptr) {
+            busy_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (busy_event == nullptr) {
+                return HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY);
+            }
+        }
+        if (busy_timer == nullptr) {
+            busy_timer = CreateWaitableTimerExW(
+                nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (busy_timer == nullptr) {
+                busy_timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+            }
+            if (busy_timer == nullptr) {
+                return HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY);
+            }
+        }
+        LARGE_INTEGER due{};
+        due.QuadPart = -static_cast<LONGLONG>(limit_us) * 10;
+        if (!SetWaitableTimer(busy_timer, &due, 0, nullptr, nullptr, FALSE)) {
+            const DWORD error = GetLastError();
+            return HRESULT_FROM_WIN32(error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error);
+        }
+        HRESULT result = S_OK;
+        if (slot.consumer_fence_value != 0) {
+            result = wait_for_fence_bounded(
+                slot.consumer_fence.Get(), slot.consumer_fence_value);
+        }
+        if (SUCCEEDED(result)) {
+            result = wait_for_fence_bounded(producer_fence.Get(), slot.capture_fence_value);
+        }
+        static_cast<void>(CancelWaitableTimer(busy_timer));
+        return result;
+    }
+
     [[nodiscard]] HRESULT prepare_slot_for_capture(HistorySlot& slot) noexcept {
         if (slot.active_lease_serial != 0) {
             return HRESULT_FROM_WIN32(ERROR_BUSY);
@@ -401,11 +480,12 @@ struct D3D12SwapchainHistory::Impl {
     [[nodiscard]] HRESULT capture(
         std::uint32_t source_index,
         D3D12HistoryCaptureTicket* output_ticket,
-        const TwoFrameImageInfo* diagnostic_info) noexcept {
+        const TwoFrameImageInfo* diagnostic_info, D3D12HistoryCaptureWait* wait) noexcept {
         if (output_ticket == nullptr) {
             return E_POINTER;
         }
         *output_ticket = {};
+        if (wait) { wait->slot_busy=false; wait->waited_us=0; }
 
         if (!capture_enabled || has_pending_capture) {
             return E_UNEXPECTED;
@@ -420,6 +500,15 @@ struct D3D12SwapchainHistory::Impl {
 
         HistorySlot& slot = slots[next_slot];
         HRESULT result = prepare_slot_for_capture(slot);
+        if (result == HRESULT_FROM_WIN32(ERROR_BUSY) && wait && wait->limit_us) {
+            wait->slot_busy = true;
+            const auto entered = std::chrono::steady_clock::now();
+            result = wait_for_busy_slot(slot, wait->limit_us);
+            wait->waited_us = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now()-entered).count());
+            if (SUCCEEDED(result)) result = prepare_slot_for_capture(slot);
+        }
         if (FAILED(result)) {
             return result;
         }
@@ -702,7 +791,7 @@ HRESULT D3D12SwapchainHistory::initialize(
 HRESULT D3D12SwapchainHistory::capture(
     std::uint32_t source_index,
     D3D12HistoryCaptureTicket* ticket,
-    const TwoFrameImageInfo* diagnostic_info) noexcept {
+    const TwoFrameImageInfo* diagnostic_info, D3D12HistoryCaptureWait* wait) noexcept {
     try {
         std::scoped_lock lock(mutex_);
         if (impl_ == nullptr) {
@@ -715,7 +804,7 @@ HRESULT D3D12SwapchainHistory::capture(
         const auto token = log.begin(BridgeFlightOperation::history_capture,
             reinterpret_cast<std::uintptr_t>(this), source_index);
         const HRESULT result = impl_->capture(source_index, ticket,
-            diagnostic_info);
+            diagnostic_info, wait);
         log.end(token, BridgeFlightOperation::history_capture, result,
             reinterpret_cast<std::uintptr_t>(this), ticket ? ticket->serial : 0,
             ticket ? ticket->fence_value : 0);

@@ -78,6 +78,13 @@ struct DlssMotionVectorPublication {
     bool direct_output_receipt{};
     std::uint32_t camera_frame_token{};
     bool camera_frame_token_valid{};
+    // KCD scene-camera tokens identify read attempts, including extra failed
+    // probes. Its temporal identity instead comes from the exact observed NGX
+    // SR/RR production; failed productions still consume this sequence.
+    std::uint64_t native_production_sequence{};
+    // In-process receipt:1=current->N-1,2=current->same-eye N-2.
+    // Append fields so existing aggregate publishers retain their contract.
+    std::uint32_t raw_motion_native_span{1};
 };
 
 // Scalar native camera history: no retained older GPU resources or SL metadata.
@@ -88,6 +95,8 @@ struct DlssNativeCameraHistory {
     float jitter_x{},jitter_y{};
     std::array<float,3> position{},right{},up{},forward{};
     std::array<float,16> projection{},inverse_projection{};
+    std::uint64_t native_production_sequence{};
+    std::uint32_t raw_motion_native_span{1};
 };
 struct DlssMotionVectorFrame {
     std::uint64_t stream{};
@@ -164,12 +173,24 @@ struct DlssMotionVectorFrame {
     // Exact native N-2 same-eye camera. Resolver results retain plain producer
     // frames, never recursive history chains; no additional GPU copy is needed.
     std::shared_ptr<const DlssMotionVectorFrame> previous_same_guide;
+    // Resolver-proven chronological A/B/A cameras; original stream/epoch/
+    // serial identities remain intact, never rewritten as a virtual feature.
+    bool luke_interleaved_history{};
     // Calibrated same-time eye separation in the producer camera units.
     float calibrated_game_eye_baseline{};
     std::shared_ptr<DlssSnapshotRetention> motion_retention;
     std::shared_ptr<DlssSnapshotRetention> depth_retention;
     std::uint32_t camera_frame_token{};
     bool camera_frame_token_valid{};
+    std::uint64_t native_production_sequence{};
+    // Where the game's motion and depth rectangles started before the
+    // snapshot cropped them: what tells eyes sharing one target apart.
+    std::uint32_t source_motion_x{};
+    std::uint32_t source_depth_x{};
+    // R22: preceding opposite-eye evaluation in a shared stream. Attached only
+    // to resolved frames, never to stored producer frames or recursively.
+    std::shared_ptr<const DlssMotionVectorFrame> bridge;
+    std::uint32_t raw_motion_native_span{1};
 };
 
 inline DlssNativeCameraHistory dlss_native_camera_history(const DlssMotionVectorFrame& f) noexcept {
@@ -177,7 +198,8 @@ inline DlssNativeCameraHistory dlss_native_camera_history(const DlssMotionVector
         f.motion_width,f.motion_height,f.output_width,f.output_height,
         f.camera_frame_token_valid&&f.camera_data_valid&&f.camera_matrices_valid,
         f.reset,f.jittered,f.jitter_x,f.jitter_y,f.camera_position,f.camera_right,
-        f.camera_up,f.camera_forward,f.camera_view_to_clip,f.camera_clip_to_view};
+        f.camera_up,f.camera_forward,f.camera_view_to_clip,f.camera_clip_to_view,
+        f.native_production_sequence,f.raw_motion_native_span};
 }
 
 constexpr std::uint32_t kDlssMotionVectorEyeCount = 2;
@@ -197,6 +219,11 @@ enum class DlssMotionVectorStatus : std::uint32_t {
     invalid_input,
     temporal_mismatch,
     used,
+    waiting_for_depth,
+    native_unavailable,
+    multi_frame_unsupported,
+    native_evaluate_failed,
+    native_resizing,
 };
 
 struct DlssMotionVectorStatistics {

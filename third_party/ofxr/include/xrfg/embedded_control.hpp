@@ -8,13 +8,18 @@ bool layer_active() noexcept;
 // CPU-only interface: no NGX/FFX structures cross the host/backend ABI boundary.
 struct Settings {
     bool enabled{true};
+    int pacing_mode{1}; // 0 Framework, 1 Director, 2 Framework + Director
     int backend{}; // 0 FidelityFX, 1 NVIDIA legacy, 2 NVIDIA new, 3 NVIDIA djules
     int preset{1}; // 0 slow, 1 medium, 2 fast
-    int scale{2}; // 0 full, 1 three-quarter, 2 half
+    int scale{2}; // 0 full, 1 three-quarter, 2 half, 3 quarter
     bool backward{};
-    int lower_vram{-1}; // -1 preserves route defaults; 0/1 explicitly select native D3D12 output storage
+    int lower_vram{}; // reduce XR output rings independently of compute storage
     int motion_vectors{}; // 0 optical flow, 1 DLSS ingress
-    int frame_generation{}; // 0 OFXR synthesis, 1 FSR 3 frame generation
+    int frame_generation{}; // 0 OFXR, 1 FSR 3, 2 native DLSS-G
+    unsigned native_scale{100};
+    bool hybrid{};
+    int separate_synthesis{}; // owned compute textures; independent of XR ring count
+    bool synthetic_camera{}; // optional own-camera composition, off by default
     bool operator==(const Settings&) const = default;
 };
 struct Snapshot {

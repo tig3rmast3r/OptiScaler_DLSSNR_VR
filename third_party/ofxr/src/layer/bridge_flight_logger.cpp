@@ -31,6 +31,14 @@ constexpr std::uint64_t kMegabyte = 1024ull * 1024ull;
 [[nodiscard]] const char* operation_name(
     BridgeFlightOperation operation) noexcept {
     switch (operation) {
+    case BridgeFlightOperation::native_dlssg_record: return "native_dlssg_record";
+    case BridgeFlightOperation::native_dlssg_evaluate: return "native_dlssg_evaluate";
+    case BridgeFlightOperation::native_dlssg_decision: return "native_dlssg_decision";
+    case BridgeFlightOperation::native_dlssg_provider: return "native_dlssg_provider";
+    case BridgeFlightOperation::luke_inline_view: return "luke_inline_view";
+    case BridgeFlightOperation::luke_inline_pose_bits: return "luke_inline_pose_bits";
+    case BridgeFlightOperation::history_capture_wait: return "history_capture_wait";
+    case BridgeFlightOperation::menu_status: return "menu_status";
     case BridgeFlightOperation::steamvr_delivery_attach: return "steamvr_delivery_attach";
     case BridgeFlightOperation::view_configuration: return "view_configuration";
     case BridgeFlightOperation::vulkan_negotiation: return "vulkan_negotiation";

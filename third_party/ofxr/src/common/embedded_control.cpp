@@ -46,7 +46,10 @@ struct Control {
         settings.scale = static_cast<int>(options.input_scale);
         settings.backward = options.bidirectional;
         settings.lower_vram = std::clamp(static_cast<int>(GetPrivateProfileIntW(
-            L"ofxr", L"single_swapchain_rings", -1, ini().c_str())), -1, 1);
+            L"ofxr", L"single_swapchain_rings", 0, ini().c_str())), 0, 1);
+        settings.separate_synthesis = std::clamp(static_cast<int>(GetPrivateProfileIntW(
+            L"ofxr", L"separate_synthesis", settings.lower_vram, ini().c_str())), 0, 1);
+        settings.synthetic_camera = GetPrivateProfileIntW(L"ofxr", L"synthetic_camera", 0, ini().c_str()) != 0;
         settings.enabled = GetPrivateProfileIntW(L"ofxr", L"enabled", 1, ini().c_str()) != 0;
         wchar_t motion[16]{};
         GetPrivateProfileStringW(L"ofxr", L"motion_vectors", L"off", motion, 16, ini().c_str());
@@ -58,7 +61,15 @@ struct Control {
         }
         wchar_t generation[16]{};
         GetPrivateProfileStringW(L"ofxr", L"frame_generation", L"ofxr", generation, 16, ini().c_str());
-        settings.frame_generation = _wcsicmp(generation, L"fsr3") == 0 ? 1 : 0;
+        settings.frame_generation = _wcsicmp(generation,L"dlssg")==0 ? 2 : _wcsicmp(generation,L"fsr3")==0 ? 1 : 0;
+        settings.hybrid=GetPrivateProfileIntW(L"ofxr",L"hybrid",0,ini().c_str())!=0;
+        settings.native_scale=std::clamp(GetPrivateProfileIntW(L"ofxr",L"dlssg_resolution",100,ini().c_str()),25U,100U);
+        settings.pacing_mode=std::clamp(int(GetPrivateProfileIntW(L"ofxr",L"pacing_mode",1,ini().c_str())),0,2);
+        // The Assetto preset pairs the existing memory controls. Preserve old
+        // mixed profiles as Fast, without writing or importing unrelated INIs.
+        settings.lower_vram=settings.separate_synthesis=(settings.lower_vram||settings.separate_synthesis)?1:0;
+        if(settings.frame_generation==2) {settings.backend=0;settings.motion_vectors=1;settings.hybrid=false;}
+        if(settings.hybrid) {settings.frame_generation=0;settings.motion_vectors=1;}
     }
 };
 Control& control() { static Control state; return state; }
@@ -116,9 +127,12 @@ Snapshot snapshot() {
 }
 bool request(Settings s) {
     if (s.backend < 0 || s.backend > 3 || s.preset < 0 || s.preset > 2 ||
-        s.scale < 0 || s.scale > 2 || s.motion_vectors < 0 || s.motion_vectors > 1 ||
-        s.frame_generation < 0 || s.frame_generation > 1 ||
-        s.lower_vram < -1 || s.lower_vram > 1) return false;
+        s.scale < 0 || s.scale > 3 || s.motion_vectors < 0 || s.motion_vectors > 1 ||
+        s.frame_generation < 0 || s.frame_generation > 2 ||
+        s.lower_vram < 0 || s.lower_vram > 1 || s.separate_synthesis < 0 || s.separate_synthesis > 1) return false;
+    if (s.pacing_mode < 0 || s.pacing_mode > 2 || s.native_scale < 25 || s.native_scale > 100) return false;
+    if (s.hybrid) { s.frame_generation=0; s.motion_vectors=1; }
+    if (s.frame_generation==2) { s.backend=0; s.motion_vectors=1; s.hybrid=false; }
     // This UI option controls OFXR's temporal guide choice, but Luke AFW
     // independently needs the NGX guide publication even with color-only OFXR.
     if (luke_afw_requires_dlss_guides()) s.motion_vectors = 1;
@@ -130,14 +144,19 @@ bool request(Settings s) {
     if (old.backend != s.backend) ok &= write(L"ofxr", L"backend", s.backend ? L"nvidia" : L"fidelityfx");
     if (old.backend != s.backend) ok &= write(L"ofxr", L"nvidia_route", s.backend == 3 ? L"djules" : s.backend == 2 ? L"new" : L"legacy");
     const wchar_t* presets[]{L"slow", L"medium", L"fast"};
-    const wchar_t* scales[]{L"100", L"75", L"50"};
+    const wchar_t* scales[]{L"100", L"75", L"50", L"25"};
     if (old.preset != s.preset) ok &= write(L"ofxr", L"nvidia_preset", presets[s.preset]);
     if (old.scale != s.scale) ok &= write(L"ofxr", L"nvidia_input_scale", scales[s.scale]);
     if (old.lower_vram != s.lower_vram) ok &= write(L"ofxr", L"single_swapchain_rings",
         s.lower_vram < 0 ? nullptr : s.lower_vram ? L"1" : L"0");
+    if (old.separate_synthesis != s.separate_synthesis) ok &= write(L"ofxr", L"separate_synthesis", s.separate_synthesis ? L"1" : L"0");
+    if (old.synthetic_camera != s.synthetic_camera) ok &= write(L"ofxr", L"synthetic_camera", s.synthetic_camera ? L"1" : L"0");
     if (old.backward != s.backward) ok &= write(L"ofxr", L"nvidia_bidirectional", s.backward ? L"1" : L"0");
     if (old.motion_vectors != s.motion_vectors) ok &= write(L"ofxr", L"motion_vectors", s.motion_vectors ? L"dlss" : L"off");
-    if (old.frame_generation != s.frame_generation) ok &= write(L"ofxr", L"frame_generation", s.frame_generation ? L"fsr3" : L"ofxr");
+    if (old.frame_generation != s.frame_generation) ok &= write(L"ofxr", L"frame_generation", s.frame_generation==2 ? L"dlssg" : s.frame_generation==1 ? L"fsr3" : L"ofxr");
+    if(old.hybrid!=s.hybrid) ok &= write(L"ofxr",L"hybrid",s.hybrid?L"1":L"0");
+    if(old.pacing_mode!=s.pacing_mode) { const auto value=std::to_wstring(s.pacing_mode);ok &= write(L"ofxr",L"pacing_mode",value.c_str()); }
+    if(old.native_scale!=s.native_scale) { const auto value=std::to_wstring(s.native_scale);ok &= write(L"ofxr",L"dlssg_resolution",value.c_str()); }
     if (old != s) { c.settings = s; ++c.revision; }
     return ok;
 }
@@ -289,6 +308,15 @@ bool set_overlay_setting(int position) { return position >= 0 && position < 5 &&
 
 // Private, versioned POD ABI for the combined-module host regression harness.
 extern "C" __declspec(dllexport) int OFXR_EmbeddedRequestV1(int enabled, int backend, int preset, int scale, int backward) noexcept {
-    try { return xrfg::embedded::request({enabled != 0, backend, preset, scale, backward != 0, 0, 0}) ? 1 : 0; }
+    try {
+        // Keep the versioned five-argument ABI independent of Settings layout.
+        xrfg::embedded::Settings settings;
+        settings.enabled = enabled != 0;
+        settings.backend = backend;
+        settings.preset = preset;
+        settings.scale = scale;
+        settings.backward = backward != 0;
+        return xrfg::embedded::request(settings) ? 1 : 0;
+    }
     catch (...) { return 0; }
 }

@@ -3,6 +3,7 @@
 
 #include <Util.h>
 #include <Config.h>
+#include <misc/GpuStartup.h>
 
 #include <proxies/KernelBase_Proxy.h>
 
@@ -90,6 +91,8 @@ static void HookToDeviceLocal(ID3D11Device* InDevice)
 {
     if (o_CreateSamplerState != nullptr || InDevice == nullptr)
         return;
+
+    CompleteDeferredGpuDiscovery();
 
     LOG_DEBUG("Dx11");
 

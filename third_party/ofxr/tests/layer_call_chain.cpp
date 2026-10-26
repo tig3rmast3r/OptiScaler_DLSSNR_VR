@@ -136,6 +136,7 @@ enum class SubmittedTarget {
 };
 
 struct EndFrameRecord {
+    std::chrono::steady_clock::time_point handoff{};
     XrTime display_time{};
     SubmittedTarget target{SubmittedTarget::none};
     std::uint32_t layer_count{};
@@ -397,6 +398,7 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_end_frame(
         g_begun_display_time.reset();
     }
     EndFrameRecord record{};
+    record.handoff = std::chrono::steady_clock::now();
     record.display_time = end_info->displayTime;
     record.layer_count = end_info->layerCount;
     bool saw_projection = false;
@@ -547,12 +549,27 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_locate_views(
     return XR_SUCCESS;
 }
 
+#ifdef XRFG_EMBEDDED_MENU_TEST
+std::mutex g_recreated_output_mutex;
+std::array<bool,4> g_recreated_output_live{};
+#endif
+
 XRAPI_ATTR XrResult XRAPI_CALL fake_create_swapchain(
     XrSession,
     const XrSwapchainCreateInfo* create_info,
     XrSwapchain* swapchain) {
-    const std::uint32_t call =
+    const std::uint32_t invocation =
         g_create_swapchain_calls.fetch_add(1, std::memory_order_relaxed);
+    std::uint32_t call=invocation;
+#ifdef XRFG_EMBEDDED_MENU_TEST
+    if(invocation && !g_split_eye_mode) {
+        std::scoped_lock lock(g_recreated_output_mutex);
+        auto slot=std::find(g_recreated_output_live.begin(),g_recreated_output_live.end(),false);
+        if(slot==g_recreated_output_live.end())return XR_ERROR_LIMIT_REACHED;
+        call=1+static_cast<std::uint32_t>(slot-g_recreated_output_live.begin());
+        *slot=true;
+    }
+#endif
     if (g_split_eye_mode) {
         const bool private_info_valid =
             create_info != nullptr &&
@@ -730,7 +747,17 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_poll_event(
     return XR_SUCCESS;
 }
 
-XRAPI_ATTR XrResult XRAPI_CALL fake_destroy_swapchain(XrSwapchain) {
+XRAPI_ATTR XrResult XRAPI_CALL fake_destroy_swapchain(XrSwapchain handle) {
+#ifdef XRFG_EMBEDDED_MENU_TEST
+    const std::array handles{g_current_swapchain,g_current_swapchain_b,g_synthetic_swapchain,g_synthetic_swapchain_b};
+    const auto slot=std::find(handles.begin(),handles.end(),handle);
+    if(slot!=handles.end()) {
+        std::scoped_lock lock(g_recreated_output_mutex);
+        auto& live=g_recreated_output_live[slot-handles.begin()];
+        if(!live)return XR_ERROR_HANDLE_INVALID;
+        live=false;
+    }
+#endif
     g_swapchain_destroyed.store(true, std::memory_order_release);
     g_destroy_swapchain_calls.fetch_add(1, std::memory_order_relaxed);
     return XR_SUCCESS;
@@ -1394,6 +1421,63 @@ int main(int argc, char** argv) {
     if (XR_FAILED(create_session(instance, &session_info, &session)) ||
         XR_FAILED(begin_session(session, &session_begin_info))) {
         return EXIT_FAILURE;
+    }
+
+    if (g_steamvr_runtime_mode) {
+        const auto require = [](bool value, const char* reason) {
+            if (!value) { std::cerr << reason << "\n"; std::exit(EXIT_FAILURE); }
+        };
+        XrSwapchainCreateInfo chain_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        chain_info.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        chain_info.format=DXGI_FORMAT_R8G8B8A8_UNORM;chain_info.sampleCount=1;
+        chain_info.width=chain_info.height=4;chain_info.arraySize=2;chain_info.faceCount=chain_info.mipCount=1;
+        XrSwapchain chain{};require(XR_SUCCEEDED(create_swapchain(session,&chain_info,&chain)),"private shipping create");
+        std::array<XrSwapchainImageD3D12KHR,3> images;
+        for(auto& image:images)image={XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR};
+        uint32_t count{};
+        require(XR_SUCCEEDED(enumerate_images(chain,3,&count,reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data()))) &&
+            count==3 && images[0].texture!=g_application_swapchain_images[0].Get(),"shipping images must be private");
+        XrTime previous{};
+        for(unsigned n=0;n<8;++n) {
+            XrFrameState frame{XR_TYPE_FRAME_STATE};
+            require(XR_SUCCEEDED(wait_frame(session,nullptr,&frame)) && frame.predictedDisplayTime>previous &&
+                frame.predictedDisplayPeriod==kFakeDisplayPeriod,"shipping private prediction/physical period");
+            previous=frame.predictedDisplayTime;
+            require(XR_SUCCEEDED(begin_frame(session,nullptr)),"shipping private begin");
+            XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+            XrSwapchainImageWaitInfo wait_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait_info.timeout=XR_INFINITE_DURATION;
+            XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};unsigned index{};
+            require(XR_SUCCEEDED(acquire_image(chain,&acquire_info,&index)) && index<3 &&
+                XR_SUCCEEDED(wait_image(chain,&wait_info)) && XR_SUCCEEDED(release_image(chain,&release_info)),"shipping private image ownership");
+            std::array<XrCompositionLayerProjectionView,2> views;
+            for(unsigned eye=0;eye<2;++eye){auto& v=views[eye];v={XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+                v.pose.orientation.w=1;v.pose.position.x=eye?.032F:-.032F;v.pose.position.y=n*.01F;
+                v.fov={-.7F,.7F,.7F,-.7F};v.subImage.swapchain=chain;v.subImage.imageArrayIndex=eye;v.subImage.imageRect.extent={4,4};}
+            XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+            projection.space=g_space;projection.viewCount=2;projection.views=views.data();
+            auto* layer=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
+            XrFrameEndInfo info{XR_TYPE_FRAME_END_INFO};info.displayTime=frame.predictedDisplayTime;
+            info.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;info.layerCount=1;info.layers=&layer;
+            require(XR_SUCCEEDED(end_frame(session,&info)),"shipping private acceptance");
+        }
+        if(g_destroy_pending_space) {
+            require(destroy_space && XR_SUCCEEDED(destroy_space(g_space)),"private FIFO drains before space destruction");
+            const auto before=g_end_frame_calls.load();
+            std::this_thread::sleep_for(std::chrono::milliseconds(35));
+            require(g_end_frame_calls==before && !g_submission_after_destroy,"no replay after space destruction");
+        }
+        require(XR_SUCCEEDED(end_session(session)) && XR_SUCCEEDED(destroy_swapchain(chain)) &&
+            XR_SUCCEEDED(destroy_session(session)) && XR_SUCCEEDED(destroy_instance(instance)),"shipping private teardown");
+        std::vector<EndFrameRecord> records;
+        {std::scoped_lock lock(g_end_records_mutex);for(const auto& record:g_end_records)if(record.layer_count)records.push_back(record);}
+        require(records.size()>=10 && g_synthetic_release_calls>0,"shipping generator reaches private consumer");
+        for(size_t i=1;i<records.size();++i)
+            require(records[i].handoff-records[i-1].handoff>=std::chrono::nanoseconds(kFakeDisplayPeriod),"shipping physical handoff minimum");
+        require(!g_submission_after_destroy && g_waited_display_times.empty() && !g_begun_display_time &&
+            g_wait_frame_calls==g_begin_frame_calls && g_begin_frame_calls==g_end_frame_calls,"shipping real Wait/Begin/End ownership");
+        FreeLibrary(module);
+        std::cout << "Shipping SteamVR private images/raw prediction/generation/physical cadence/lifetime PASS\n";
+        return EXIT_SUCCESS;
     }
 
     XrSwapchainCreateInfo swapchain_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};

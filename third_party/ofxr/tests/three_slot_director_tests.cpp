@@ -1457,7 +1457,7 @@ void embedded_eligibility_test() {
             apply_embedded_control(s);
             // Eligible attempt fails without a graphics binding: refusal must
             // latch. Ineligible/budget-exhausted chains must remain untouched.
-            check(chain->generation_declined == (mode == 1 || mode == 3),
+            check(chain->generation_declined == (mode == 1),
                 "control eligibility/refusal gate");
             check(!chain->frame_generation, "unexpected control allocation");
             { std::scoped_lock lock(g_state_mutex); g_swapchains.erase(chain->handle); }
@@ -1800,6 +1800,48 @@ void refused_frame_recovery_test() {
 #include "native_dx11_guide_session_tests.inc"
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string_view(argv[1]) == "assetto-common") {
+        try {
+            auto state = std::make_shared<SessionState>(std::make_shared<Dispatch>());
+            state->dispatch->steamvr_runtime = true;
+            state->graphics_binding = SessionGraphicsBinding::d3d12;
+            state->d3d11_bridge = std::make_unique<SessionState::D3D11Bridge>();
+            check(application_prediction_period(*state, 22'222'222) == 22'222'222,
+                "unobserved CSP period was guessed");
+            state->history_capture_wait_period = 11'111'111;
+            check(application_prediction_period(*state, 22'222'222) == 11'111'111,
+                "CSP camera horizon inherited throttled SteamVR prediction");
+            state->luke_afw_enabled = true;
+            check(application_prediction_period(*state, 22'222'222) == 22'222'222, "Luke clock was ported accidentally");
+            state->luke_afw_enabled = false;
+            ProjectionSnapshot a{}, b{};
+            a.display_time=100;b.display_time=99;
+            a.interface_stamp.serial=1;b.interface_stamp.serial=2;
+            ProjectionLayerSnapshot layer;
+            layer.views.resize(2);
+            for(auto& view:layer.views) {
+                view.pose.orientation.w=1;view.fov={-.8F,.8F,.8F,-.8F};
+                view.subImage.imageRect.extent={64,64};
+            }
+            a.layers.push_back(layer);b.layers.push_back(layer);
+            for(auto& view:b.layers[0].views) view.pose.position.x=.1F;
+            const auto camera=synthetic_camera_snapshot(a,b,.5F);
+            check(camera && std::abs(camera->layers[0].views[0].pose.position.x-.05F)<.0001F,
+                "synthetic metadata did not follow its camera fraction");
+            b.layers[0].views[1].pose.position.x=.7F;
+            check(!synthetic_camera_snapshot(a,b,.5F), "one-eye teleport did not reject the stereo camera");
+            b.layers=a.layers;
+            const auto history=std::make_shared<xrfg::D3D12SwapchainHistory>();
+            a.capture_order.push_back({{},history,1,1});b.capture_order.push_back({{},history,2,2});
+            check(consecutive_projection_captures(a,b), "exact capture chronology rejected");
+            check(!projection_snapshots_compatible(a,b) && projection_snapshots_compatible(a,b,true),
+                "capture identity did not distinguish a backwards XR prediction");
+            b.capture_order[0].serial=4;
+            check(!consecutive_projection_captures(a,b), "capture gap borrowed a newer image");
+            std::cout << "Assetto bridge clock/capture/camera contracts passed\n"; return 0;
+        } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}
+    }
+
 #ifdef OFXR_TEST_DJULES_ROUTE
     {
         auto timing=std::make_shared<SessionState>(std::make_shared<Dispatch>());

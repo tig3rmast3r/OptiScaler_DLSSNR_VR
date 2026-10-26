@@ -184,12 +184,16 @@ int main(int argc, char** argv) {
             require(XR_SUCCEEDED(acquire(swapchain, &a, &index)) && XR_SUCCEEDED(wait_image(swapchain, &w)) &&
                 XR_SUCCEEDED(release_image(swapchain, &r)), "capture/release image");
         };
+        unsigned submission_identity{}; XrPosef last_submitted_pose{};
         const auto submit = [&](XrTime time) {
+            const auto identity=++submission_identity;
             std::array<XrCompositionLayerProjectionView, 2> views{};
             for (uint32_t i = 0; i < 2; ++i) {
                 const auto view = fake_submitted_view_for_time(time, i);
                 views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                 views[i].pose = view.pose; views[i].fov = view.fov;
+                if(g_steamvr_runtime_mode)views[i].pose.position.y=identity/1024.0F;
+                if(i==0)last_submitted_pose=views[i].pose;
                 views[i].subImage.swapchain = swapchain;
                 views[i].subImage.imageRect.extent = {4, 4}; views[i].subImage.imageArrayIndex = i;
             }
@@ -205,6 +209,19 @@ int main(int argc, char** argv) {
             const XrResult end_result = end(session, &e);
             g_application_in_end_frame.store(false, std::memory_order_release);
             require(XR_SUCCEEDED(end_result), "end frame");
+        };
+        const auto delivered_original = [&](XrTime time) {
+            if (!g_steamvr_runtime_mode) return;
+            const auto wanted=last_submitted_pose; // unique even if the fake camera clock repeats
+            const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+            bool found=false;
+            do {
+                {std::scoped_lock lock(g_end_records_mutex);
+                 for(const auto& record:g_end_records)
+                    if(record.target==SubmittedTarget::original && std::memcmp(&record.poses[0],&wanted,sizeof(wanted))==0)found=true;}
+                if(!found)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } while(!found && std::chrono::steady_clock::now()<deadline);
+            require(found,"private original receipt drained after Disarm");
         };
         XrFrameState current{XR_TYPE_FRAME_STATE};
         require(XR_SUCCEEDED(wait(session, nullptr, &current)), "first wait");
@@ -223,7 +240,7 @@ int main(int argc, char** argv) {
         }
         require(g_synthetic_release_calls.load() > 0, "generation active before Disarm");
         if (g_steamvr_presenter_mode || g_flight_simulator_mode)
-            require(current.predictedDisplayPeriod == kFakeDisplayPeriod * 2, "presenter active before Disarm");
+            require(current.predictedDisplayPeriod == kFakeDisplayPeriod * (g_steamvr_presenter_mode ? 1 : 2), "expected transport period before Disarm");
 #ifdef XRFG_EMBEDDED_MENU_TEST
         using Request = int (*)(int, int, int, int, int);
         auto menu_request = reinterpret_cast<Request>(GetProcAddress(module, "OFXR_EmbeddedRequestV1"));
@@ -236,21 +253,28 @@ int main(int argc, char** argv) {
         // but no new synthetic can be prepared after this stop boundary.
         require(XR_SUCCEEDED(begin(session, nullptr)), "stop boundary begin");
         capture(); submit(current.predictedDisplayTime);
+        delivered_original(current.predictedDisplayTime);
         const auto synthetic_after_stop = g_synthetic_release_calls.load();
         std::size_t records_after_stop{};
         { std::scoped_lock lock(g_end_records_mutex); records_after_stop = g_end_records.size(); }
+        XrTime last_disarmed{};
         for (int i = 0; i < 6; ++i) {
             XrFrameState frame{XR_TYPE_FRAME_STATE};
             require(XR_SUCCEEDED(wait(session, nullptr, &frame)), "disarmed wait");
             require(frame.predictedDisplayPeriod == kFakeDisplayPeriod, "native application period after Disarm");
             require(XR_SUCCEEDED(begin(session, nullptr)), "disarmed begin");
-            capture(); submit(frame.predictedDisplayTime);
+            capture(); submit(frame.predictedDisplayTime); last_disarmed=frame.predictedDisplayTime;
         }
+        delivered_original(last_disarmed);
         require(g_synthetic_release_calls.load() == synthetic_after_stop, "no synthesis after Disarm");
         { std::scoped_lock lock(g_end_records_mutex);
-          require(g_end_records.size() >= records_after_stop + 6, "original frames continue");
-          for (std::size_t i = records_after_stop; i < g_end_records.size(); ++i)
-              require(g_end_records[i].target == SubmittedTarget::original, "only originals after Disarm"); }
+          unsigned originals{};
+          for (std::size_t i = records_after_stop; i < g_end_records.size(); ++i) {
+              if (!g_end_records[i].layer_count) continue; // legal empty frame-cycle closure
+              require(g_end_records[i].target == SubmittedTarget::original, "only originals after Disarm");
+              ++originals;
+          }
+          require(originals >= 6, "six actual original receipts continue after Disarm"); }
         require(wait_for_queue_idle(), "final GPU retirement");
 #ifdef XRFG_EMBEDDED_MENU_TEST
         // Force context recreation with a different options tuple while keeping
@@ -265,13 +289,19 @@ int main(int argc, char** argv) {
         }
         require(g_synthetic_release_calls.load() > synthetic_after_stop, "synthesis resumes in same XR session");
         require(menu_request(1, 8, 2, 1, 1) == 0, "invalid backend rejected");
-        const auto before_failure = g_synthetic_release_calls.load();
+        auto before_failure = g_synthetic_release_calls.load();
         require(menu_request(1, 1, 1, 2, 0) != 0, "request unavailable NVIDIA on WARP");
         for (int i = 0; i < 4; ++i) {
             XrFrameState frame{XR_TYPE_FRAME_STATE};
             require(XR_SUCCEEDED(wait(session, nullptr, &frame)), "failed-config wait");
             require(XR_SUCCEEDED(begin(session, nullptr)), "failed-config begin");
             capture(); submit(frame.predictedDisplayTime);
+            if(g_steamvr_runtime_mode) {
+                delivered_original(frame.predictedDisplayTime);
+                // Already accepted old-route work drains before this first
+                // original. Every later failed-config frame must add no S.
+                if(i==0)before_failure=g_synthetic_release_calls.load();
+            }
         }
         // D3D12 fixture is WARP; the D3D11 interop fixture uses the real adapter
         // and may successfully run NVIDIA, so it cannot assert unavailability.

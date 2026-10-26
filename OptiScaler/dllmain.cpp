@@ -47,11 +47,14 @@
 #include <magic_enum.hpp>
 #include <version_check.h>
 #include <misc/IdentifyGpu.h>
+#include <misc/GpuStartup.h>
+#include <atomic>
 #include <sha1/sha1.hpp>
 
 static std::vector<HMODULE> _asiHandles;
 static std::vector<std::filesystem::directory_entry> _lateLoadingEntries;
 static bool _passThruMode = false;
+static std::atomic<bool> _deferredGpuDiscovery { false };
 
 typedef const char*(CDECL* PFN_wine_get_version)(void);
 typedef void (*PFN_InitializeASI)(void);
@@ -1757,6 +1760,19 @@ DWORD WINAPI getGpuInfo(LPVOID hModuleVoid)
     return 0;
 }
 
+void CompleteDeferredGpuDiscovery()
+{
+    if (!_deferredGpuDiscovery.exchange(false, std::memory_order_acq_rel))
+        return;
+
+    // CSP loads SteamVR on its loading thread before creating the game device.
+    // A concurrent NVAPI_Initialize can hold NVIDIA's internal lock while
+    // waiting for that same loader initialization. Run the existing discovery
+    // synchronously after device creation, never as a racing startup worker.
+    LOG_INFO("V33036 completing deferred Assetto GPU discovery after D3D11 device creation");
+    getGpuInfo(GetDllNameWModule(&dx12NamesW));
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
 {
     switch (ul_reason_for_call)
@@ -2137,7 +2153,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         spdlog::info("---------------------------------------------");
         spdlog::info("");
 
-        CreateThread(nullptr, 0, getGpuInfo, GetDllNameWModule(&dx12NamesW), 0, nullptr);
+        if (lstrcmpiW(Util::ExePath().filename().c_str(), L"acs.exe") == 0)
+        {
+            _deferredGpuDiscovery.store(true, std::memory_order_release);
+            LOG_INFO("V33036 deferring Assetto GPU discovery until D3D11 device creation");
+        }
+        else
+            CreateThread(nullptr, 0, getGpuInfo, GetDllNameWModule(&dx12NamesW), 0, nullptr);
 
 #ifndef _DEBUG
         if (Config::Instance()->LogLevel.value_or_default() == 0 && Config::Instance()->LogToFile.value_or_default())

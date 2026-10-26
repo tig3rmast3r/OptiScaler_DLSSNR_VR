@@ -272,6 +272,7 @@ int main(int argc, char** argv) {
                 if (std::wstring(name) == L"off") {
                     check(observed_count == 1, "live Off failed");
                     check(!overlay.marker_placement(), "Off left diagnostic marker enabled");
+                    check(destroyed == 1, "Off did not return its retired XR handle");
                 }
                 else {
                     check(observed_count == 2, "position lost overlay");
@@ -286,6 +287,40 @@ int main(int argc, char** argv) {
             info.layerCount = expected_count = 2;
             check(overlay.end_frame(&info, false) == XR_SUCCESS && observed_count == 2, "exceeded runtime maxLayerCount");
             overlay.reset_metrics(); check(!overlay.metrics().active && overlay.metrics().submitted_fps == 0, "session reset");
+            xrfg::request_interface_measurement();
+            overlay.set_display_period(11'111'111);
+            const auto measured_at = xrfg::interface_clock_ns();
+            auto cycle = std::make_shared<xrfg::InterfaceCycle>(measured_at - 80'000'000);
+            cycle->call(measured_at - 80'000'000, measured_at - 60'000'000);
+            cycle->call(measured_at - 50'000'000, measured_at - 40'000'000);
+            cycle->producer_returned(measured_at - 1'000'000);
+            xrfg::InterfaceFrameStamp stamp{700, measured_at - 40'000'000, measured_at - 60'000'000, cycle};
+            check(overlay.end_frame(&info, false, true, stamp) == XR_SUCCESS, "timed actual EndFrame");
+            const auto timing = xrfg::interface_telemetry();
+            check(timing.delay_valid && timing.cpu_valid && timing.ofxr_time_valid && timing.cycle_valid &&
+                std::abs(timing.cpu_render_ms - 20) < .01F && std::abs(timing.ofxr_time_ms - 30) < .01F,
+                "actual D11/D12 overlay lost immutable latency receipt");
+
+            std::shared_ptr<xrfg::InterfaceDeliveryReceipt> pending;
+            overlay.set_private_delivery_end([&](const XrFrameEndInfo*, const std::shared_ptr<xrfg::InterfaceDeliveryReceipt>& done) {
+                pending = done; return XR_SUCCESS;
+            });
+            overlay.reset_metrics(); xrfg::publish_interface_telemetry({});
+            const auto async_at = xrfg::interface_clock_ns();
+            auto deferred_cycle = std::make_shared<xrfg::InterfaceCycle>(async_at - 10'000'000);
+            deferred_cycle->call(async_at - 10'000'000, async_at - 5'000'000);
+            deferred_cycle->producer_returned(async_at);
+            xrfg::InterfaceFrameStamp deferred_stamp{701, async_at, async_at - 5'000'000, deferred_cycle};
+            check(overlay.end_frame(&info, false, true, deferred_stamp) == XR_SUCCESS && bool(pending),
+                "private acceptance did not retain exact observer");
+            check(!xrfg::interface_telemetry().delay_valid, "private acceptance falsely reported real latency");
+            std::thread delivered([&] { pending->completed(true,async_at+40'000'000,async_at+40'000'000,async_at+50'000'000); }); delivered.join();
+            static_cast<void>(overlay.metrics());
+            const auto delivered_timing = xrfg::interface_telemetry();
+            check(delivered_timing.delay_valid && std::abs(delivered_timing.ofxr_delay_ms - 40) < .01F &&
+                delivered_timing.cycle_valid && std::abs(delivered_timing.cycle_length_ms - 50) < .01F,
+                "real handoff must include time retained in private FIFO");
+            overlay.set_private_delivery_end({});
             info.layerCount = expected_count = 1;
             // Asymmetric/narrow FOV catches accidental fallback to the default
             // 90-degree placement. Flipping image storage must not move the quad.
@@ -323,7 +358,7 @@ int main(int argc, char** argv) {
             check(overlay.end_frame(&info, false) == XR_SUCCESS && observed_count == 1 && releases == uploads_before_stop,
                   "stopped overlay never uploads/reappears after refresh or metric reset");
         }
-        check(created == 1 && destroyed == 1 && space_created == 1 && space_destroyed == 1, "overlay lifetime leak");
+        check(created == 2 && destroyed == 2 && space_created == 1 && space_destroyed == 1, "overlay retirement/reopen lifetime leak");
         unsupported = true;
         info.layerCount = expected_count = 2;
         {

@@ -342,6 +342,79 @@ CameraSample sample_current_target(
     return output;
 }
 
+// Bit 4: the synthetic is shown from a camera of its own, C - the head's pose
+// at the instant it is shown, which the layer submits it with - rather than
+// from B's. The runtime then has nothing to turn back, where B's pose left it
+// turning the synthetic back by the head's motion over the periods between,
+// with no pixels for the trailing edge. C has B's field of view and
+// rectangle, so the turn from C into B is a pure rotation; it rides in the
+// other view's mapping, which a view's composition never reads otherwise.
+bool synthetic_camera() {
+    return (SynthesisFlags & 16u) != 0u;
+}
+
+float4 multiply_quaternions(float4 left, float4 right) {
+    return float4(
+        left.w * right.xyz + right.w * left.xyz + cross(left.xyz, right.xyz),
+        left.w * right.w - dot(left.xyz, right.xyz));
+}
+
+// C's mapping into B: B's projection on both sides, turned by the rotation.
+CameraMapping synthetic_to_current_mapping() {
+    CameraMapping own = PreviousMappings[ViewIndex];
+    CameraMapping mapping = own;
+    mapping.TargetToSourceRotation = PreviousMappings[1 - ViewIndex].TargetToSourceRotation;
+    mapping.SourceTangents = own.TargetTangents;
+    mapping.SourceRect = own.TargetRect;
+    return mapping;
+}
+
+// What an output pixel shows. Without a synthetic camera, the synthesis at
+// that pixel of B. With one, the synthesis at the point of B the pixel's ray
+// meets - every composition below is evaluated at a continuous point already,
+// so the turn costs no second resample. A ray that leaves B's view takes A's
+// colour where A saw it: the far side of a turn, whose content B has already
+// turned away from. Where neither saw it, B's nearest edge is evaluated, so
+// no pixel is left without content.
+struct OutputSource {
+    float2 current;
+    float4 previous;
+    bool from_previous;
+};
+
+OutputSource output_source(float2 pixel) {
+    OutputSource output;
+    output.current = pixel;
+    output.previous = float4(0.0, 0.0, 0.0, 1.0);
+    output.from_previous = false;
+    if (synthetic_camera()) {
+        CameraMapping to_current = synthetic_to_current_mapping();
+        MappedCoordinate current = map_target_to_source(pixel, to_current);
+        float4 rect = PreviousMappings[ViewIndex].TargetRect;
+        output.current = clamp(current.coordinate, rect.xy, rect.xy + rect.zw - 1.0);
+        if (current.valid < 0.5) {
+            // C into A is C into B, then B into A.
+            CameraMapping to_previous = PreviousMappings[ViewIndex];
+            to_previous.TargetToSourceRotation = multiply_quaternions(
+                to_previous.TargetToSourceRotation, to_current.TargetToSourceRotation);
+            MappedCoordinate previous = map_target_to_source(pixel, to_previous);
+            if (previous.valid >= 0.5) {
+                output.previous = bilinear_previous_source(previous.coordinate, Slice);
+                output.from_previous = true;
+            }
+        }
+    }
+    return output;
+}
+
+// Where a point of B lies in the synthetic's camera, for the mesh warps,
+// which move their grid in B and draw it in C.
+float2 current_to_output(float2 coordinate) {
+    return synthetic_camera()
+        ? map_source_to_target(coordinate, synthetic_to_current_mapping()).coordinate
+        : coordinate;
+}
+
 [numthreads(8, 8, 1)]
 void PackFlowInput(uint3 thread_id : SV_DispatchThreadID) {
     if (thread_id.x >= PackedWidth || thread_id.y >= PackedHeight) {
@@ -365,6 +438,17 @@ void PackFlowInput(uint3 thread_id : SV_DispatchThreadID) {
         if (source_coordinate.y < float(Height)) {
             current_color =
                 bilinear_current_source(source_coordinate, slice);
+#ifdef XRFG_HYBRID_QUARTER_INPUT
+            // One bilinear tap filters 2x2 pixels; at a quarter, four of
+            // them cover the 4x4 the packed pixel stands for.
+            if (input_scale.x < 0.3) {
+                current_color = 0.25 * (
+                    bilinear_current_source(source_coordinate + float2(-1.0, -1.0), slice) +
+                    bilinear_current_source(source_coordinate + float2(1.0, -1.0), slice) +
+                    bilinear_current_source(source_coordinate + float2(-1.0, 1.0), slice) +
+                    bilinear_current_source(source_coordinate + float2(1.0, 1.0), slice));
+            }
+#endif
         }
     } else if (thread_id.x < Width && local_y < Height) {
         current_color = CurrentFrame.Load(
@@ -607,12 +691,28 @@ float2 forward_flow_for_pixel(
     return magnitude > 512.0 ? result * (512.0 / magnitude) : result;
 }
 
+// The hybrid composition runs both the game-motion and the optical-flow
+// branches, so the flow keeps its constants and the DLSS output rectangle
+// travels 16 bits a value in UseGameMotion (x, y) and GameMotionPadding
+// (width, height).
+static bool hybrid_layout = false;
+// How far the last synthesize_midpoint's two samples disagreed: what the
+// hybrid composition chooses by.
+static float last_disagreement = 1.0;
+
+// The DLSS output rectangle associated with this eye stream. In the
+// game-motion branch the otherwise-unused optical-flow constants carry it.
+float4 game_motion_output_rect() {
+    if (hybrid_layout) {
+        return float4(float(UseGameMotion & 0xffffU), float(UseGameMotion >> 16),
+                      float(GameMotionPadding & 0xffffU), float(GameMotionPadding >> 16));
+    }
+    return float4(float(FlowWidth), float(FlowHeight), float(FlowBlockSize),
+                  float(GameMotionPadding));
+}
+
 float2 game_motion_for_pixel(float2 pixel, uint slice, uint view_index) {
-    // In the game-motion branch these otherwise-unused optical-flow constants
-    // carry the DLSS output rectangle associated with this eye stream.
-    float4 output_rect = float4(
-        float(FlowWidth), float(FlowHeight),
-        float(FlowBlockSize), float(GameMotionPadding));
+    float4 output_rect = game_motion_output_rect();
     float2 uv = (pixel - output_rect.xy + 0.5) /
         max(output_rect.zw, float2(1.0, 1.0));
     float2 coordinate = GameMotionRect.xy + uv * GameMotionRect.zw - 0.5;
@@ -639,36 +739,16 @@ float2 game_motion_for_pixel(float2 pixel, uint slice, uint view_index) {
     return magnitude > 512.0 ? result * (512.0 / magnitude) : result;
 }
 
-float nvidia_cost_for_pixel(float2 pixel, uint slice, uint view_index) {
-    float2 packed_coordinate = flow_input_coordinate(pixel);
-    int2 coordinate = int2(round(
-        (packed_coordinate + 0.5) / float(FlowBlockSize) - 0.5));
-    FlowGridBounds bounds = flow_grid_bounds(
-        PreviousMappings[view_index].TargetRect,
-        slice);
-    return float(FlowAuxiliary.Load(int3(clamp(
-        coordinate,
-        bounds.minimum,
-        bounds.maximum), 0)) & 0xffU);
-}
-
-float nvidia_forward_cost_for_pixel(
-    float2 pixel,
-    uint slice,
-    uint view_index,
-    bool warped_previous) {
-    float2 packed_coordinate = flow_input_coordinate(pixel);
-    int2 coordinate = int2(round(
-        (packed_coordinate + 0.5) / float(FlowBlockSize) - 0.5));
-    FlowGridBounds bounds = flow_grid_bounds(
-        warped_previous
-            ? PreviousMappings[view_index].TargetRect
-            : PreviousMappings[view_index].SourceRect,
-        slice);
-    return float(ForwardAuxiliary.Load(int3(clamp(
-        coordinate,
-        bounds.minimum,
-        bounds.maximum), 0)) & 0xffU);
+// The game's vector at the guide texel under pixel, unfiltered: enough to tell
+// surfaces apart.
+float2 game_motion_texel(float2 pixel) {
+    float4 output_rect = game_motion_output_rect();
+    float2 uv = (pixel - output_rect.xy + 0.5) /
+        max(output_rect.zw, float2(1.0, 1.0));
+    float2 maximum = GameMotionRect.xy + GameMotionRect.zw - 1.0;
+    int2 texel = int2(clamp(GameMotionRect.xy + uv * GameMotionRect.zw,
+        GameMotionRect.xy, maximum));
+    return GameMotionVectors.Load(int4(texel, 0, 0)) * GameMotionScale;
 }
 
 bool coordinate_inside_rect(float2 coordinate, float4 rect) {
@@ -681,45 +761,6 @@ bool coordinate_inside_rect(float2 coordinate, float4 rect) {
 float rgb_error(float4 a, float4 b) {
     float3 difference = abs(a.rgb - b.rgb);
     return max(difference.r, max(difference.g, difference.b));
-}
-
-// Fast can report a plausible low-cost match on a different repeated edge.
-// Validate against the ORIGINAL endpoints, not just two already-warped samples:
-// those can both hit the same unrelated dark/bright patch and agree perfectly.
-float fast_endpoint_confidence(
-    float2 pixel, float2 backward, uint slice, bool warped_previous) {
-    static const float2 offsets[5] = {
-        float2(0, 0), float2(-2, 0), float2(2, 0),
-        float2(0, -2), float2(0, 2)
-    };
-    float error = 0.0;
-    bool valid = true;
-    [unroll] for (uint i = 0; i < 5; ++i) {
-        float2 current = pixel + offsets[i];
-        float2 previous = current + backward;
-        if (!coordinate_inside_rect(current, PreviousMappings[ViewIndex].TargetRect)) {
-            valid = false;
-        }
-        float4 previous_color;
-        if (warped_previous) {
-            // The previous endpoint is a target coordinate: read it through
-            // the mapping, as the pack did when it built the engine's input.
-            CameraSample sample = sample_previous_target(previous, slice, ViewIndex);
-            if (sample.valid < 0.5) {
-                valid = false;
-            }
-            previous_color = sample.color;
-        } else {
-            if (!coordinate_inside_rect(previous, PreviousMappings[ViewIndex].SourceRect)) {
-                valid = false;
-            }
-            previous_color = bilinear_previous_source(previous, slice);
-        }
-        error = max(error, rgb_error(
-            bilinear_current_source(current, slice),
-            previous_color));
-    }
-    return valid ? 1.0 - smoothstep(8.0 / 255.0, 48.0 / 255.0, error) : 0.0;
 }
 
 // Preserve a stationary neighbourhood after the existing XR camera mapping.
@@ -754,6 +795,85 @@ FullscreenVertex FullscreenTriangleVS(uint vertex_id : SV_VertexID) {
     return output;
 }
 
+// Content that stayed where it was on screen although the game's vector there
+// says it moved: a HUD drawn after DLSS has no vectors of its own. It needs
+// both: unchanged at the pixel and its neighbours, and not what the vector
+// predicts. Correct vectors explain a moving surface however flat or striped
+// it is, so only content they do not describe is kept.
+bool game_motion_static_overlay(float2 pixel, float4 current) {
+    // The nearest texel: under a synthetic camera the pixel is a point of B
+    // between texels.
+    int2 texel = int2(pixel + 0.5);
+    bool overlay = rgb_error(PreviousFrame.Load(int4(texel, int(Slice), 0)), current) <= 1.0 / 255.0;
+    MappedCoordinate moved = (MappedCoordinate)0;
+    if (overlay) {
+        // Content its vector holds still is explained without a sample, and in
+        // a still scene that is nearly every pixel.
+        moved = map_source_to_target(pixel + game_motion_texel(pixel), PreviousMappings[ViewIndex]);
+        overlay = moved.valid >= 0.5 && length(moved.coordinate - pixel) >= 0.5;
+    }
+    // Unchanged across the patch next: what moves fails that cheaply.
+    int2 offsets[4] = {int2(2, 0), int2(-2, 0), int2(0, 2), int2(0, -2)};
+    float4 around[4] = {current, current, current, current};
+    bool flat = true;
+    if (overlay) {
+        int2 limit = int2(int(Width) - 1, int(Height) - 1);
+        [unroll] for (uint i = 0; i < 4; ++i) {
+            int2 neighbour = clamp(texel + offsets[i], int2(0, 0), limit);
+            around[i] = CurrentFrame.Load(int4(neighbour, int(Slice), 0));
+            overlay = overlay && rgb_error(PreviousFrame.Load(int4(neighbour, int(Slice), 0)),
+                around[i]) <= 1.0 / 255.0;
+            flat = flat && rgb_error(around[i], current) <= 1.0 / 255.0;
+        }
+    }
+    if (overlay) {
+        // Somewhere in it not what the vector predicts. A repeating pattern
+        // can match its own shift at one pixel; a flat patch cannot tell, and
+        // its centre has already been asked.
+        float unexplained = rgb_error(
+            sample_previous_target(moved.coordinate, Slice, ViewIndex).color, current);
+        if (unexplained <= 0.1 && !flat) {
+            [unroll] for (uint i = 0; i < 4; ++i) {
+                unexplained = max(unexplained, rgb_error(sample_previous_target(
+                    moved.coordinate + float2(offsets[i]), Slice, ViewIndex).color, around[i]));
+            }
+        }
+        overlay = unexplained > 0.1;
+    }
+    return overlay;
+}
+
+// The game-motion solve below, from start rather than the pixel, for a second
+// surface: true, with its A and B samples, if two steps reach its fixed point.
+bool game_motion_surface(float2 pixel, float2 start, out float4 previous_color,
+    out float4 current_color) {
+    previous_color = float4(0.0, 0.0, 0.0, 1.0);
+    current_color = previous_color;
+    float2 endpoint = start;
+    float2 previous_coordinate = start;
+    bool found = true;
+    [unroll] for (uint step = 0; step < 3; ++step) {
+        float2 backward = game_motion_for_pixel(endpoint, Slice, ViewIndex);
+        MappedCoordinate mapped = map_source_to_target(endpoint + backward, PreviousMappings[ViewIndex]);
+        found = found && mapped.valid >= 0.5;
+        previous_coordinate = mapped.coordinate;
+        float2 next = pixel - (1.0 - synthesis_fraction()) * (mapped.coordinate - endpoint);
+        if (step == 2) {
+            found = found && length(next - endpoint) < 0.5;
+        } else {
+            endpoint = next;
+        }
+    }
+    if (found) {
+        CameraSample a = sample_previous_target(previous_coordinate, Slice, ViewIndex);
+        CameraSample b = sample_current_target(endpoint, Slice, ViewIndex);
+        previous_color = a.color;
+        current_color = b.color;
+        found = a.valid >= 0.5 && b.valid >= 0.5;
+    }
+    return found;
+}
+
 float4 synthesize_midpoint(
     FullscreenVertex input,
     float flow_value_scale,
@@ -767,11 +887,17 @@ float4 synthesize_midpoint(
     // flow still carries the pose term and it is subtracted here.
     bool input_pose_compensated) {
     float4 output_color = float4(0.0, 0.0, 0.0, 1.0);
+    last_disagreement = 1.0;
     uint2 integer_pixel = uint2(input.position.xy);
     bool in_bounds = integer_pixel.x < Width && integer_pixel.y < Height &&
         Slice < ArraySize;
-    if (in_bounds) {
-        float2 pixel = float2(integer_pixel);
+    OutputSource source = output_source(float2(integer_pixel));
+    if (in_bounds && source.from_previous) {
+        output_color = saturate(source.previous);
+        last_disagreement=0.0;
+
+    } else if (in_bounds) {
+        float2 pixel = source.current;
         CameraSample current_fallback = sample_current_target(
             pixel,
             Slice,
@@ -787,16 +913,28 @@ float4 synthesize_midpoint(
             bool preserve_stationary = validate_fast && repeated_capture_flag() == 0 &&
                 current_fallback.valid >= 0.5 &&
                 fast_stationary_patch(pixel, Slice, current_fallback.color);
+            bool static_overlay = !preserve_stationary && use_game_motion_pipeline &&
+                repeated_capture_flag() == 0 && current_fallback.valid >= 0.5 &&
+                game_motion_static_overlay(pixel, current_fallback.color);
             if (preserve_stationary) {
                 output_color = saturate(lerp(
                     sample_previous_target(pixel, Slice, ViewIndex).color,
                     current_fallback.color,
                     synthesis_fraction()));
+            } else if (static_overlay) {
+                output_color = saturate(current_fallback.color);
+                last_disagreement = 0.0;
             } else {
                 float2 raw_backward = float2(0.0, 0.0);
                 CameraSample previous_sample = (CameraSample)0;
                 CameraSample current_sample = (CameraSample)0;
                 bool endpoints_valid = true;
+                // How far the solve below still was from a fixed point, and
+                // its final B-to-A displacement.
+                float solve_residual = 0.0;
+                float2 last_displacement = float2(0.0, 0.0);
+                // Where the A and B samples were taken.
+                float2 a_coordinate = pixel, b_coordinate = pixel;
                 if (use_game_motion_pipeline) {
                     // A B-to-A vector is attached to its B endpoint. Sampling
                     // it once at the desired midpoint is exact only for a
@@ -805,6 +943,8 @@ float4 synthesize_midpoint(
                     // cA through the previous OpenXR camera exactly.
                     float2 current_endpoint = pixel;
                     MappedCoordinate previous_endpoint;
+                    // Keep the step count odd: see the covered-background
+                    // case below.
                     [unroll] for (uint iteration = 0; iteration < 3; ++iteration) {
                         raw_backward = repeated_capture_flag() != 0
                             ? float2(0.0, 0.0)
@@ -831,8 +971,13 @@ float4 synthesize_midpoint(
                             current_endpoint + raw_backward,
                             PreviousMappings[ViewIndex]);
                         endpoints_valid = previous_endpoint.valid >= 0.5;
+                        last_displacement = previous_endpoint.coordinate - current_endpoint;
+                        solve_residual = length(pixel -
+                            (1.0 - synthesis_fraction()) * last_displacement - current_endpoint);
                     }
                     if (endpoints_valid) {
+                        a_coordinate = previous_endpoint.coordinate;
+                        b_coordinate = current_endpoint;
                         previous_sample = sample_previous_target(
                             previous_endpoint.coordinate, Slice, ViewIndex);
                         current_sample = sample_current_target(
@@ -850,6 +995,8 @@ float4 synthesize_midpoint(
                     float2 residual_backward = input_pose_compensated
                         ? raw_backward
                         : raw_backward - (previous_coverage.coordinate - pixel);
+                    a_coordinate = pixel + residual_backward * synthesis_fraction();
+                    b_coordinate = pixel - residual_backward * (1.0 - synthesis_fraction());
                     previous_sample = sample_previous_target(
                         pixel + residual_backward * synthesis_fraction(), Slice, ViewIndex);
                     current_sample = sample_current_target(
@@ -866,70 +1013,139 @@ float4 synthesize_midpoint(
                         max(
                             abs(previous_sample.color.g - current_sample.color.g),
                             abs(previous_sample.color.b - current_sample.color.b)));
-                    float confidence = saturate(1.0 - disagreement * 6.0);
+                    // Game motion's disagreements are mostly resampling at sharp
+                    // detail, which a gentle slope keeps on the warp.
+                    float confidence = saturate(1.0 - disagreement * 3.0);
+                    float4 stable_previous =
+                        sample_previous_target(pixel, Slice, ViewIndex).color;
                     float4 stable_midpoint = lerp(
-                        sample_previous_target(pixel, Slice, ViewIndex).color,
-                        current_fallback.color,
-                        synthesis_fraction());
-                    if (use_nvidia_cost) {
-                        float consistency_confidence = 1.0;
-                        float cost_confidence = 1.0;
-                        if (repeated_capture_flag() == 0) {
-                            if (validate_fast) {
-                                confidence *= fast_endpoint_confidence(
-                                    pixel, raw_backward, Slice, input_pose_compensated);
+                        stable_previous, current_fallback.color, synthesis_fraction());
+                    // The hybrid compares its two branches' samples blurred a
+                    // little: sharp detail resampled at a fraction of a pixel
+                    // disagrees even where the motion is exact.
+                    float compared = disagreement;
+                    if (hybrid_layout) {
+                        float4 a_low = 0.0, b_low = 0.0;
+                        [unroll] for (uint k = 0; k < 4; ++k) {
+                            float2 o = float2((k & 1) != 0 ? 0.5 : -0.5, (k & 2) != 0 ? 0.5 : -0.5);
+                            a_low += sample_previous_target(a_coordinate + o, Slice, ViewIndex).color;
+                            b_low += sample_current_target(b_coordinate + o, Slice, ViewIndex).color;
+                        }
+                        compared = rgb_error(a_low, b_low) * 0.25;
+                    }
+                    last_disagreement = compared;
+                    if (!use_game_motion_pipeline) {
+                        // Optical flow is not trusted as the game's vectors
+                        // are. Whichever explains both frames better is taken:
+                        // the flow, or the camera alone - a still scene under a
+                        // turning head. The flow keeps a tie. On recorded game
+                        // frames this beat the flow's own confidence measures -
+                        // NVIDIA's cost, the fast preset's endpoint check and
+                        // the forward flow's consistency - which all leaned on
+                        // the camera-only blend where the game had moved.
+                        confidence = saturate(1.0 +
+                            (rgb_error(stable_previous, current_fallback.color) - disagreement) * 8.0);
+                    }
+                    if (use_nvidia_bidirectional && repeated_capture_flag() == 0) {
+                        // The bidirectional option still keeps the flow only
+                        // where the forward flow leads back.
+                        float2 previous_coordinate = pixel + raw_backward;
+                        float consistency = 0.0;
+                        if (coordinate_inside_rect(
+                                previous_coordinate,
+                                input_pose_compensated
+                                    ? PreviousMappings[ViewIndex].TargetRect
+                                    : PreviousMappings[ViewIndex].SourceRect)) {
+                            float2 raw_forward = forward_flow_for_pixel(
+                                previous_coordinate,
+                                Slice,
+                                ViewIndex,
+                                flow_value_scale,
+                                input_pose_compensated);
+                            consistency = 1.0 - smoothstep(
+                                2.0, 6.0, length(raw_backward + raw_forward));
+                        }
+                        confidence *= consistency;
+                    }
+                    if (!use_game_motion_pipeline) {
+                        output_color = saturate(lerp(stable_midpoint, flow_midpoint, confidence));
+                        last_disagreement = lerp(
+                            rgb_error(stable_previous, current_fallback.color),
+                            compared, confidence);
+                    } else {
+                        // Autonomous's XR mapping can explain a head turn
+                        // even when the game publishes zero scene motion.
+                        // Do not force a mismatching guide warp over that
+                        // exact camera result. Moving guides still own the
+                        // occlusion and fade solve below.
+                        bool camera_explains = length(raw_backward) <= 0.1 &&
+                            rgb_error(stable_previous, current_fallback.color) +
+                                1.0 / 255.0 < disagreement;
+                        // The game's vectors are trusted: away from a motion
+                        // edge, warped samples that disagree are one surface
+                        // whose shading changed - a fade, a flash - and their
+                        // motion-compensated blend is the frame between.
+                        output_color = saturate(camera_explains ? stable_midpoint : flow_midpoint);
+                        // Background a leading edge is covering shows only in
+                        // A. There the solve has no fixed point: B shows the
+                        // occluder at the pixel, so it starts inside it and
+                        // alternates outside and in. After its odd number of
+                        // steps it ends outside, on the covered surface's
+                        // displacement, which places A's sample.
+                        if (!camera_explains && solve_residual >= 0.5) {
+                            CameraSample covered = sample_previous_target(
+                                pixel + synthesis_fraction() * last_displacement, Slice, ViewIndex);
+                            if (covered.valid >= 0.5) output_color = saturate(covered.color);
+                        } else if (!camera_explains && disagreement > 0.1 && repeated_capture_flag() == 0) {
+                            // Where the motion is not uniform - a vector 16
+                            // pixels away differs by a tenth of a pixel -
+                            // disagreeing samples are two surfaces instead. A's
+                            // is usually hidden behind what B shows, background
+                            // a trailing edge uncovers, so B's warped sample
+                            // stands in. On recorded game frames the tenth beat
+                            // a whole pixel: steep but smooth motion, such as
+                            // ground rushing past, gains from B's sample too.
+                            float2 here = game_motion_texel(
+                                pixel - (1.0 - synthesis_fraction()) * last_displacement);
+                            bool motion_edge = false;
+                            [unroll] for (uint probe = 0; probe < 4; ++probe) {
+                                float2 offset = probe == 0 ? float2(16, 0) : probe == 1 ? float2(-16, 0)
+                                              : probe == 2 ? float2(0, 16) : float2(0, -16);
+                                motion_edge = motion_edge ||
+                                    length(game_motion_texel(pixel + offset) - here) > 0.1;
                             }
-                            if (use_nvidia_bidirectional) {
-                                float2 previous_coordinate = pixel + raw_backward;
-                                if (coordinate_inside_rect(
-                                        previous_coordinate,
-                                        input_pose_compensated
-                                            ? PreviousMappings[ViewIndex].TargetRect
-                                            : PreviousMappings[ViewIndex].SourceRect)) {
-                                    float2 raw_forward = forward_flow_for_pixel(
-                                        previous_coordinate,
-                                        Slice,
-                                        ViewIndex,
-                                        flow_value_scale,
-                                        input_pose_compensated);
-                                    float cycle_error = length(
-                                        raw_backward + raw_forward);
-                                    consistency_confidence =
-                                        1.0 - smoothstep(2.0, 6.0, cycle_error);
-                                    float maximum_cost = max(
-                                        nvidia_cost_for_pixel(
-                                            pixel,
-                                            Slice,
-                                            ViewIndex),
-                                        nvidia_forward_cost_for_pixel(
-                                            previous_coordinate,
-                                            Slice,
-                                            ViewIndex,
-                                            input_pose_compensated));
-                                    cost_confidence = saturate(
-                                        1.0 - maximum_cost / 255.0);
-                                } else {
-                                    consistency_confidence = 0.0;
-                                    cost_confidence = 0.0;
+                            if (motion_edge) {
+                                output_color = saturate(lerp(
+                                    current_sample.color, flow_midpoint, confidence));
+                            }
+                            // B's sample may in turn be background that B has
+                            // already uncovered but a faster surface in front
+                            // still covers at the generated instant. That
+                            // surface is another solution of the solve, and the
+                            // one whose own A and B samples agree is visible in
+                            // both frames, so in front. It is looked for from at
+                            // most two starts on another surface, nearest first.
+                            uint solves = 0;
+                            bool done = !motion_edge;
+                            [loop] for (uint radius_index = 0; radius_index < 4 && !done; ++radius_index) {
+                                float radius = 4.0 * float(1u << radius_index);
+                                [loop] for (uint direction = 0; direction < 8 && !done; ++direction) {
+                                    float angle = float(direction) * 0.78539816;
+                                    float2 start = pixel + radius * float2(cos(angle), sin(angle));
+                                    // A start on the same surface finds B's again.
+                                    if (length(game_motion_texel(start) - here) > 1.0) {
+                                        float4 a, b;
+                                        ++solves;
+                                        if (game_motion_surface(pixel, start, a, b) &&
+                                            rgb_error(a, b) < 0.05) {
+                                            output_color = saturate(lerp(a, b, synthesis_fraction()));
+                                            done = true;
+                                        }
+                                        done = done || solves >= 2;
+                                    }
                                 }
-                            } else {
-                                cost_confidence = saturate(
-                                    1.0 - nvidia_cost_for_pixel(
-                                        pixel,
-                                        Slice,
-                                        ViewIndex) / 255.0);
                             }
                         }
-                        confidence *= consistency_confidence * cost_confidence;
-                        output_color = saturate(lerp(
-                            stable_midpoint,
-                            flow_midpoint,
-                            confidence));
-                    } else {
-                        output_color = saturate(lerp(
-                            stable_midpoint,
-                            flow_midpoint,
-                            confidence));
                     }
                     }
                 }
@@ -945,6 +1161,20 @@ float4 SynthesizeMidpointPS(FullscreenVertex input) : SV_Target {
 
 float4 SynthesizeGameMotionMidpointPS(FullscreenVertex input) : SV_Target {
     return synthesize_midpoint(input, 1.0, false, false, false, true, false);
+}
+
+// The game's vectors and FidelityFX's optical flow both: per pixel, whichever
+// explains both frames better. Content the vectors do not describe - a
+// shadow, a reflection - moves as the image does, which the flow follows.
+// The vectors keep a tie.
+float4 SynthesizeHybridMidpointPS(FullscreenVertex input) : SV_Target {
+    hybrid_layout = true;
+    float4 vectors = synthesize_midpoint(input, 1.0, false, false, false, true, false);
+    float vectors_disagreement = last_disagreement;
+    // Where the vectors explain both frames, the flow need not be asked.
+    [branch] if (vectors_disagreement < 0.02) return vectors;
+    float4 flow = synthesize_midpoint(input, 1.0, false, false, false, false, false);
+    return lerp(flow, vectors, saturate(1.0 + (last_disagreement - vectors_disagreement) * 8.0));
 }
 
 // The NVIDIA variants read flow in signed S10.5 fixed point, and from a

@@ -1,13 +1,16 @@
 #include "xrfg/steamvr_delivery.hpp"
 
 #include "xrfg/bridge_flight_logger.hpp"
+#include "xrfg/compositor_presentation_rate.hpp"
 
 #include <openvr.h>
 
 #include <windows.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -91,7 +94,6 @@ enum class AttachRoute : std::uint64_t {
 constexpr std::int64_t kWindowNanoseconds = 1'000'000'000;
 // Mispresented-above-predicted values are small; anything past this is counted
 // with the top bucket and is a loss under any baseline.
-constexpr std::uint32_t kExcessBuckets = 16;
 // Past this the last window is too old to describe what is on screen now, so
 // report nothing rather than something stale.
 constexpr std::int64_t kStaleNanoseconds = 5'000'000'000;
@@ -163,8 +165,15 @@ struct SteamVrDelivery::Impl {
     // display_period()'s cache.
     std::optional<std::chrono::nanoseconds> display_period;
     std::chrono::steady_clock::time_point display_period_read{};
+    // The physical director must not take mutex: optional compositor polling
+    // holds it across OpenVR calls, which can stall inside the runtime.
+    std::atomic<std::int64_t> display_period_snapshot{};
+    std::atomic<std::uint64_t> vsync_version{},vsync_counter{};
+    std::atomic<std::int64_t> vsync_at_ns{};
     AttachRoute route{AttachRoute::none};
     bool owns_context{};
+    ScenePresentationRate scene_receipts;
+    std::optional<ScenePresentationRate::Rate> scene_rate;
 
     float delivered{};
     std::int64_t delivered_at_ns{-1};
@@ -176,93 +185,7 @@ struct SteamVrDelivery::Impl {
     std::uint32_t settled_last_index{};
     bool settled_reported{};
 
-    // Distinct frames the headset received, counted on the compositor's own
-    // vsync-aligned clock.
-    //
-    // The cumulative counters cannot give this and neither can the frame index
-    // alone. m_nNumNumReprojectedFrames counts routine reprojection, not loss:
-    // MSFS 2024 predicts two frames ahead and marks every frame reprojected
-    // while the headset receives all 90, so presents minus dropped minus
-    // reprojected reads zero through a healthy session. The index rate fixes
-    // that but misses the other shape of loss - two of our submissions landing
-    // in one scanout window, where the compositor still produces a frame per
-    // scanout and the index keeps advancing at 90 while the headset shows 45.
-    //
-    // What separates the two is m_nNumMisPresented against how far ahead the
-    // compositor says it is predicting. Landing on a vsync other than the one
-    // first predicted is expected when it predicts ahead and a fault when it
-    // does not:
-    //
-    //   Callisto healthy   mispres   0%   predicted 0   ->  90, matches fpsVR
-    //   Callisto dropping  mispres  49%   predicted 0   ->  46, matches 45-40
-    //   MSFS 2024          mispres 100%   predicted 2   ->  90, matches fpsVR
-    //
-    // With one exception. The frame after a repeat is mispresented *because of*
-    // the repeat: it arrives a period late and so lands on a vsync other than
-    // the one predicted. The index rate has already subtracted that scanout,
-    // because a repeat holds its index instead of advancing it, so charging the
-    // successor as well counts one lost frame twice. Where every frame is
-    // repeated - MSFS holding 45 on a 90 Hz display - that takes the rate to
-    // zero. The mispresent therefore only counts when the previous distinct
-    // frame was scanned out once; past that the index rate covers it.
-    std::uint32_t rate_first_index{};
-    double rate_first_time{};
-    std::uint32_t rate_last_index{};
-    double rate_last_time{};
-    std::uint32_t rate_seen{};
-    // Frames eligible to be judged - those the index gap and the previous
-    // frame's scanout count did not already exempt - and how far each one was
-    // mispresented beyond the depth the compositor said it was predicting.
-    std::uint32_t rate_counted{};
-    std::array<std::uint32_t, kExcessBuckets> rate_excess_histogram{};
-    // Scanouts the previous distinct frame occupied. One means this frame is as
-    // early as it could be, so a mispresent here is a real displacement.
-    std::uint32_t rate_previous_presents{1};
-    bool rate_started{};
-
-    void observe(const vr::Compositor_FrameTiming& timing) noexcept {
-        if (!rate_started || timing.m_nFrameIndex < rate_last_index) {
-            rate_first_index = rate_last_index = timing.m_nFrameIndex;
-            rate_first_time = rate_last_time = timing.m_flSystemTimeInSeconds;
-            rate_seen = rate_counted = 0;
-            rate_excess_histogram.fill(0);
-            rate_previous_presents = timing.m_nNumFramePresents;
-            rate_started = true;
-            return;
-        }
-        if (timing.m_nFrameIndex <= rate_last_index) {
-            return;
-        }
-        // Vsyncs this frame is past the previous one. One means the compositor
-        // composited on every vsync; more means it did not, and the scanouts it
-        // skipped are already excluded by counting records rather than index
-        // units. Charging the mispresent on top counts the same loss twice, and
-        // where every frame skips - MSFS holding 45 on a 90 Hz display - it
-        // takes the rate to zero.
-        //
-        // This is the general form of the presents >= 2 rule beside it, which
-        // assumed a repeat always shows as one frame occupying two scanouts.
-        // That is how the first MSFS capture read, but a repeat shows equally
-        // as an index gap of two with a single present, and then the presents
-        // rule exempts nothing at all.
-        const std::uint32_t gap = timing.m_nFrameIndex - rate_last_index;
-        rate_last_index = timing.m_nFrameIndex;
-        rate_last_time = timing.m_flSystemTimeInSeconds;
-        ++rate_seen;
-        const std::uint32_t predicted =
-            (timing.m_nReprojectionFlags & vr::VRCompositor_PredictionMask) >> 4;
-        if (gap <= 1 && rate_previous_presents <= 1) {
-            const std::uint32_t excess =
-                timing.m_nNumMisPresented > predicted
-                    ? timing.m_nNumMisPresented - predicted
-                    : 0;
-            ++rate_excess_histogram[excess < kExcessBuckets
-                                        ? excess
-                                        : kExcessBuckets - 1];
-            ++rate_counted;
-        }
-        rate_previous_presents = timing.m_nNumFramePresents;
-    }
+    std::optional<CompositorPresentationRate> presentation_rate;
 
     // Until the session proves it will be shown, no accessor may attach. See
     // SteamVrDelivery::mark_established().
@@ -385,100 +308,66 @@ struct SteamVrDelivery::Impl {
             system != nullptr ? 1 : 0);
     }
 
-    // The probe's accumulate(). A 64-frame window is not a detail: observe()
-    // restarts whenever it sees an index below the last one, and the oldest
-    // entry of an overlapping window always is one, so the rate only ever spans
-    // a single window. Sixty-four frames is 0.7 s at 90 Hz and 63 usable
-    // samples; the eight-frame lookback last_presentation() needs for its own
-    // record is seven, and a lost share estimated from seven frames taken
-    // whenever the overlay happened to ask is why this read 90 through drops
-    // the probe resolved.
     void poll_window() noexcept {
         std::array<vr::Compositor_FrameTiming, 64> window{};
         window[0].m_nSize = sizeof(vr::Compositor_FrameTiming);
-        const std::uint32_t filled = compositor->GetFrameTimings(window.data(), 64);
-        if (filled > window.size()) {
-            return;
-        }
-        for (std::uint32_t i = 0; i + 1 < filled; ++i) {
-            if (window[i].m_nNumFramePresents != 0) {
-                observe(window[i]);
-            }
-        }
+        const auto filled = compositor->GetFrameTimings(window.data(), 64);
+        presentation_rate = filled <= window.size()
+            ? compositor_presentation_rate(std::span<const vr::Compositor_FrameTiming>(window.data(), filled))
+            : std::nullopt;
+        scene_rate=filled<=window.size() ? scene_receipts.rate(
+            std::span<const vr::Compositor_FrameTiming>(window.data(),filled)) : std::nullopt;
     }
 
-    // Scanouts per second, less the share of them that carried nothing new.
     void close_window(std::int64_t now) noexcept {
-        if (!rate_started || rate_seen == 0) {
-            return;
-        }
-        // The probe's threshold, and it has to be short: the span is one
-        // window, about 0.7 s, never longer. A one-second requirement never
-        // fires at all, which leaves the overlay showing submitted frames.
-        const double span = rate_last_time - rate_first_time;
-        if (span < 0.05) {
-            return;
-        }
-        // Counted, not derived from the index. m_nFrameIndex counts *vsyncs*
-        // while the compositor writes one record per frame it actually
-        // composited, so at 45 frames on a 90 Hz display consecutive records
-        // are N, N+2, N+4 and the index gap is twice the frame count. Measured
-        // on Hogwarts Legacy: 31 records spanning 62 index units over 0.689 s,
-        // which the index arithmetic read as 90 while the headset received 45
-        // and presenter_frame_presented fired 45.1 times a second.
-        //
-        // Callisto and MSFS both advanced the index by exactly one per record,
-        // so last - first equalled the count there and this stayed hidden
-        // through two rounds of validation against fpsVR.
-        // Only excursions above the window's own baseline are losses.
-        //
-        // The rule was mispresented above the prediction depth, and it read a
-        // constant offset as total loss. Where the grid sits inside the display
-        // period decides which vsync a submission is predicted for, so a
-        // schedule that lands one vsync off its prediction reports
-        // mispresented 1 with predicted 0 on *every* frame while delivering all
-        // of them - and the overlay showed zero exactly when delivery was
-        // perfect. The gap and presents exemptions cannot catch it: at full rate
-        // both are 1.
-        //
-        // The window's median excess is that offset, whatever it happens to be,
-        // so a frame is lost only when it exceeds it. Against every shape on
-        // record: Callisto healthy excess 0 throughout, median 0, none lost;
-        // Callisto dropping 49% above a median of 0, all counted; MSFS healthy
-        // mispresented 2 against predicted 2, excess 0; MSFS holding 45 exempt
-        // on the index gap; and a full-rate grid one vsync off its prediction,
-        // excess 1 throughout, median 1, none lost.
-        std::uint32_t median_excess = 0;
-        if (rate_counted != 0) {
-            const std::uint32_t half = rate_counted / 2;
-            std::uint32_t running = 0;
-            for (std::uint32_t i = 0; i < kExcessBuckets; ++i) {
-                running += rate_excess_histogram[i];
-                if (running > half) {
-                    median_excess = i;
-                    break;
-                }
-            }
-        }
-        std::uint32_t lost = 0;
-        for (std::uint32_t i = median_excess + 1; i < kExcessBuckets; ++i) {
-            lost += rate_excess_histogram[i];
-        }
-        const double frames = static_cast<double>(rate_seen) / span;
-        const double lost_share = rate_counted == 0
-            ? 0.0
-            : static_cast<double>(lost) / static_cast<double>(rate_counted);
-        delivered = static_cast<float>(frames * (1.0 - lost_share));
+        if (!presentation_rate) return;
+        delivered = presentation_rate->fps;
         delivered_at_ns = now;
-        bridge_flight_logger().event(
-            BridgeFlightOperation::steamvr_delivery,
-            0,
+        // b is informational mispresentation count, never a deduction from
+        // frames OpenVR explicitly says were presented.
+        bridge_flight_logger().event(BridgeFlightOperation::steamvr_delivery, 0,
             static_cast<std::uint64_t>(delivered * 1000.0F),
-            static_cast<std::uint64_t>(lost_share * 1000.0),
-            rate_seen);
-        rate_started = false;
+            presentation_rate->mispresented, presentation_rate->intervals);
     }
+
 };
+
+SteamVrDelivery::SubmissionProbe SteamVrDelivery::scene_submission_probe() noexcept {
+    try {
+        if(!impl_)return {};
+        std::scoped_lock lock(impl_->mutex);
+        if(!impl_->established)return {};
+        if(!impl_->attempted)impl_->attach();
+        if(!impl_->usable||!impl_->compositor)return {};
+        vr::Compositor_CumulativeStats stats{};
+        impl_->compositor->GetCumulativeStats(&stats,sizeof(stats));
+        if(stats.m_nPid!=GetCurrentProcessId())return {};
+        vr::Compositor_FrameTiming t{};t.m_nSize=sizeof(t);
+        if(!impl_->compositor->GetFrameTiming(&t,0))return {};
+        return {t.m_nFrameIndex,t.m_flSystemTimeInSeconds,t.m_flNewFrameReadyMs,true};
+    }catch(...){return {};}
+}
+void SteamVrDelivery::scene_submission_completed(SubmissionProbe before,SceneIdentity scene) noexcept {
+    const auto after=scene_submission_probe();
+    // A changed current record (or a newly filled ready field in that same
+    // record) witnesses the synchronous scene submission. Unchanged/stale
+    // records and asynchronous handoffs cannot be attributed by guessing.
+    const bool matched=before.valid&&after.valid&&after.frame>=before.frame&&std::isfinite(after.ready)&&after.ready!=0&&
+        !(after.frame==before.frame&&after.time==before.time&&after.ready==before.ready);
+    bridge_flight_logger().event(BridgeFlightOperation::presenter_source,matched?5650:5651,
+        before.frame,after.frame,(before.valid?1U:0U)|(after.valid?2U:0U));
+    if(!matched)return;
+    try {std::scoped_lock lock(impl_->mutex);impl_->scene_receipts.record(after.frame,scene);
+        bridge_flight_logger().event(BridgeFlightOperation::presenter_source,5652,
+            after.frame,scene.owner,scene.serial);}
+    catch(...){}
+}
+std::optional<ScenePresentationRate::Rate> SteamVrDelivery::scene_fps(std::int64_t now) noexcept {
+    try {
+        if(!delivered_fps(now))return {};
+        std::scoped_lock lock(impl_->mutex);return impl_->scene_rate;
+    }catch(...){return {};}
+}
 
 SteamVrDelivery::SteamVrDelivery(bool steamvr_runtime) noexcept
     : impl_(nullptr) {
@@ -574,12 +463,13 @@ std::optional<float> SteamVrDelivery::delivered_fps(std::int64_t now) noexcept {
 }
 
 std::optional<SteamVrDelivery::VsyncAnchor>
-SteamVrDelivery::vsync_anchor() noexcept {
+SteamVrDelivery::vsync_anchor(bool nonblocking) noexcept {
     try {
         if (!impl_) {
             return std::nullopt;
         }
-        std::scoped_lock lock(impl_->mutex);
+        std::unique_lock lock(impl_->mutex,std::defer_lock);
+        if(nonblocking){if(!lock.try_lock())return std::nullopt;}else lock.lock();
         if (!impl_->established) {
             return std::nullopt;
         }
@@ -609,10 +499,28 @@ SteamVrDelivery::vsync_anchor() noexcept {
         anchor.frame_counter = counter;
         anchor.cost = std::chrono::duration_cast<std::chrono::microseconds>(
             now - entered);
+        impl_->vsync_version.fetch_add(1,std::memory_order_acq_rel);
+        impl_->vsync_counter.store(counter,std::memory_order_relaxed);
+        impl_->vsync_at_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(anchor.at.time_since_epoch()).count(),std::memory_order_relaxed);
+        impl_->vsync_version.fetch_add(1,std::memory_order_release);
         return anchor;
     } catch (...) {
         return std::nullopt;
     }
+}
+
+std::optional<SteamVrDelivery::VsyncAnchor> SteamVrDelivery::cached_vsync_anchor() const noexcept {
+    if(!impl_)return {};
+    for(unsigned attempt=0;attempt<3;++attempt) {
+        const auto before=impl_->vsync_version.load(std::memory_order_acquire);
+        if(before&1)continue;
+        const auto at=impl_->vsync_at_ns.load(std::memory_order_relaxed);
+        const auto counter=impl_->vsync_counter.load(std::memory_order_relaxed);
+        if(before!=impl_->vsync_version.load(std::memory_order_acquire))continue;
+        if(at<=0 || !counter)return {};
+        VsyncAnchor result;result.at=std::chrono::steady_clock::time_point(std::chrono::nanoseconds(at));result.frame_counter=counter;return result;
+    }
+    return {};
 }
 
 std::optional<std::chrono::nanoseconds>
@@ -621,7 +529,8 @@ SteamVrDelivery::display_period() noexcept {
         if (!impl_) {
             return std::nullopt;
         }
-        std::scoped_lock lock(impl_->mutex);
+        std::unique_lock lock(impl_->mutex, std::try_to_lock);
+        if (!lock) return cached_display_period();
         if (!impl_->established) {
             return std::nullopt;
         }
@@ -642,14 +551,23 @@ SteamVrDelivery::display_period() noexcept {
             vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float, &error);
         if (error != vr::TrackedProp_Success || !(hertz >= 20.0F) || hertz > 500.0F) {
             impl_->display_period.reset();
+            impl_->display_period_snapshot.store(0, std::memory_order_release);
             return std::nullopt;
         }
         impl_->display_period = std::chrono::nanoseconds(
             static_cast<std::int64_t>(1e9 / static_cast<double>(hertz)));
+        impl_->display_period_snapshot.store(impl_->display_period->count(), std::memory_order_release);
         return impl_->display_period;
     } catch (...) {
         return std::nullopt;
     }
+}
+
+std::optional<std::chrono::nanoseconds>
+SteamVrDelivery::cached_display_period() const noexcept {
+    if (!impl_) return std::nullopt;
+    const auto period = impl_->display_period_snapshot.load(std::memory_order_acquire);
+    return period > 0 ? std::optional{std::chrono::nanoseconds(period)} : std::nullopt;
 }
 
 std::optional<std::chrono::nanoseconds>
@@ -696,7 +614,7 @@ SteamVrDelivery::settled_frames() noexcept {
         if (!impl_->usable) {
             return output;
         }
-        constexpr std::uint32_t kLookback = 16;
+        constexpr std::uint32_t kLookback = 64;
         std::array<vr::Compositor_FrameTiming, kLookback> timings{};
         timings[0].m_nSize = sizeof(vr::Compositor_FrameTiming);
         const std::uint32_t filled =
@@ -760,6 +678,40 @@ SteamVrDelivery::settled_frames() noexcept {
     } catch (...) {
     }
     return output;
+}
+
+std::optional<SteamVrDelivery::GpuRenderTiming> SteamVrDelivery::gpu_render_timing(std::int64_t now) noexcept {
+    try {
+        if (!impl_) return std::nullopt;
+        std::unique_lock lock(impl_->mutex, std::try_to_lock);
+        if (!lock || !impl_->established) return std::nullopt;
+        if (!impl_->attempted) impl_->attach();
+        if (!impl_->usable || !impl_->compositor) return std::nullopt;
+        vr::Compositor_FrameTiming timing{};
+        timing.m_nSize = sizeof(timing);
+        if (!impl_->compositor->GetFrameTiming(&timing, 1)) return std::nullopt;
+        GpuRenderTiming result{timing.m_nFrameIndex, timing.m_flPreSubmitGpuMs};
+        // Observe the existing delivery cache; never close its window or consume
+        // either presentation cursor for a UI request.
+        if (impl_->delivered_at_ns >= 0 && now >= impl_->delivered_at_ns && now - impl_->delivered_at_ns <= kStaleNanoseconds)
+            result.delivered_fps = impl_->delivered;
+        if (impl_->system) {
+            vr::ETrackedPropertyError error{};
+            const auto hz = impl_->system->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd,
+                vr::Prop_DisplayFrequency_Float, &error);
+            if (error == vr::TrackedProp_Success && std::isfinite(hz) && hz > 0)
+                result.display_period = std::chrono::nanoseconds(static_cast<std::int64_t>(1.0e9 / hz));
+            if (error == vr::TrackedProp_Success && std::isfinite(hz) && hz >= 20 && hz <= 500) {
+                impl_->display_period = std::chrono::nanoseconds(static_cast<std::int64_t>(1e9 / static_cast<double>(hz)));
+                impl_->display_period_snapshot.store(impl_->display_period->count(), std::memory_order_release);
+                impl_->display_period_read = std::chrono::steady_clock::now();
+            } else {
+                impl_->display_period.reset();
+                impl_->display_period_snapshot.store(0, std::memory_order_release);
+            }
+        }
+        return result;
+    } catch (...) { return std::nullopt; }
 }
 
 std::optional<SteamVrDelivery::FramePresentation>

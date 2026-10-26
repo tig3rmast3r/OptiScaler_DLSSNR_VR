@@ -1,4 +1,8 @@
 #include "xrfg/two_frame_capture.hpp"
+#include "xrfg/diagnostic_hotkeys.hpp"
+#include "xrfg/diagnostic_ring_sink.hpp"
+#include <sstream>
+
 
 
 #include <windows.h>
@@ -22,7 +26,7 @@ namespace xrfg {
 namespace {
 
 using Microsoft::WRL::ComPtr;
-constexpr std::uint64_t kMaximumBytes = 1024ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaximumBytes = 1280ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kMaximumImages = 48;
 
 struct Shot {
@@ -34,6 +38,7 @@ struct Shot {
     std::uint64_t bytes{};
     ComPtr<ID3D12Resource> readback;
     ComPtr<ID3D12CommandList> producer_list;
+    ComPtr<ID3D12CommandAllocator> owned_allocator;
     ComPtr<ID3D12Fence> fence;
     std::uint64_t fence_value{};
     HRESULT status{S_OK};
@@ -57,8 +62,11 @@ struct Session {
     std::mutex mutex;
     std::vector<std::shared_ptr<Shot>> shots;
     std::vector<ContractShot> contracts;
+    std::vector<TwoFrameNativeDlssgEvaluation> native_dlssg_evaluations;
     std::vector<TimelineShot> timeline;
+    std::vector<std::uint64_t> dlssg_streams;
     std::filesystem::path directory;
+    std::string settings;
     std::uint64_t allocated{};
     std::uint32_t dropped_images{};
     bool sealed{};
@@ -84,6 +92,29 @@ struct Manager {
 Manager& manager() {
     static Manager value;
     return value;
+}
+
+std::string capture_settings() {
+    HMODULE module{}; wchar_t runtime[32768]{};
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&manager), &module);
+    GetModuleFileNameW(module, runtime, 32768);
+    const auto root=std::filesystem::path(runtime).parent_path();
+    wchar_t executable[32768]{};GetModuleFileNameW(nullptr,executable,32768);
+    const auto game=std::filesystem::path(executable).parent_path();
+    const auto provider=root/L"PDAFWPlugin.dll";
+    std::string result="AFW provider selected: "+provider.string()+"\n";
+    result+="Actual per-evaluation AFW debug/mode: guide-contracts.tsv\n";
+    result+="Odd serial is left: "+std::to_string(GetPrivateProfileIntW(L"experimental",L"luke_afw_odd_serial_is_left",1,(root/L"ofxr_bridge.ini").c_str()))+"\n";
+    for(const auto& path:{root/L"ofxr_bridge.ini",game/L"ofxr_bridge.ini",game/L"RealVR.ini"}) {
+        std::ifstream file(path,std::ios::binary);
+        if(!file)continue;
+        std::string contents(65536,'\0');file.read(contents.data(),contents.size());
+        contents.resize(static_cast<std::size_t>(file.gcount()));
+        result+="\n--- "+path.string()+" ---\n"+contents;
+    }
+    return result;
 }
 
 DXGI_FORMAT typed_format(DXGI_FORMAT format) noexcept {
@@ -267,12 +298,39 @@ void write_session(const std::shared_ptr<Session>& session) {
     manifest << "index\tframe\tstage\tstatus\tstream\tdisplay_time\tswapchain\tserial\teye\tslice\tx\ty\twidth\theight\tresource_width\tresource_height\tformat\tsource_format\trow_pitch\trow_bytes\tbytes\tscale_x\tscale_y\tjitter_x\tjitter_y\tfile\n";
     std::vector<std::shared_ptr<Shot>> shots;
     std::vector<ContractShot> contracts;
+    std::vector<TwoFrameNativeDlssgEvaluation> native_dlssg_evaluations;
     std::vector<TimelineShot> timeline;
     {
         std::scoped_lock lock(session->mutex);
         shots = session->shots;
         contracts = session->contracts;
+        native_dlssg_evaluations = session->native_dlssg_evaluations;
         timeline = session->timeline;
+    }
+    std::ofstream native_manifest(session->directory / L"native-dlssg-evaluations.tsv", std::ios::binary);
+    native_manifest << "frame\tstream\tpublication\tserial\tprevious_serial\treset\tdirect\tresult\tcount\tindex\tflags"
+        "\tcolor\tmotion\tdepth\tgenerated\tdisable\twidth\theight\tcolor_format\tinput_color_format"
+        "\tbackbuffer_rect\tmotion_rect\tdepth_rect\tmotion_scale\tjitter\tdepth_scale\tnear_far_partition"
+        "\tobject_separation\tinvalid_motion\tnear\tfar\tfov\taspect\tposition\tright\tup\tforward"
+        "\tview_to_clip\tclip_to_view\tclip_to_lens\tclip_to_previous\tprevious_to_clip\n";
+    native_manifest << std::setprecision(9);
+    const auto native_array = [&](const auto& values) {
+        native_manifest << '\t';
+        for (std::size_t i=0;i<values.size();++i) { if(i)native_manifest << ',';native_manifest << values[i]; }
+    };
+    for (const auto& c : native_dlssg_evaluations) {
+        native_manifest << c.frame << '\t' << c.stream << '\t' << c.publication << '\t' << c.serial
+            << '\t' << c.previous_serial << '\t' << c.reset << '\t' << c.direct << '\t' << c.result
+            << '\t' << c.count << '\t' << c.index << '\t' << c.flags << '\t' << c.color << '\t' << c.motion
+            << '\t' << c.depth << '\t' << c.generated << '\t' << c.disable << '\t' << c.width << '\t' << c.height
+            << '\t' << c.color_format << '\t' << c.input_color_format;
+        native_array(c.backbuffer_rect);native_array(c.motion_rect);native_array(c.depth_rect);
+        native_array(c.motion_scale);native_array(c.jitter);
+        native_manifest << '\t' << c.depth_scale << '\t' << c.near_far_partition << '\t' << c.object_separation
+            << '\t' << c.invalid_motion << '\t' << c.near_plane << '\t' << c.far_plane << '\t' << c.fov << '\t' << c.aspect;
+        native_array(c.position);native_array(c.right);native_array(c.up);native_array(c.forward);
+        native_array(c.view_to_clip);native_array(c.clip_to_view);native_array(c.clip_to_lens);
+        native_array(c.clip_to_previous);native_array(c.previous_to_clip);native_manifest << '\n';
     }
     std::ofstream timeline_manifest(
         session->directory / L"xr-timeline.tsv", std::ios::binary);
@@ -312,7 +370,8 @@ void write_session(const std::shared_ptr<Session>& session) {
         "\tmotion_temporal_valid\tmotion_previous_publication\tmotion_middle_publication"
         "\tmotion_current_to_middle_same\tmotion_current_to_previous_same\tmotion_current_to_middle_opposite"
         "\tdepth_native_history_valid\tdepth_native_previous_publication\tdepth_current_to_native_previous"
-        "\tcamera_forward_sign\tcamera_up_sign\n";
+        "\tcamera_forward_sign\tcamera_up_sign\traw_motion_native_span"
+        "\tnative_camera_token\tcolor_origin_token\tnative_production_sequence\tinterleaved_history\n";
     const auto write_array = [&guide_manifest](const auto& values) {
         for (std::size_t i = 0; i < values.size(); ++i) {
             if (i) guide_manifest << ',';
@@ -382,7 +441,9 @@ void write_session(const std::shared_ptr<Session>& session) {
         guide_manifest << c.depth_native_history_valid << '\t'
             << c.depth_native_previous_publication << '\t';
         write_array(c.depth_current_to_native_previous); guide_manifest << '\t';
-        guide_manifest << c.camera_forward_sign << '\t' << c.camera_up_sign << '\n';
+        guide_manifest << c.camera_forward_sign << '\t' << c.camera_up_sign << '\t' << c.raw_motion_native_span
+            << '\t' << c.native_camera_token << '\t' << c.color_origin_token
+            << '\t' << c.native_production_sequence << '\t' << c.interleaved_history << '\n';
     }
     const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::seconds(15);
@@ -446,11 +507,19 @@ void write_session(const std::shared_ptr<Session>& session) {
         session->directory.string() + "\n";
     std::ofstream summary(session->directory / L"README.txt", std::ios::binary);
     summary << "V23286 AFW/OFXR frame-slot and projection-pose audit.\n"
-        << "Trigger: F10; capture ends after two AFW evaluations or eight XR frames.\n"
+        << "Trigger: F8; capture ends after two AFW evaluations or eight XR frames.\n"
         << "NGX source, AFW inputs, OpenXR eyes, camera matrices and xr-timeline.tsv.\n"
+        << "V601: afw_plugin_returned_eye -> afw_generated_eye -> afw_xr_terminal_eye.\n"
+        << "xr_final_eye is the application source release BEFORE AFW.\n"
+        << "Terminal eyes carry original publication, XR swapchain, pose interval, acquired index and fence receipts.\n"
         << "Raw images include D3D12 row padding; see manifest.tsv.\n"
-        << "Max images=48, max total readback=1 GiB. Dropped images="
+        << "Max images=48, max total readback=1.25 GiB. Dropped images="
         << session->dropped_images << "\n";
+    summary << "V576 DLSS-G stages: aligned_previous / packed_current / packed_motion / packed_depth -> ngx_generated -> composed_output.\n"
+        << "One pair per stream, at most two streams. Native stage swapchain is resource identity, not XR handle.\n"
+        << "native_dlssg_pair: original A/B pose/projection. native_dlssg_output_camera: B -> output-to-B quaternion, mode = output index.\n";
+    std::ofstream settings(session->directory / L"settings.txt", std::ios::binary);
+    settings << session->settings;
     OutputDebugStringA(message.c_str());
     session->write_finished.store(true);
 }
@@ -461,7 +530,7 @@ std::uint32_t two_frame_capture_begin_end_frame() noexcept {
     try {
         auto& state = manager();
         std::scoped_lock lock(state.mutex);
-        const bool down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        const bool down = (GetAsyncKeyState(kImageCaptureKey) & 0x8000) != 0;
         const bool pressed = down && !state.key_down;
         state.key_down = down;
         if (state.session && state.session->write_finished.load() &&
@@ -469,10 +538,11 @@ std::uint32_t two_frame_capture_begin_end_frame() noexcept {
             if (state.writer.joinable()) state.writer.join();
             state.session.reset();
         }
-        if (!state.session && pressed) {
+        if (!state.session && pressed && !diagnostic_ring_enabled && !(GetAsyncKeyState(VK_CONTROL)&0x8000)) {
             if (state.writer.joinable()) state.writer.join();
             state.session = std::make_shared<Session>();
             state.session->directory = capture_directory();
+            state.session->settings = capture_settings();
             state.pending_start = true;
             state.afw_completed_frame = false;
             state.observed_end_frames = 0;
@@ -535,7 +605,26 @@ void two_frame_capture_mark_afw_evaluation() noexcept {
 }
 
 bool two_frame_capture_active() noexcept {
+    return diagnostic_ring_enabled.load(std::memory_order_relaxed) || manager().active_frame.load() != 0;
+}
+
+bool two_frame_capture_images_active() noexcept {
     return manager().active_frame.load() != 0;
+}
+
+bool two_frame_capture_claim_dlssg_pair(std::uint64_t stream) noexcept {
+    if (!two_frame_capture_images_active()) return false;
+    try {
+        auto& state = manager();
+        std::scoped_lock lock(state.mutex);
+        if (!state.active_frame || !state.session) return false;
+        std::scoped_lock session_lock(state.session->mutex);
+        auto& streams = state.session->dlssg_streams;
+        if (state.session->sealed || streams.size() >= 2 ||
+            std::find(streams.begin(), streams.end(), stream) != streams.end()) return false;
+        streams.push_back(stream);
+        return true;
+    } catch (...) { return false; }
 }
 
 void two_frame_capture_timeline(
@@ -545,6 +634,11 @@ void two_frame_capture_timeline(
     std::uint64_t display_time,
     std::uint64_t detail) noexcept {
     if (stream == nullptr) return;
+    if(diagnostic_ring_enabled) {
+        diagnostic_ring_record("{\"kind\":\"afw_timeline\",\"qpc\":"+std::to_string(diagnostic_ring_qpc())+
+            ",\"stream\":\""+stream+"\",\"code\":"+std::to_string(code)+",\"serial\":"+std::to_string(serial)+
+            ",\"display_time\":"+std::to_string(display_time)+",\"detail\":"+std::to_string(detail)+"}");
+    }
     try {
         auto& state = manager();
         std::scoped_lock lock(state.mutex);
@@ -559,9 +653,39 @@ void two_frame_capture_timeline(
     }
 }
 
+void two_frame_capture_native_dlssg_evaluation(const TwoFrameNativeDlssgEvaluation& info) noexcept {
+    auto& value=manager();const auto frame=value.active_frame.load(std::memory_order_relaxed);
+    if(!frame)return;
+    std::shared_ptr<Session> session;
+    {std::scoped_lock lock(value.mutex);session=value.session;}
+    if(!session)return;
+    try {
+        std::scoped_lock lock(session->mutex);
+        if(session->sealed || session->native_dlssg_evaluations.size()>=16)return;
+        auto copy=info;copy.frame=frame;session->native_dlssg_evaluations.push_back(copy);
+    } catch (...) {} // An optional F8 observer cannot fail generation.
+}
+
 void two_frame_capture_guide_contract(
     const TwoFrameGuideContract& info) noexcept {
     if (!info.stage) return;
+    if(diagnostic_ring_enabled) {
+        try {
+            const auto& c=info;std::ostringstream row;row<<std::setprecision(9);
+            row<<"{\"kind\":\"afw_contract\",\"qpc\":"<<diagnostic_ring_qpc()<<",\"stage\":\""<<c.stage
+               <<"\",\"stream\":"<<c.stream<<",\"publication\":"<<c.publication<<",\"serial\":"<<c.serial
+               <<",\"previous_serial\":"<<c.previous_serial<<",\"source_eye\":"<<c.source_eye<<",\"destination_eye\":"<<c.destination_eye
+               <<",\"mode\":"<<c.mode<<",\"debug\":"<<c.debug<<",\"motion_vectors_type\":"<<c.motion_vectors_type;
+            const auto array=[&](const char* key,const auto& values){row<<",\""<<key<<"\":[";bool first=true;for(auto value:values){if(!first)row<<',';first=false;row<<value;}row<<']';};
+            array("source_pose",c.source_pose);array("destination_pose",c.destination_pose);
+            array("source_orientation",c.source_orientation);array("destination_orientation",c.destination_orientation);
+            array("source_world_to_view",c.source_world_to_view);array("destination_world_to_view",c.destination_world_to_view);
+            array("source_view_to_clip",c.source_view_to_clip);array("destination_view_to_clip",c.destination_view_to_clip);
+            array("native_clip_to_opposite",c.native_clip_to_opposite);array("native_clip_to_same",c.native_clip_to_same);
+            row<<",\"motion_temporal_valid\":"<<c.motion_temporal_valid<<",\"camera_forward_sign\":"<<c.camera_forward_sign<<'}';
+            diagnostic_ring_record(row.str());
+        }catch(...){}
+    }
     try {
         auto& state = manager();
         std::scoped_lock lock(state.mutex);
@@ -619,6 +743,56 @@ void two_frame_capture_record_ng_x(
         record_copy(*shot, list, source, source_state);
         if (SUCCEEDED(shot->status)) shot->producer_list = list;
     } catch (...) {
+    }
+}
+
+HRESULT two_frame_capture_record_queue(
+    const TwoFrameImageInfo& info, ID3D12Device* device,
+    ID3D12CommandQueue* queue, ID3D12Resource* source,
+    D3D12_RESOURCE_STATES source_state) noexcept {
+    try {
+        std::shared_ptr<Session> session;
+        std::uint32_t frame{};
+        {
+            auto& state = manager();
+            std::scoped_lock lock(state.mutex);
+            session = state.session;
+            frame = state.active_frame;
+        }
+        if (!session || !frame) return S_FALSE;
+        if (!device || !queue || !source) return E_INVALIDARG;
+        auto shot = prepare_shot(session, frame, info, device, source);
+        if (!shot) return E_OUTOFMEMORY;
+        if (FAILED(shot->status)) return shot->status;
+        shot->status = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(shot->owned_allocator.GetAddressOf()));
+        ComPtr<ID3D12GraphicsCommandList> list;
+        if (SUCCEEDED(shot->status))
+            shot->status = device->CreateCommandList(queue->GetDesc().NodeMask,
+                D3D12_COMMAND_LIST_TYPE_DIRECT, shot->owned_allocator.Get(), nullptr,
+                IID_PPV_ARGS(list.GetAddressOf()));
+        if (SUCCEEDED(shot->status)) {
+            record_copy(*shot, list.Get(), source, source_state);
+            const HRESULT closed = list->Close();
+            if (SUCCEEDED(shot->status)) shot->status = closed;
+        }
+        // Provision completion before submitting; a failed allocation must
+        // never strand a diagnostic list whose allocator is released early.
+        if (SUCCEEDED(shot->status))
+            shot->status = device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                IID_PPV_ARGS(shot->fence.GetAddressOf()));
+        if (FAILED(shot->status)) return shot->status;
+        shot->producer_list = list;
+        ID3D12CommandList* lists[]{list.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        shot->status = queue->Signal(shot->fence.Get(), 1);
+        if (SUCCEEDED(shot->status)) shot->fence_value = 1;
+        else session->safe_to_release.store(false);
+        // The retained list is owned, not awaiting an intercepted submission.
+        // Keep it until session retirement alongside its allocator.
+        return shot->status;
+    } catch (...) {
+        return E_FAIL;
     }
 }
 

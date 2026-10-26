@@ -10,6 +10,11 @@
 
 namespace xrfg {
 class RamTimingCapture;
+inline std::filesystem::path benchmark_log_path(const std::filesystem::path& flight) {
+    constexpr std::wstring_view prefix = L"ofxr-bridge-flight-";
+    const auto stem = flight.stem().wstring();
+    return flight.parent_path() / (L"ofxr-benchmark-" + stem.substr(prefix.size()) + L".benchmark.log");
+}
 
 enum class BridgeFlightOperation : std::uint32_t {
     logger,
@@ -136,6 +141,9 @@ enum class BridgeFlightOperation : std::uint32_t {
     luke_release,
     luke_filter,
     luke_cycle_wait,
+    // Startup-only: a=session, b=requested separate bit0/actual bit1,
+    // c=initial backend low8, generator next8, Hybrid bit16, enabled bit17.
+    steamvr_queue_configuration,
     // Embedded-only diagnostics appended to preserve V223 operation IDs.
     fsr_eye_binding,
     fsr_eye_resources,
@@ -193,6 +201,22 @@ enum class BridgeFlightOperation : std::uint32_t {
     compositor_vsync,
     compositor_presentation,
     compositor_timeline,
+    // Passive NGX provider diagnostics retained for late logging. a=stage:
+    // 1 initialize (result=NGX code), 2 capability query (result=NGX code),
+    // 3 capability answer (result=feature init code, b=available, c=frames),
+    // 4 feature creation (result=NGX code, b=width, c=height).
+    native_dlssg_provider,
+    native_dlssg_record, // result=Skip (0 recorded), a=publication, b=detail, c=eye
+    native_dlssg_evaluate, // result=NGX result, a=reset, b=output index, c=direct
+    native_dlssg_decision, // result=generated mask, a=publication, b=eyes/outputs, c=disable bits
+    history_capture_wait, // V441: result HRESULT, a swapchain, b waited us, c budget/index
+    menu_status, // result XR/HRESULT; a boundary (0 close,1 create,2 acquire,3 wait,4 fence,5 list,6 draw,7 release,8 end), b XR handle, c image
+    benchmark_configuration, // a=revision,b=selected/effective route bits,c=quality options
+    benchmark_rates, // a=output/game milliFPS,b=generated milliFPS/display milliHz,c=revision
+    benchmark_cycles, // a=OFXR/cycle microseconds,b=estimated microseconds,c=revision; result validity bits
+    gpu_afw, // a=provider context,b=guide publication,c=calibrated GPU QPC; result0..3 GPU stages,4 CPU submit
+    benchmark_command, // V558: a=requested revision,b=automatic suite active,c=run ID. Closes preceding interval before apply.
+    benchmark_stages, // V608: a=game/preparation microseconds,b=delivery microseconds,c=revision; result=valid
 };
 
 struct BridgeFlightToken {
@@ -215,7 +239,9 @@ public:
     void refresh_settings() noexcept;
     // Explicit diagnostic/teardown use only; never called on a render path.
     void flush() noexcept;
-    [[nodiscard]] bool gpu_instrumentation_enabled() const noexcept { return gpu_instrumentation_enabled_.load(std::memory_order_relaxed); }
+    [[nodiscard]] bool gpu_instrumentation_enabled() const noexcept {
+        return gpu_instrumentation_enabled_.load(std::memory_order_relaxed);
+    }
 
     [[nodiscard]] bool enabled() const noexcept;
     [[nodiscard]] bool ram_enabled() const noexcept;
@@ -262,6 +288,7 @@ private:
         std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t) noexcept;
     std::atomic<std::shared_ptr<Impl>> impl_;
     std::unique_ptr<RamTimingCapture> ram_;
+    std::atomic<bool> ram_recording_{false};
     std::atomic<bool> gpu_instrumentation_enabled_{false}, disk_enabled_{false}, initialized_{false};
     std::atomic<std::uint64_t> next_poll_{0};
     std::mutex control_mutex_, startup_mutex_;

@@ -3,6 +3,7 @@
 
 #include <dlssnr/DlssNr.h>
 #include "../ofxr/ofxr_bridge_client.hpp"
+#include "../../third_party/ofxr/include/xrfg/interface_metrics.hpp"
 
 #include "input/input_system.h"
 
@@ -6935,20 +6936,44 @@ static void RenderOfxrVrFramegenMenu()
     }
 
     const auto status = ofxr_bridge::snapshot();
-    auto settings = status.desired;
+    if (ImGui::TreeNode("Frame timings"))
+    {
+        xrfg::request_interface_measurement();
+        const auto timings = xrfg::interface_telemetry();
+        const auto metric = [](const char* label, bool valid, float value) {
+            if (valid) ImGui::Text("%s: %.2f ms", label, value);
+            else ImGui::TextDisabled("%s: N/A", label);
+        };
+        metric("GPU render (SteamVR)", timings.gpu_valid, timings.gpu_render_ms);
+        metric("App CPU render", timings.cpu_valid, timings.cpu_render_ms);
+        metric("OFXR API time", timings.ofxr_time_valid, timings.ofxr_time_ms);
+        metric("Real frame handoff", timings.delay_valid, timings.ofxr_delay_ms);
+        metric("Frame cycle", timings.cycle_valid, timings.cycle_length_ms);
+        metric("Cycle estimated", timings.cycle_estimated_valid, timings.cycle_estimated_ms);
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Rolling one-second medians. OFXR API time includes blocked CPU calls.\n"
+            "Frame cycle follows this frame from WaitFrame entry to real output acceptance.\n"
+            "Cycle estimated adds physical display slots from accepted synthetic outputs.\n"
+            "GPU render comes from SteamVR. These are not motion-to-photon measurements.\n"
+            "Unavailable or stale measurements stay N/A.");
+        ImGui::TreePop();
+    }
+    auto settings = xrfg::embedded::snapshot().desired;
     int engine = settings.enabled == 0
         ? 0
-        : settings.frame_generation == 1
+        : settings.hybrid ? 6 : settings.frame_generation == 2 ? 7 : settings.frame_generation == 1
             ? 5
             : settings.backend == 3 ? 3 : settings.backend == 2 ? 4 : settings.backend == 1 ? 2 : 1;
     bool changed = ImGui::Combo(
-        "Engine", &engine, "Off\0FidelityFX\0Nvidia (0.2.1)\0Nvidia (djules)\0Nvidia (new / 0.3.0)\0FSR 3.1\0");
+        "Engine", &engine, "Off\0FidelityFX\0Nvidia (0.2.1)\0Nvidia (djules)\0Nvidia (new / 0.3.0)\0FSR 3.1\0Hybrid\0Native DLSS-G\0");
     if (changed)
     {
         settings.enabled = engine == 0 ? 0 : 1;
-        settings.frame_generation = engine == 5 ? 1 : 0;
+        settings.frame_generation = engine == 7 ? 2 : engine == 5 ? 1 : 0;
+        settings.hybrid=engine==6;
         settings.backend = engine == 3 ? 3 : engine == 4 ? 2 : engine == 2 ? 1 : 0;
-        settings.motion_vectors = engine == 5 ? 1 : 0;
+        settings.motion_vectors = engine>=5 ? 1 : 0;
     }
 
     if (engine == 2 || engine == 3 || engine == 4)
@@ -6960,8 +6985,8 @@ static void RenderOfxrVrFramegenMenu()
             changed = true;
         }
         changed |= ImGui::Combo(
-            "NVIDIA input resolution", &settings.scale,
-            "100%\0" "75%\0" "50%\0");
+            "Flow resolution", &settings.scale,
+            "100%\0" "75%\0" "50%\0" "25%\0");
         bool backward = settings.backward != 0;
         if (ImGui::Checkbox("NVIDIA backward flow", &backward))
         {
@@ -6973,26 +6998,37 @@ static void RenderOfxrVrFramegenMenu()
     if (engine != 0)
     {
         auto storageSettings = xrfg::embedded::snapshot().desired;
-        bool lowerVram = storageSettings.lower_vram < 0 ? (engine == 3 || engine == 4) : storageSettings.lower_vram != 0;
-        if (ImGui::Checkbox("Lower VRAM (may cause stuttering)", &lowerVram))
+        bool ownCamera = storageSettings.synthetic_camera;
+        if (ImGui::Checkbox("Reduce rotation black bars (experimental)", &ownCamera))
         {
-            storageSettings.lower_vram = lowerVram ? 1 : 0;
+            storageSettings.synthetic_camera = ownCamera;
             if (!xrfg::embedded::request(storageSettings))
-                ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F), "Could not save memory preference");
+                ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F), "Could not save camera preference");
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Uses one runtime swapchain per output, with private staging.\n"
-                              "Applies to all engines on native D3D12; excludes Luke AFW and D3D11/Vulkan interop.\n"
-                              "Applies at the next frame boundary after pending frames complete.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Generate the synthetic in its interpolated head orientation and submit that same pose.\n"
+            "Experimental, off by default. For New/Djules/FidelityFX/FSR on SteamVR.\n"
+            "Reference and Luke/AFW keep their existing camera contract.");
+        bool fast=settings.lower_vram!=0 || settings.separate_synthesis!=0;
+        if(ImGui::Checkbox("Fast mode",&fast)) {settings.lower_vram=settings.separate_synthesis=fast?1:0;changed=true;}
+        if(ImGui::IsItemHovered())ImGui::SetTooltip("Use reduced output storage. 3X retains distinct frames and required GPU ownership.");
+        changed |= ImGui::Combo("Pacing (SteamVR)",&settings.pacing_mode,"Framework\0Director\0Framework + Director\0");
+        if(engine>=1 && engine<=4)changed |= ImGui::Combo("Motion source",&settings.motion_vectors,"Optical flow\0Game motion vectors\0");
+        if(engine==7) {int scale=int(settings.native_scale);if(ImGui::SliderInt("Generated resolution",&scale,25,100,"%d%%")) {settings.native_scale=unsigned(scale);changed=true;}}
     }
 
     if (engine == 3)
     {
         auto pipeline = xrfg::embedded::djules_pipeline_snapshot();
         bool triple = pipeline.triple_frame_gen;
+        const auto storage = xrfg::embedded::snapshot().desired;
+        const bool reducedDirect = false; // Fast 3X owns distinct output storage.
+        ImGui::BeginDisabled(reducedDirect);
         if (ImGui::Checkbox("3X Frame Gen", &triple) &&
             !xrfg::embedded::set_djules_triple_frame_gen(triple))
             ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F), "Could not save multiplier");
+        ImGui::EndDisabled();
+        if (reducedDirect) ImGui::TextDisabled("Direct reduced output uses 2X");
         pipeline = xrfg::embedded::djules_pipeline_snapshot();
         bool preferFps = pipeline.prefer_fps;
         ImGui::BeginDisabled(pipeline.triple_frame_gen);
@@ -7011,7 +7047,7 @@ static void RenderOfxrVrFramegenMenu()
                               "Applies during play after pending frames complete.");
     }
 
-    if (changed && !ofxr_bridge::request(settings))
+    if (changed && !xrfg::embedded::request(settings))
         ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F),
                            "Setting rejected by the loaded OFXR layer");
 
@@ -7045,6 +7081,11 @@ static void RenderOfxrVrFramegenMenu()
         else
             ImGui::TextColored(ImVec4(0.95F, 0.65F, 0.15F, 1.0F),
                                "FSR waiting for a complete stereo pair");
+    }
+    else if ((engine == 6 || engine == 7) && status.ready != 0)
+    {
+        ImGui::TextDisabled(engine == 7 ? "DLSS-G ready (2X)" : "Hybrid ready (2X)");
+        ImGui::TextDisabled("See Frame timings for confirmed generated frames");
     }
     else if (status.ready != 0)
     {

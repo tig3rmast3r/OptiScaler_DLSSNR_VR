@@ -181,6 +181,12 @@ std::vector<GpuInformation> IdentifyGpu::checkGpuInfo()
     // has some old Nvidia card in their system for example.
     // sortGpus(localCachedInfo);
 
+    // Publish the actual DXGI-selected primary vendor before querying driver
+    // capabilities. A concurrent loader callback needs only this fact, not the
+    // enriched cache protected by mutex. Unknown stays unknown on DXGI failure.
+    if (!localCachedInfo.empty())
+        primaryVendor.store(localCachedInfo.front().vendorId, std::memory_order_release);
+
     for (auto& gpuInfo : localCachedInfo)
     {
         if (gpuInfo.vendorId == VendorId::Nvidia)

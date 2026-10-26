@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <vector>
+#include "xrfg/scene_presentation_rate.hpp"
 
 namespace xrfg {
 
@@ -80,10 +81,15 @@ public:
     // that it never spans an instance boundary, not that it opens once.
     static void release_process_connection() noexcept;
 
-    // Distinct images the headset received per second, over a rolling window of
-    // about a second. Empty until the first window closes. Attaches lazily on
+    // Presented compositor frames per second, over a rolling 64-record window.
+    // Repeated scanouts count once; mispresentation is not deducted as loss.
+    // This does not identify the source scene image. Attaches lazily on
     // the first call of any accessor after mark_established(), once.
     [[nodiscard]] std::optional<float> delivered_fps(std::int64_t now_ns) noexcept;
+    struct SubmissionProbe {std::uint32_t frame{};double time{};float ready{};bool valid{};};
+    [[nodiscard]] SubmissionProbe scene_submission_probe() noexcept;
+    void scene_submission_completed(SubmissionProbe before,SceneIdentity scene) noexcept;
+    [[nodiscard]] std::optional<ScenePresentationRate::Rate> scene_fps(std::int64_t now_ns) noexcept;
 
     // When the display last scanned out, converted into the layer's own clock,
     // plus the compositor's frame counter. This is the thing the presenter's
@@ -97,11 +103,12 @@ public:
         // this is the number that says whether it belongs there.
         std::chrono::microseconds cost{};
     };
-    [[nodiscard]] std::optional<VsyncAnchor> vsync_anchor() noexcept;
+    [[nodiscard]] std::optional<VsyncAnchor> vsync_anchor(bool nonblocking=false) noexcept;
+    [[nodiscard]] std::optional<VsyncAnchor> cached_vsync_anchor() const noexcept;
 
     // Whether the compositor's most recent frame went out on the vsync it was
-    // predicted for. mispresented > 0 is "it landed somewhere else", which is
-    // per-frame attribution for a loss that submission counts cannot see.
+    // predicted for. mispresented > 0 means it landed on another vsync;
+    // presents > 0 still means it was shown, not lost.
     struct FramePresentation {
         std::uint32_t frame_index{};
         std::uint32_t mispresented{};
@@ -162,6 +169,13 @@ public:
         float compositor_idle_cpu_ms{};
     };
     [[nodiscard]] std::optional<FramePresentation> last_presentation() noexcept;
+    struct GpuRenderTiming {
+        std::uint32_t frame_index{}; float pre_submit_ms{};
+        std::optional<float> delivered_fps;
+        std::optional<std::chrono::nanoseconds> display_period;
+    };
+    // Independent UI observation. Never consumes either pacing cursor.
+    [[nodiscard]] std::optional<GpuRenderTiming> gpu_render_timing(std::int64_t now_ns) noexcept;
 
     // Every compositor frame that has settled since the last call, oldest
     // first - including the ones presented zero times, which
@@ -190,6 +204,13 @@ public:
     // headset can change mode mid-session. Empty when unavailable.
     [[nodiscard]] std::optional<std::chrono::nanoseconds>
     display_period() noexcept;
+
+    // Director-safe observation of the last physical period published by
+    // display_period()/gpu_render_timing(). Never attaches, locks the observer
+    // mutex or calls OpenVR. Empty until an application/observer read succeeds;
+    // the director can use its native prediction while that value is unknown.
+    [[nodiscard]] std::optional<std::chrono::nanoseconds>
+    cached_display_period() const noexcept;
 
 private:
     struct Impl;

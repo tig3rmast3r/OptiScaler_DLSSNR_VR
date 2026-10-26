@@ -195,11 +195,15 @@ void* __stdcall NvApiHooks::hkNvAPI_QueryInterface(unsigned int InterfaceId)
         else
             return nullptr;
 
-    auto primaryGpu = IdentifyGpu::getPrimaryGpu();
+    const auto primaryVendor = IdentifyGpu::getObservedPrimaryVendor();
+    // During initial discovery, forward the native interface without inventing
+    // a vendor or recursively entering the GPU cache from a driver callback.
+    if (primaryVendor == VendorId::Invalid)
+        return o_NvAPI_QueryInterface(InterfaceId);
 
     // Disable flip metering
     if (InterfaceId == GET_ID(NvAPI_D3D12_SetFlipConfig) &&
-        Config::Instance()->DisableFlipMetering.value_or(primaryGpu.vendorId != VendorId::Nvidia))
+        Config::Instance()->DisableFlipMetering.value_or(primaryVendor != VendorId::Nvidia))
     {
         LOG_INFO("FlipMetering is disabled!");
         return nullptr;

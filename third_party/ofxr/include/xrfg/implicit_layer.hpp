@@ -63,6 +63,7 @@ enum class ConfiguredNvidiaInputScale {
     full,
     three_quarter,
     half,
+    quarter,
 };
 
 struct ConfiguredNvidiaOptions {

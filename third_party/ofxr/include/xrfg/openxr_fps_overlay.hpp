@@ -1,11 +1,14 @@
 #pragma once
 
 #include "xrfg/fps_overlay_model.hpp"
+#include "xrfg/interface_metrics.hpp"
+#include "xrfg/d3d12_native_result.hpp"
 #include <d3d11_4.h>
 #include <d3d12.h>
 #include <openxr/openxr.h>
 #include <filesystem>
 #include <memory>
+#include <functional>
 #include <optional>
 
 namespace xrfg {
@@ -25,7 +28,12 @@ public:
     void application_frame(const XrFrameEndInfo* info) noexcept;
     void set_afw_active(bool active) noexcept;
     void set_delivery_source(SteamVrDelivery* delivery) noexcept;
-    [[nodiscard]] XrResult end_frame(const XrFrameEndInfo* info, bool synthetic, bool new_content = true);
+    using DeferredEnd = std::function<XrResult(const XrFrameEndInfo*,const std::shared_ptr<InterfaceDeliveryReceipt>&)>;
+    // Invoked only after the real runtime End returns.
+    void set_private_delivery_end(DeferredEnd end);
+    [[nodiscard]] XrResult end_frame(const XrFrameEndInfo* info, bool synthetic, bool new_content = true,
+        InterfaceFrameStamp stamp = {},
+        std::span<const std::shared_ptr<D3D12NativeFrameResult>> native_results = {}, unsigned native_output=0);
     void reset_metrics() noexcept;
     void set_display_period(std::int64_t period_ns) noexcept;
     // Terminal for this session. Keep resources alive until normal teardown;

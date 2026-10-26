@@ -701,10 +701,11 @@ HMODULE LibraryLoadHooks::LoadNvApi()
     LOG_FUNC();
 
     HMODULE nvapi = nullptr;
+    const auto primaryVendor = IdentifyGpu::getObservedPrimaryVendor();
 
     // Opti exports a query function that nvapi would export
     if (Config::Instance()->UseFakenvapi.value_or_default() &&
-        IdentifyGpu::getPrimaryGpu().vendorId != VendorId::Nvidia)
+        primaryVendor != VendorId::Invalid && primaryVendor != VendorId::Nvidia)
     {
         nvapi = dllModule;
         fakenvapi::setUsingAsMainNvapi(true);

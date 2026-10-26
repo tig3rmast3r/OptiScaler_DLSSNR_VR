@@ -327,6 +327,15 @@ int main(int argc,char** argv) {
         lower_vram_test=mode.ends_with("lower-vram"); direct_output_test=mode.ends_with("direct-output");
         if(lower_vram_test) s->lower_vram=1;
         if(direct_output_test) s->lower_vram=0;
+        s->separate_synthesis = lower_vram_test ? 1 : 0;
+        const auto setting = [](const char* key, int fallback) {
+            char value[16]{}; const auto size = GetEnvironmentVariableA(key, value, sizeof(value));
+            return size && size < sizeof(value) ? std::atoi(value) : fallback;
+        };
+        s->separate_synthesis = setting("XRFG_TEST_SEPARATE", s->separate_synthesis);
+        s->lower_vram = setting("XRFG_TEST_REDUCED", s->lower_vram);
+        const int observed_runtime = setting("XRFG_TEST_RUNTIME", -1);
+
         if(mode=="legacy-queue-lower-vram" || mode=="legacy-queue-direct-output") s->nvidia_new_route=false;
         if(mode=="fidelityfx-lower-vram") { s->optical_flow_backend=xrfg::D3D12OpticalFlowBackend::fidelity_fx; s->nvidia_new_route=false; s->djules_route=false; }
 #ifdef OFXR_TEST_DJULES_ROUTE
@@ -372,6 +381,15 @@ int main(int argc,char** argv) {
             s->frame_generation_mode=xrfg::D3D12FrameGenerationMode::fsr3;
             dispatch->steamvr_runtime=fsr_queue;
         }
+        // Direct reduction intentionally uses the same bounded fresh-pair
+        // consumer as Reference. Keep the selected New/Djules generator.
+        if (!fsr_test && direct_reduced_outputs(*s)) legacy_queue = true;
+        if (deep_readiness) s->separate_synthesis = 1;
+        s->djules_history_wait_enabled = s->djules_route && s->nvidia_new_route;
+        if (observed_runtime >= 0) {
+            dispatch->steamvr_runtime = observed_runtime == 1;
+            dispatch->virtual_desktop_runtime = observed_runtime == 0;
+        }
         s->control_revision=xrfg::embedded::snapshot().revision;
         hr(D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&s->d3d12_device)),"device");
         D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -407,18 +425,19 @@ int main(int argc,char** argv) {
             const auto history=left->d3d12_history;
             const auto capture=left->last_released_capture;
             require(capture.has_value(),"owned capture before route change");
-            for(const int lower:{-1,0,1}) for(const int route:{1,3,2,1,3,2}) {
+            for(const int lower:{0,1}) for(const int route:{1,3,2,1,3,2}) {
                 auto desired=*restore_route.previous;
-                desired.enabled=true;desired.backend=route;desired.frame_generation=0;desired.lower_vram=lower;
+                desired.enabled=true;desired.backend=route;desired.frame_generation=0;desired.lower_vram=lower;desired.separate_synthesis=lower;
                 require(xrfg::embedded::request(desired),"GPU route request");
                 apply_embedded_control(s);
                 require(!s->control_reconfigure_required && s->menu_enabled,"GPU route reconfiguration");
+                for(const auto& chain:{left,right})require(ensure_frame_generation(chain),"explicit projection shape re-admission");
                 require(left->d3d12_history==history && left->last_released_capture.has_value(),"route replaced source ownership");
                 for(const auto& chain:{left,right}) {
                     const auto generation=chain->frame_generation;
-                    require(generation && generation->staged_outputs==(lower<0 ? route>=2 : lower!=0),"stale private output shape");
-                    require(generation->direct_extra_outputs==(!generation->staged_outputs && route==3),"stale direct 3X capacity");
-                    require(generation->staging_stride==(generation->staged_outputs && route==3 ? 2U : 1U),"stale staged 3X capacity");
+                    require(generation && generation->staged_outputs==(lower!=0),"stale private output shape");
+                    require(generation->direct_extra_outputs==(!generation->staged_outputs && route==3 && s->djules_triple_requested),"stale direct 3X capacity");
+                    require(generation->staging_stride==(generation->staged_outputs && route==3 && s->djules_triple_requested ? 2U : 1U),"stale staged 3X capacity");
                     for(const auto& image:generation->synthetic)synthetic_handles.insert(image.handle);
                 }
             }
@@ -427,6 +446,12 @@ int main(int argc,char** argv) {
             if(lower_vram_test || direct_output_test)
                 require(chain->frame_generation && chain->frame_generation->staged_outputs==lower_vram_test,
                     "explicit output storage was ignored");
+            if (observed_runtime >= 0) {
+                const auto& generation = chain->frame_generation;
+                require(generation && generation->current_runtime_rings == (s->lower_vram ? 1U : 2U) &&
+                    generation->synthetic_runtime_rings == (s->lower_vram ? 1U : 2U), "storage matrix XR handle count");
+                require(generation->staged_outputs == (s->separate_synthesis != 0), "storage matrix changed compute ownership");
+            }
         }
         ComPtr<ID3D12Resource> depth, motion;
         if(fsr_test && !fsr_missing) {
@@ -577,7 +602,7 @@ int main(int argc,char** argv) {
                     "guard admitted out-of-bounds motion slice");
                 b->motion_slice=1;
                 b->depth.Reset();
-                require(classify_fsr_stereo_guides(audit,mapped.mappings)==FsrStereoGuideReason::missing_guides,
+                require(classify_fsr_stereo_guides(audit,mapped.mappings)==FsrStereoGuideReason::missing_depth,
                     "guard admitted missing depth");
                 audit.layers[0].views.resize(1);
                 require(classify_fsr_stereo_guides(audit,mapped.mappings)==FsrStereoGuideReason::non_stereo_projection,

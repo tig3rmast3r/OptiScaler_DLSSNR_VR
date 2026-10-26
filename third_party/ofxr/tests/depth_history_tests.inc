@@ -79,7 +79,7 @@ void depth_history_test() {
         release_depth(false);
         enumerate(); enumerate();
         check(bool(chain->d3d12_history) == color, "enumeration allocated new depth ring");
-        check(!chain->generation_eligible_pending && !chain->frame_generation, "depth/budget generation armed");
+        check(chain->generation_eligible_pending == color && !chain->frame_generation, "only color can await projection after explicit budget retry; no outputs allocated");
         select(1);
         check(chain->d3d12_history && chain->d3d12_history->initialized(), "reverse switch lost reference history");
         release_depth(true);

@@ -63,6 +63,7 @@ public:
         ID3D12Resource** generated_array) noexcept;
     [[nodiscard]] bool requires_idle_reconfigure(
         std::span<const D3D12FsrEyeInput> eyes) const noexcept;
+    [[nodiscard]] bool output_is_current(unsigned view) const noexcept; // observed SDK reset output
     void reset() noexcept;
 
 private:

@@ -253,6 +253,7 @@ struct D3D12FsrFrameGenerator::Impl {
         std::uint64_t frame_id{};
     };
 
+    std::array<bool,kMaximumEyes> last_reset{};
     ComPtr<ID3D12Device> device;
     D3D12_RESOURCE_DESC array_description{};
     DXGI_FORMAT color_format{DXGI_FORMAT_UNKNOWN};
@@ -697,6 +698,7 @@ HRESULT D3D12FsrFrameGenerator::dispatch(
             report_fsr_frame_generation_attempt(false);
             return result;
         }
+        impl_->last_reset[eye_index]=input.reset || eye.frame_id==1;
         const auto before = transition(eye.output.Get(), eye.output_state,
                                        D3D12_RESOURCE_STATE_COPY_SOURCE);
         commands->ResourceBarrier(1, &before);
@@ -743,6 +745,10 @@ bool D3D12FsrFrameGenerator::requires_idle_reconfigure(
             return true;
     }
     return false;
+}
+
+bool D3D12FsrFrameGenerator::output_is_current(unsigned view) const noexcept {
+    return !impl_ || view>=kMaximumEyes || impl_->last_reset[view];
 }
 
 void D3D12FsrFrameGenerator::reset() noexcept {
